@@ -1,0 +1,73 @@
+# Development tools, pinned. `mise install` installs them, `mise tasks` lists
+# the tasks below (`mise run check`, `mise run scan`, ...). Versions and
+# checksums are locked in mise.lock; `mise run deps:update` bumps everything.
+
+[tools]
+rust = { version = "1.99.0", components = "rustfmt,clippy" }
+python = "3.14"
+uv = "0.12.23"
+actionlint = "1.7.12"
+shellcheck = "0.11.0"
+osv-scanner = "2.6.0"
+trivy = "0.75.0"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+
+[settings]
+lockfile = true
+
+[env]
+# Docs tooling lives in a project virtualenv, activated by mise.
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.check]
+description = "Format, clippy and tests (what CI runs)"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --locked --all-targets -- -D warnings",
+  "cargo test --locked",
+]
+
+[tasks.lint]
+description = "Lint the GitHub workflows (actionlint, with shellcheck for scripts)"
+run = "actionlint"
+
+[tasks.deny]
+description = "Licenses, advisories, bans and sources of Rust dependencies"
+run = "cargo deny check advisories licenses bans sources"
+
+[tasks.scan]
+description = "Vulnerability scans: dependencies (osv-scanner) and the repository (trivy)"
+run = [
+  "osv-scanner scan source --recursive .",
+  "trivy fs --quiet --skip-dirs target --skip-dirs .venv --scanners vuln,secret,misconfig --exit-code 1 .",
+]
+
+[tasks."docs:install"]
+description = "Install the pinned documentation tooling into .venv"
+run = "uv pip install --quiet --require-hashes -r docs/requirements.txt"
+
+[tasks."docs:build"]
+description = "Build the documentation strictly (as CI)"
+depends = ["docs:install"]
+run = "mkdocs build --strict"
+
+[tasks."docs:serve"]
+description = "Serve the documentation with live reload"
+depends = ["docs:install"]
+run = "mkdocs serve"
+
+[tasks."docs:lock"]
+description = "Pin the full docs dependency tree (with hashes) from docs/requirements.in"
+run = "uv pip compile docs/requirements.in --universal --generate-hashes --quiet -o docs/requirements.txt"
+
+[tasks."deps:update"]
+description = "Update Rust crates, docs packages and mise tools to their latest versions"
+run = [
+  "cargo update",
+  "uv pip compile docs/requirements.in --universal --generate-hashes --upgrade --quiet -o docs/requirements.txt",
+  "mise upgrade --bump",
+]
+
+[tasks.ci]
+description = "Everything CI checks, locally"
+depends = ["check", "lint", "deny", "docs:build", "scan"]

@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runway: Cloud Run deployments from one file</title>
+<meta name="description" content="runway deploys applications to Google Cloud Run from a single runway.yaml: build, identity, secrets, traffic and guardrails, with no state file and no cluster.">
+<meta property="og:title" content="runway: Cloud Run deployments from one file">
+<meta property="og:description" content="Build, identity, secrets, branch previews, canaries and guardrails for Google Cloud Run, in one runway.yaml.">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/svg+xml" href="assets/runway-icon.svg">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<style>
+:root{--bg:#070b18;--card:#111a3a;--card2:#16214a;--line:#26335f;--text:#e7ecff;--muted:#9aa6d1;--dim:#6b77a6;
+  --cyan:#22d3ee;--violet:#a78bfa;--pink:#f472b6;--green:#34d399;--amber:#fbbf24;
+  --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  --sans:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:var(--sans);color:var(--text);background:
+  radial-gradient(1100px 700px at 85% -10%,rgba(167,139,250,.18),transparent 60%),
+  radial-gradient(900px 600px at -10% 30%,rgba(34,211,238,.10),transparent 60%),var(--bg);line-height:1.55}
+a{color:inherit}
+.wrap{width:min(1160px,92vw);margin:0 auto}
+nav{display:flex;align-items:center;justify-content:space-between;padding:22px 0}
+.logo{display:flex;align-items:center;flex:none;text-decoration:none}
+.logo img{display:block;width:180px;max-width:30vw;height:auto}
+nav .links{display:flex;gap:26px;align-items:center}
+nav .links a{color:var(--muted);text-decoration:none;font-size:15px}
+nav .links a:hover{color:var(--text)}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 20px;border-radius:12px;font-weight:650;text-decoration:none;font-size:15px;border:1px solid var(--line)}
+.btn.primary{background:linear-gradient(92deg,var(--cyan),var(--violet));color:#07101f;border:none}
+.btn.ghost{background:rgba(255,255,255,.03);color:var(--text)}
+.btn:hover{filter:brightness(1.08)}
+.grad{background:linear-gradient(92deg,var(--cyan),var(--violet) 55%,var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);gap:48px;align-items:center;padding:56px 0 40px}
+.badge{display:inline-block;font:600 12px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--cyan);border:1px solid rgba(34,211,238,.35);background:rgba(34,211,238,.07);padding:8px 12px;border-radius:999px}
+h1{font-size:clamp(40px,5.4vw,68px);line-height:1.03;letter-spacing:-.035em;margin:18px 0 18px;font-weight:850}
+.lead{font-size:clamp(17px,1.5vw,20px);color:var(--muted);max-width:56ch;margin:0 0 28px}
+.cta{display:flex;gap:12px;flex-wrap:wrap}
+.install{margin-top:26px;font:14px var(--mono);color:var(--muted);background:#050816;border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;justify-content:space-between;gap:12px;align-items:center}
+.also{margin:10px 2px 0;font-size:14px;color:var(--dim)}
+.also a{color:var(--muted)}
+.install button{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:4px 10px;cursor:pointer;font:12px var(--mono)}
+.term{background:#050816;border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.45);container-type:inline-size}
+.term .bar{display:flex;gap:7px;padding:11px 14px;background:#0b1128;border-bottom:1px solid var(--line)}
+.term .bar i{width:11px;height:11px;border-radius:50%;background:#ff5f57}.term .bar i:nth-child(2){background:#febc2e}.term .bar i:nth-child(3){background:#28c840}
+.term .bar span{margin-left:10px;font:12px var(--mono);color:var(--dim)}
+pre{margin:0;padding:18px;font:13.5px/1.6 var(--mono);color:#cfd7ff;overflow-x:auto;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+/* Shrinks the code to fit its card (--cols: longest line); scrolls below 11px. */
+.term pre{--cols:56;font-size:clamp(11px,calc((100cqi - 36px) / (var(--cols) * .61)),13.5px)}
+pre::-webkit-scrollbar{height:8px}
+pre::-webkit-scrollbar-track{background:transparent}
+pre::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+.k{color:var(--violet)}.s{color:var(--green)}.c{color:var(--dim)}.n{color:var(--amber)}.u{color:var(--cyan)}
+section{padding:64px 0}
+.kicker{font:600 13px/1 var(--mono);color:var(--cyan);letter-spacing:.18em;text-transform:uppercase}
+h2{font-size:clamp(28px,3.2vw,42px);letter-spacing:-.025em;margin:12px 0 14px;font-weight:800}
+.sub{color:var(--muted);max-width:68ch;margin:0 0 34px;font-size:17px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.card{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:18px;padding:22px}
+.card h3{margin:12px 0 6px;font-size:18px}
+.card p{margin:0;color:var(--muted);font-size:15.5px}
+.card code,.sub code,td code{font:13px var(--mono);color:#c7d2fe;background:rgba(167,139,250,.12);padding:.1em .35em;border-radius:6px}
+svg.ic{width:28px;height:28px;fill:none;stroke:var(--cyan);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.split{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:28px;align-items:start}
+.steps{counter-reset:s;display:flex;flex-direction:column;gap:14px}
+.step{display:flex;gap:16px;align-items:flex-start}
+.step b{flex:none;width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:rgba(34,211,238,.12);color:var(--cyan);font:700 15px var(--mono)}
+.step p{margin:4px 0 0;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:15.5px}
+th,td{padding:13px 14px;border-bottom:1px solid var(--line);text-align:left;color:var(--muted);vertical-align:top}
+th{color:var(--text);background:rgba(255,255,255,.03)}
+td:first-child{color:var(--text);font-weight:600}
+td.best{color:var(--green)}
+.final{text-align:center;padding:80px 0 90px}
+footer{border-top:1px solid var(--line);padding:28px 0 40px;color:var(--dim);font-size:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
+footer a{color:var(--muted);text-decoration:none;margin-left:18px}
+@media (max-width:1000px){.split{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:900px){.hero,.split{grid-template-columns:1fr}.grid{grid-template-columns:1fr 1fr}nav .links a.hide{display:none}}
+@media (max-width:600px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <a class="logo" href="./"><img src="assets/runway-logo-dark.svg" alt="runway" width="580" height="156"></a>
+  <div class="links">
+    <a class="hide" href="#features">Features</a>
+    <a class="hide" href="#compare">Compare</a>
+    <a href="docs/">Docs</a>
+    <a href="https://github.com/echaouchna/runway">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div>
+    <span class="badge">Open source · Apache-2.0</span>
+    <h1>Cloud Run deployments from <span class="grad">one file</span>.</h1>
+    <p class="lead">runway builds your app, creates what it needs (identity, grants, secrets, buckets, tags), rolls it out and manages its traffic, from a <code style="font:inherit;color:var(--text)">runway.yaml</code> next to your code. No state file. No cluster.</p>
+    <div class="cta">
+      <a class="btn primary" href="docs/getting-started/">Get started →</a>
+      <a class="btn ghost" href="docs/configuration/">Configuration reference</a>
+    </div>
+    <div class="install"><span id="cmd">brew install echaouchna/tap/runway</span><button onclick="navigator.clipboard.writeText(document.getElementById('cmd').textContent);this.textContent='copied'">copy</button></div>
+    <p class="also">macOS and Linux. Also as <a href="docs/getting-started/#binaries">binaries</a>, a <a href="docs/getting-started/#container-image">container image</a> or <a href="docs/getting-started/#from-source">from source</a>.</p>
+  </div>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><span>~/hello</span></div>
+<pre><span class="c">$</span> runway plan --stage prod
+<span class="n">~ update</span> hello-prod
+    <span class="n">~</span> memory: 512Mi -> 1Gi
+    <span class="s">+</span> secrets.API_KEY: api-key@3
+  <span class="s">+</span> grant secretAccessor on api-key to hello-run
+
+<span class="c">$</span> runway deploy --stage prod --preview feature/login
+<span class="u">==></span> Building hello from . (image exists → skip)
+<span class="u">==></span> Updating Cloud Run service hello-prod
+<span class="s">✓ hello-prod updated in 38s</span>
+Preview:  <span class="u">https://feature-login---hello-prod-…run.app</span>
+Traffic:  100% hello-prod-00012 · 0% feature-login
+
+<span class="c">$</span> runway deploy --stage prod --traffic 10   <span class="c"># canary</span>
+<span class="c">$</span> runway traffic --stage prod --promote</pre>
+  </div>
+</header>
+</div>
+
+<section id="features">
+<div class="wrap">
+  <div class="kicker">Features</div>
+  <h2>Everything a Cloud Run service needs, <span class="grad">nothing to glue</span></h2>
+  <p class="sub">One configuration covers the build, the runtime identity and its least-privilege grants, secrets, storage, probes, scaling, access and traffic. Every step reads the live project first and changes only what differs.</p>
+  <div class="grid">
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><h3>Builds that skip themselves</h3><p>Dockerfile or buildpacks on Cloud Build. Images are content-addressed: same source and base images, no rebuild.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><h3>A URL per branch</h3><p><code>--preview $BRANCH</code> deploys a revision with its own URL and no traffic. Merge to main and the release gets the traffic.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3"/><path d="M4 4v4h4M20 20v-4h-4"/></svg><h3>Canaries and rollback</h3><p><code>--traffic 10</code>, watch, <code>runway traffic --promote</code>. Roll back with one command. No revision churn.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/></svg><h3>Secrets without the dance</h3><p>Declared secrets are created empty, the right people can fill them, and the deploy waits (with the exact command) until they have a value.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5z"/><path d="M9 12l2 2 4-4"/></svg><h3>Least privilege by default</h3><p>A runtime service account per service, roles on exactly one dataset, bucket or secret, private by default, IAP when you want it.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12V3h9l9 9-9 9z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg><h3>Org policies welcome</h3><p>Tags bound to the service and awaited until effective; a first deploy that satisfies <code>run.allowedIngress</code> conditions.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><h3>Exact plans</h3><p><code>runway plan</code> diffs config, image, traffic and grants against the live service, and says when something is only known at deploy time.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><h3>Observability built in</h3><p><code>otel_collector: {}</code> adds Google's OpenTelemetry Collector as a sidecar with the roles and APIs it needs. <code>runway logs --follow</code>.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c5 0 9 5 9 7a12 12 0 0 1-2.2 3.2M6.6 6.6C4.3 8 3 10.4 3 12c0 2 4 7 9 7a9.8 9.8 0 0 0 4.4-1"/></svg><h3>No state, no cluster</h3><p>The project is the state. Ownership labels keep runway away from what it did not create. Undeploy keeps your data.</p></div>
+  </div>
+</div>
+</section>
+
+<section>
+<div class="wrap split">
+  <div>
+    <div class="kicker">How it works</div>
+    <h2>Describe it once. <span class="grad">Re-run forever.</span></h2>
+    <div class="steps">
+      <div class="step"><b>1</b><div><strong>Write <code>runway.yaml</code></strong><p>Stages, build, identity, secrets, access. <code>runway init</code> scaffolds one.</p></div></div>
+      <div class="step"><b>2</b><div><strong>Plan</strong><p>See the exact changes against the live project, read-only.</p></div></div>
+      <div class="step"><b>3</b><div><strong>Deploy</strong><p>APIs, buckets, secrets, accounts, grants, build, rollout, health, traffic, access: in dependency order, each step idempotent.</p></div></div>
+      <div class="step"><b>4</b><div><strong>Same command in CI</strong><p>Workload Identity Federation, a container image, JSON output and stable exit codes.</p></div></div>
+    </div>
+  </div>
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><span>runway.yaml</span></div>
+<pre style="--cols:69"><span class="k">version</span>: 1
+<span class="k">app</span>: hello
+<span class="k">provider</span>:
+  project: my-project
+  region: europe-west1
+  enable_apis: <span class="n">true</span>
+  create_build_resources: <span class="n">true</span>
+<span class="k">secrets</span>:
+  api-key: { adders: [group:devs@example.com] }
+<span class="k">service</span>:
+  source: .            <span class="c"># Dockerfile or buildpacks</span>
+  health_check: { path: /healthz }
+  service_account: <span class="s">"hello-run@${project}.iam.gserviceaccount.com"</span>
+  identity:
+    create: <span class="n">true</span>
+    roles:
+      - { role: roles/storage.objectUser, bucket: my-data }
+  secrets:
+    API_KEY: { secret: <span class="s">"${secrets.api-key}"</span> }
+  iap: { members: [group:devs@example.com] }
+<span class="k">stages</span>:
+  dev: {}
+  prod: { service: { min_instances: 1 } }</pre>
+  </div>
+</div>
+</section>
+
+<section id="compare">
+<div class="wrap">
+  <div class="kicker">Compare</div>
+  <h2>Where runway fits</h2>
+  <p class="sub">Keep Terraform for shared platform resources (networks, load balancers, DNS) and Kubernetes GitOps for Kubernetes. runway takes the part that changes every day: the Cloud Run application.</p>
+  <table>
+    <tr><th></th><th>CI scripts + Terraform</th><th>GitOps (Argo CD)</th><th>runway</th></tr>
+    <tr><td>What the app team maintains</td><td>CI YAML + HCL, often in several repos</td><td>CI + manifests + controller CRDs</td><td class="best">one <code>runway.yaml</code></td></tr>
+    <tr><td>Extra infrastructure</td><td>state buckets, Terraform pipeline</td><td>a cluster and controllers</td><td class="best">none</td></tr>
+    <tr><td>Branch previews, canaries</td><td>build it yourself</td><td>Kubernetes-centric</td><td class="best">built in</td></tr>
+    <tr><td>Secrets</td><td>created by Terraform, filled by hand</td><td>secrets operator</td><td class="best">created, granted, checked before deploy</td></tr>
+    <tr><td>Drift</td><td>next apply</td><td>healed continuously</td><td>next plan / deploy</td></tr>
+  </table>
+</div>
+</section>
+
+<section class="final">
+<div class="wrap">
+  <h2>Ship your next Cloud Run service <span class="grad">in minutes</span>.</h2>
+  <p class="sub" style="margin:0 auto 28px">Read the docs, deploy your first app, and tell us what you think.</p>
+  <div class="cta" style="justify-content:center">
+    <a class="btn primary" href="docs/getting-started/">Get started →</a>
+    <a class="btn ghost" href="https://github.com/echaouchna/runway">Star on GitHub</a>
+  </div>
+</div>
+</section>
+
+<div class="wrap">
+<footer>
+  <span>runway · Apache-2.0 · not affiliated with Google. Google Cloud and Cloud Run are trademarks of Google LLC.</span>
+  <span><a href="docs/">Docs</a><a href="docs/roadmap/">Roadmap</a><a href="https://github.com/echaouchna/runway/blob/main/CHANGELOG.md">Changelog</a><a href="https://github.com/echaouchna/runway">GitHub</a></span>
+</footer>
+</div>
+</body>
+</html>

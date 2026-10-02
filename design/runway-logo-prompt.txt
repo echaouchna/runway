@@ -1,0 +1,13 @@
+Brand direction: based on the user's October 4, 2026 reference.
+
+Source of truth: design/runway-logo.svg (editable vector paths, no font dependency).
+Symbol: bold lowercase r with a rounded shoulder, square ends and three
+transparent runway center-line dashes in the vertical stem.
+Wordmark: heavy geometric lowercase "runway", with a single-storey a.
+Colors: vivid blue #3030ef, midnight navy #0b1020, light #e7ecff.
+Variants: horizontal lockups for light and dark backgrounds; blue and
+monochrome marks; a white mark inside a midnight rounded-square app icon.
+No texture, shadow, cloud, airplane, ribbon, tagline or opaque logo background.
+
+Run python3 design/render-branding.py to regenerate all web assets and the
+CLI's blue/light terminal cells and monochrome ASCII silhouette.

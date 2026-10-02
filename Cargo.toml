@@ -1,0 +1,102 @@
+[package]
+name = "runway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Deploy applications to Google Cloud Run from a single runway.yaml"
+license = "Apache-2.0"
+repository = "https://github.com/echaouchna/runway"
+homepage = "https://echaouchna.github.io/runway"
+documentation = "https://echaouchna.github.io/runway/docs"
+readme = "README.md"
+keywords = ["cloud-run", "gcp", "deployment", "serverless", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Not published to crates.io; install from source.
+publish = false
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "signal", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = "1.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ignore = "0.4"
+tar = "0.4"
+gzp = { version = "2.0", default-features = false, features = ["deflate_rust"] }
+tempfile = "3"
+sha2 = "0.11"
+humantime = "2.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+bytes = "1"
+async-trait = "0.1"
+http = "1"
+futures = "0.3"
+
+google-cloud-auth = "1.17"
+google-cloud-gax = "1.15"
+google-cloud-wkt = { version = "1.9", features = ["chrono"] }
+google-cloud-run-v2 = "1.15"
+google-cloud-build-v1 = "1.14"
+google-cloud-storage = "1.20"
+google-cloud-logging-v2 = "1.15"
+google-cloud-resourcemanager-v3 = "1.14"
+google-cloud-iam-admin-v1 = "1.13"
+google-cloud-iam-v1 = "1.13"
+google-cloud-secretmanager-v1 = "1.14"
+google-cloud-api-serviceusage-v1 = "1.15"
+google-cloud-artifactregistry-v1 = "1.14"
+google-cloud-longrunning = "1.14"
+google-cloud-lro = "1.11"
+google-cloud-rpc = "1.6"
+google-cloud-iap-v1 = "1.13"
+google-cloud-bigquery-v2 = "1.0"
+clap_complete = "4.6"
+clap_complete_nushell = "4"
+
+[dev-dependencies]
+flate2 = "1.1"
+google-cloud-type = "1.6"
+google-cloud-api = "1.7"
+wiremock = "0.6"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# Distributed binaries and the container image (`cargo build --profile dist`):
+# about 12 MB instead of 41 MB. Measured on aarch64 Linux: no change in source
+# packaging speed, clean build about 20 s slower than `release`.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
+
+# Source hashing and compression stay at full speed (about 7% faster
+# compression than "z"/"s" for these crates).
+[profile.dist.package.sha2]
+opt-level = 3
+[profile.dist.package.gzp]
+opt-level = 3
+[profile.dist.package.flate2]
+opt-level = 3
+[profile.dist.package.miniz_oxide]
+opt-level = 3
+[profile.dist.package.crc32fast]
+opt-level = 3
+[profile.dist.package.tar]
+opt-level = 3
+[profile.dist.package.ignore]
+opt-level = 3
+
+[[bench]]
+name = "package"
+harness = false

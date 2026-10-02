@@ -1,0 +1,89 @@
+# Release on a version tag (v1.2.3, v1.2.3-rc1): binaries with checksums
+# (build.yml) and a GitHub release whose notes are the matching CHANGELOG.md
+# section, then, for stable versions when HOMEBREW_TAP is set, the Homebrew
+# formula (homebrew.yml). The container image is built by image.yml.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        name: Tag matches Cargo.toml and CHANGELOG.md
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          [ "$tag" = "$cargo_version" ] || { echo "::error::tag v$tag != Cargo.toml $cargo_version"; exit 1; }
+          grep -q "^## \[$tag\]" CHANGELOG.md || { echo "::error::no '## [$tag]' section in CHANGELOG.md"; exit 1; }
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.check-version.outputs.version }}
+
+  publish:
+    needs: build
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {found=1; next}
+            found && /^## \[/ {exit}
+            found && /^\[[^]]+\]: / {exit}
+            found {print}
+          ' CHANGELOG.md > notes.md
+          cat notes.md
+          (cd dist && cat ./*.sha256 > SHA256SUMS)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-path: dist/*.tar.gz
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: runway ${{ github.ref_name }}
+          body_path: notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  homebrew:
+    needs: [check-version, publish]
+    if: ${{ vars.HOMEBREW_TAP != '' && !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      channel: stable
+      version: ${{ needs.check-version.outputs.version }}
+      tag: ${{ github.ref_name }}
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

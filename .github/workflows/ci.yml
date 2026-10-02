@@ -1,0 +1,216 @@
+# Checks for pull requests and main, sized for the GitHub free tier:
+# - one job compiles once (fmt, clippy, tests share the build);
+# - each check runs only when its files changed (`changes` job);
+# - MSRV and cargo-deny run when dependencies change, and weekly;
+# - `ci-ok` is the single check to require in branch protection.
+# Runners: GitHub-hosted by default; set the repository variable RUNNER_LINUX
+# (for example `blacksmith-4vcpu-ubuntu-2404`) to use another runner.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: "17 5 * * 1" # weekly: new advisories (cargo-deny), MSRV
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # No debug info in CI: faster builds, smaller caches.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  changes:
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.f.outputs.rust }}
+      deps: ${{ steps.f.outputs.deps }}
+      docs: ${{ steps.f.outputs.docs }}
+      docker: ${{ steps.f.outputs.docker }}
+      workflows: ${{ steps.f.outputs.workflows }}
+    steps:
+      - id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          all=""
+          files=""
+          case "$EVENT" in
+            pull_request)
+              files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename') || all=1 ;;
+            push)
+              if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+                all=1
+              else
+                files=$(gh api "repos/$REPO/compare/$BEFORE...$AFTER" --jq '.files[].filename') || all=1
+              fi ;;
+            schedule) files="deny.toml" ;;    # dependency checks and scans only
+            *) all=1 ;;                       # merge queue, manual runs
+          esac
+          printf '%s\n' "$files"
+          out() {
+            if [ -n "$all" ] || grep -qE "$2" <<<"$files"; then v=true; else v=false; fi
+            echo "$1=$v" | tee -a "$GITHUB_OUTPUT"
+          }
+          out rust '^(src/|tests/|benches/|examples/|Cargo\.(toml|lock)$|\.cargo/|\.github/workflows/ci\.yml$)'
+          out deps '^(Cargo\.(toml|lock)$|deny\.toml$|docs/requirements\.txt$|mise\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          out docs '^(docs/|site/|mkdocs\.yml$|CHANGELOG\.md$|\.github/workflows/ci\.yml$)'
+          out docker '^(Dockerfile$|\.dockerignore$|\.github/workflows/ci\.yml$)'
+          out workflows '^(\.github/|mise\.(toml|lock)$)'
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  # The declared minimum supported Rust version still builds.
+  msrv:
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --locked --all-targets
+
+  # Licenses, security advisories, banned and duplicate crates (deny.toml).
+  deny:
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
+  docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+      - run: pip install --require-hashes -r docs/requirements.txt
+      - run: mkdocs build --strict
+
+  # Known vulnerabilities in Rust and docs dependencies (osv-scanner, the
+  # version pinned in mise.toml).
+  scan:
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@94c60b39bc2d90ab2f9bab27f38d3cc4812c1834 # v5.1.0
+        with:
+          install_args: osv-scanner
+      - run: osv-scanner scan source --recursive .
+
+  # Workflow files (actionlint, with shellcheck for run scripts).
+  lint-workflows:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@94c60b39bc2d90ab2f9bab27f38d3cc4812c1834 # v5.1.0
+        with:
+          install_args: actionlint shellcheck
+      - run: actionlint
+
+  # The container build still works (only when the Dockerfile changes; the
+  # image workflow builds it for releases).
+  docker:
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: runway:ci
+
+  # The one check to require: fails if any check failed or was cancelled;
+  # skipped checks (nothing relevant changed) count as passing.
+  ci-ok:
+    needs: [changes, rust, msrv, deny, docs, scan, lint-workflows, docker]
+    if: always()
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 2
+    steps:
+      - name: All checks passed or were not needed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac

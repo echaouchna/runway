@@ -1,0 +1,73 @@
+site_name: runway
+site_description: Deploy applications to Google Cloud Run from a single runway.yaml
+site_url: https://echaouchna.github.io/runway/docs/
+repo_url: https://github.com/echaouchna/runway
+repo_name: runway
+edit_uri: edit/main/docs/
+docs_dir: docs
+exclude_docs: |
+  slides/
+  requirements.txt
+
+theme:
+  name: material
+  logo: assets/runway-icon.svg
+  favicon: assets/runway-icon.svg
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle: { icon: material/weather-sunny, name: Light mode }
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: cyan
+      toggle: { icon: material/weather-night, name: Dark mode }
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+    - search.highlight
+    - search.suggest
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Configuration: configuration.md
+  - Commands: commands.md
+  - Guides:
+      - Previews, canaries and traffic: traffic.md
+      - Secrets: secrets.md
+      - CI/CD: ci-cd.md
+      - Permissions: permissions.md
+      - Undeploying: undeploy.md
+  - Reference:
+      - How it works: how-it-works.md
+      - Architecture: architecture.md
+      - Roadmap: roadmap.md
+      - Limitations and status: limitations.md
+      - Development: development.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.details
+
+validation:
+  links:
+    anchors: warn
+
+extra:
+  homepage: https://echaouchna.github.io/runway/

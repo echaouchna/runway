@@ -1,0 +1,4 @@
+# Documentation tooling (top-level packages). `mise run docs:lock` pins the
+# full dependency tree with hashes into requirements.txt.
+mkdocs==1.6.1
+mkdocs-material==9.7.7

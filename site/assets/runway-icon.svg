@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <title>runway</title>
+  <rect width="192" height="192" rx="40" fill="#0b1020" />
+  <g id="mark" fill="#ffffff" transform="translate(37 27.36) scale(.88)">
+    <path fill-rule="evenodd" d="M12 148V38C12 20 25 8 43 8H59V33C70 15 82 8 105 8H122V46H100C78 46 65 62 65 85V148Z M34 46H42V68H34Z M34 79H42V101H34Z M34 112H42V134H34Z" />
+  </g>
+</svg>

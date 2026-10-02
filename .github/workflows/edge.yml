@@ -1,0 +1,138 @@
+# Edge binaries: every push to main that changes the binary, like the :edge
+# container image (image.yml) and behind the same switch, the repository
+# variable PUBLISH_EDGE ("true"). A manual run on main publishes too.
+#
+# One rolling pre-release, tag `edge` (moved to the built commit), version
+# <Cargo.toml version>-edge.<run number> (`runway --version` adds the commit).
+# The new archives are uploaded before the formula Formula/runway-edge.rb
+# (homebrew.yml, when HOMEBREW_TAP is set) points at them, and the previous
+# ones are deleted only after that, so installs never hit a missing file.
+name: edge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/edge.yml"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/homebrew.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time; a newer push waits, then publishes the newest commit.
+concurrency:
+  group: edge
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: ${{ github.ref == 'refs/heads/main' && (vars.PUBLISH_EDGE == 'true' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      display: ${{ steps.v.outputs.display }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          RUN: ${{ github.run_number }}
+        run: |
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          version="${cargo_version}-edge.${RUN}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "display=$version (${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      display-version: ${{ needs.version.outputs.display }}
+
+  publish:
+    needs: [version, build]
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Move the edge tag and upload the archives
+        run: |
+          (cd dist && cat ./*.sha256 > SHA256SUMS)
+          cat > notes.md <<EOF
+          Development build of \`main\` at ${GITHUB_SHA} (version ${VERSION}),
+          replaced on every push. Not a release: it can change or break at any
+          time. Releases: https://github.com/${GH_REPO}/releases/latest
+
+          Homebrew: \`brew install echaouchna/tap/runway-edge\`.
+          Container image: \`ghcr.io/${GH_REPO}:edge\`.
+          EOF
+          if gh api "repos/${GH_REPO}/git/ref/tags/edge" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/edge" -f sha="$GITHUB_SHA" -F force=true > /dev/null
+          else
+            gh api "repos/${GH_REPO}/git/refs" -f ref=refs/tags/edge -f sha="$GITHUB_SHA" > /dev/null
+          fi
+          if gh release view edge > /dev/null 2>&1; then
+            gh release edit edge --prerelease --title "runway edge" --notes-file notes.md
+          else
+            gh release create edge --verify-tag --prerelease --latest=false --title "runway edge" --notes-file notes.md
+          fi
+          gh release upload edge --clobber dist/*.tar.gz dist/SHA256SUMS
+
+  homebrew:
+    needs: [version, publish]
+    if: ${{ vars.HOMEBREW_TAP != '' }}
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      channel: edge
+      version: ${{ needs.version.outputs.version }}
+      tag: edge
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  # After the formula moved (or when there is no tap), so it never points at a
+  # deleted archive.
+  cleanup:
+    needs: [version, publish, homebrew]
+    if: ${{ always() && needs.publish.result == 'success' && (needs.homebrew.result == 'success' || needs.homebrew.result == 'skipped') }}
+    runs-on: ${{ vars.RUNNER_LINUX || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Delete the archives of previous edge builds
+        run: |
+          gh release view edge --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+            case "$asset" in
+              "runway-v${VERSION}-"* | SHA256SUMS) ;;
+              *) echo "deleting $asset"; gh release delete-asset edge "$asset" --yes ;;
+            esac
+          done

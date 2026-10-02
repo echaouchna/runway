@@ -1,0 +1,10 @@
+# Runner labels the workflows may use through repository variables
+# (RUNNER_LINUX, RUNNER_LINUX_ARM, ...), for actionlint.
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404-arm
+    - blacksmith-4vcpu-ubuntu-2204
+    - blacksmith-4vcpu-ubuntu-2204-arm
