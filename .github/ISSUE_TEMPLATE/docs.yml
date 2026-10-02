@@ -1,0 +1,17 @@
+name: Documentation
+description: Something in the documentation is missing, wrong or unclear.
+labels: ["documentation"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page
+      placeholder: https://OWNER.github.io/runway/docs/configuration/
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is missing, wrong or unclear?
+    validations:
+      required: true

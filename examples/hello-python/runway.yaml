@@ -1,0 +1,43 @@
+# Source deployment: runway packages this directory, builds it with Cloud Build,
+# pushes the image to Artifact Registry and deploys it to Cloud Run.
+version: 1
+app: hello-python
+
+provider:
+  project: my-gcp-project            # replace with your project ID
+  region: europe-west1
+  artifact_repository: runway
+  source_bucket: my-gcp-project-runway-sources
+  build_service_account: runway-build@my-gcp-project.iam.gserviceaccount.com
+
+service:
+  source: .
+  dockerfile: Dockerfile
+  port: 8080
+  cpu: "1"
+  memory: 512Mi
+  timeout_seconds: 60
+  concurrency: 80
+  min_instances: 0
+  max_instances: 10
+  public: false
+  service_account: runway-runtime@my-gcp-project.iam.gserviceaccount.com
+  env:
+    LOG_LEVEL: info
+    GREETING: "Hello from runway!"
+  # Uncomment after creating the secret (see README.md#secrets):
+  # secrets:
+  #   DATABASE_URL:
+  #     secret: database-url
+  #     version: "1"
+
+stages:
+  dev:
+    service:
+      max_instances: 2
+      env:
+        LOG_LEVEL: debug
+  prod:
+    service:
+      min_instances: 1
+      memory: 1Gi

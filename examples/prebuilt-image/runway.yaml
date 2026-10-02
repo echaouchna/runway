@@ -1,0 +1,22 @@
+# Image deployment: no build infrastructure is needed. runway resolves the tag
+# to an immutable digest and deploys it.
+version: 1
+app: hello-image
+
+provider:
+  project: my-gcp-project            # replace with your project ID
+  region: europe-west1
+
+service:
+  image: us-docker.pkg.dev/cloudrun/container/hello:latest
+  port: 8080
+  memory: 512Mi
+  max_instances: 3
+  public: false
+  service_account: runway-runtime@my-gcp-project.iam.gserviceaccount.com
+
+stages:
+  dev: {}
+  prod:
+    service:
+      max_instances: 10

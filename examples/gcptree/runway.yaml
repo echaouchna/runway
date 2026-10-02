@@ -1,0 +1,109 @@
+# gcptree on Cloud Run (see CLOUD_RUN.md), deployed with runway:
+#   runway describe              # diagram and explanation of this stack
+#   runway doctor --stage prod   # credentials, APIs, permissions
+#   runway plan --stage prod     # what is already done, what is pending
+#   runway deploy --stage prod   # creates what is missing, in dependency order
+version: 1
+app: gcptree
+
+# Values used in several places below; change them here only.
+vars:
+  billing_project: billing-data-1234         # project holding the billing export
+  billing_dataset: billingdata
+  billing_table: gcp_billing_export_v1_000000_000000_000000
+  job_project: billing-data-1234             # project billed for the queries (GCPTREE_JOB_PROJECT)
+
+provider:
+  project: acme-sandbox-26c8           # deployment project
+  region: europe-west1
+  enable_apis: true                       # enable missing APIs on the deployment project
+  apis:
+    - telemetry.googleapis.com            # OTLP traces (OTEL_EXPORTER_OTLP_ENDPOINT)
+    - cloudtrace.googleapis.com           # where telemetry.googleapis.com stores the traces
+  # Docker repository, source bucket and build service account, created when
+  # missing with default names: repository `runway`, bucket
+  # `${project}-runway-sources`, account `runway-build@${project}.iam...`.
+  create_build_resources: true
+
+# Buckets created and kept configured by runway: uniform access, public access
+# prevention, same region as the service unless `location` is set.
+buckets:
+  cache:
+    name: "${project}-gcptree-cache"
+    # location: europe-west1              # defaults to provider.region
+    # delete_after_days: 30               # gcptree already removes its stale objects
+
+service:
+  source: .                               # no Dockerfile: built with buildpacks (npm start)
+  port: 8080
+  cpu: "1"
+  memory: 1Gi
+  concurrency: 20
+  timeout_seconds: 300
+  min_instances: 0
+  max_instances: 2
+  public: false                           # never public: IAP below
+  ingress: all                            # allowed by the service tag below
+
+  # The organization policy constraints/run.allowedIngress only allows
+  # `ingress: all` (needed for IAP on the run.app URL) on resources carrying
+  # this tag. It is bound to this Cloud Run service only, not the project.
+  tags:
+    "210987654321/allowIngressAllForCloudRun": allow-ingress-all
+  # A service can only be tagged once it exists: on the first deploy runway
+  # creates the real service with ingress internal (which the policy allows),
+  # binds the tag, waits until it is effective, then switches ingress to all.
+  bootstrap: {}
+
+  # Optional OpenTelemetry Collector sidecar (Google-built). Without `version`
+  # the newest release is used at deploy time; the app then sends OTLP to
+  # http://localhost:4318 and runway grants the collector's roles.
+  # otel_collector:
+  #   version: "0.160.0"
+
+  # Startup and liveness probes on /healthz (instant, calls no Google API).
+  # Defaults: startup every 10s (12 failures allowed), liveness every 30s.
+  health_check:
+    path: /healthz
+
+  # Runtime identity: created if missing, least-privilege grants.
+  service_account: "gcptree-run@${project}.iam.gserviceaccount.com"
+  identity:
+    create: true
+    display_name: gcptree (Cloud Run)
+    roles:
+      - role: roles/bigquery.dataViewer   # the billing export dataset only
+        dataset: "${vars.billing_project}.${vars.billing_dataset}"
+      - role: roles/bigquery.jobUser      # run queries in the job project
+        project: "${vars.job_project}"
+      - role: roles/storage.objectUser    # the cache bucket only
+        bucket: "${buckets.cache}"
+      - role: roles/telemetry.tracesWriter
+        project: "${project}"
+
+  env:
+    GCPTREE_TABLE: "${vars.billing_project}.${vars.billing_dataset}.${vars.billing_table}"
+    GCPTREE_CACHE_BUCKET: "gs://${buckets.cache}/gcptree"
+    GCPTREE_JOB_PROJECT: "${vars.job_project}"
+    GCPTREE_TZ: America/Los_Angeles       # keep to match invoices
+    GCPTREE_TAG_KEY: cost_center
+    GCPTREE_MAX_GB: "100"                 # cap per load (dry-run checked)
+    GCPTREE_REFRESH_MIN: "10"
+    GCPTREE_TTL: "1440"
+    GCPTREE_DAYS: "30"
+    OTEL_EXPORTER_OTLP_ENDPOINT: https://telemetry.googleapis.com
+
+  # Identity-Aware Proxy: only these groups get in.
+  iap:
+    enabled: true
+    members:
+      - group:PLATFORM-DEVOPS@example.com
+      - group:PLATFORM-ADMIN@example.com
+
+retry:
+  attempts: 5            # IAM and API enablement propagate for a while
+  delay: 10s
+  max_delay: 60s
+
+stages:
+  prod: {}

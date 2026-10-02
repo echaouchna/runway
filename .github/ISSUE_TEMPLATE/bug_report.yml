@@ -1,0 +1,75 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please **remove project IDs, emails, URLs and anything secret** from what you paste.
+        Many problems are explained by `runway doctor --stage <stage>`: please run it first.
+  - type: input
+    id: version
+    attributes:
+      label: runway version
+      description: Output of `runway --version`.
+      placeholder: runway 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How do you run runway?
+      options:
+        - Release binary
+        - Container image (ghcr.io)
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 15 / GitLab CI runner
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran.
+      render: shell
+      placeholder: runway deploy --stage dev
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Output of the command, ideally with `-v`. Include the full error and its hints.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal runway.yaml
+      description: The smallest configuration that reproduces the problem (anonymized).
+      render: yaml
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Organization policies, impersonation or Workload Identity Federation, anything unusual about the project.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed secrets and identifying information.
+          required: true

@@ -1,0 +1,5 @@
+target/
+.git/
+.cargo/registry/
+.cargo/git/
+**/*.swp

@@ -1,0 +1,51 @@
+# Homepage (site/) and documentation (docs/, MkDocs Material) on GitHub Pages.
+#
+# Disabled until the repository variable PAGES_ENABLED is "true" (Settings ->
+# Secrets and variables -> Actions -> Variables), so nothing is published
+# during the closed beta by accident. A Pages site is always public, even from
+# a private repository (except with GitHub Enterprise Cloud access control).
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "site/**", "mkdocs.yml", "CHANGELOG.md", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ vars.PAGES_ENABLED == 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install -r docs/requirements.txt
+      - name: Build documentation and homepage
+        run: |
+          mkdocs build --strict --site-dir _site/docs
+          cp -r site/. _site/
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

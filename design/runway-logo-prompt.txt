@@ -1,0 +1,13 @@
+Generated with the built-in image_gen tool, with transparent_background=true.
+
+Use case: logo-brand
+Asset type: final logo for "runway", a Rust CLI that deploys applications to Google Cloud Run from one configuration file.
+Primary request: Create one beautiful, original, exceptionally refined logo, a symbol and lowercase wordmark horizontal lockup. Be creative and make it memorable.
+Subject: A bold geometric lowercase r monogram built from a continuous folded runway ribbon. Its vertical stem and rounded shoulder imply the r; the outgoing ribbon lifts diagonally upward to suggest confident deployment and takeoff. Use a sharply designed negative-space slit or short runway center-line within the mark, very restrained. The silhouette must be simple, distinctive, balanced, and recognizable at favicon size. This is a sophisticated software brand with a clever visual idea.
+Style/medium: Precise flat vector-style brand artwork, crisp clean edges, masterful optical alignment, no texture. One finished logo only.
+Color palette: use the existing site's vivid cyan #22d3ee and soft violet #a78bfa for the folded symbol, with controlled transition or two solid planes; wordmark in deep midnight navy #0b1020.
+Text (verbatim): "runway"
+Typography: Bespoke-looking modern geometric lowercase sans serif, medium-bold, generous but carefully balanced spacing, subtly echo the rounded shoulder and angled cut in the symbol. Correct spelling r-u-n-w-a-y.
+Composition: Spacious horizontal lockup with symbol to left, wordmark to right, visually centered, excellent proportion, generous transparent margin, symbol approximately wordmark cap-height to 1.4 times wordmark height.
+Backdrop: actual transparent background, no opaque canvas.
+Constraints: No tagline, no extra labels, no brand sheet, no mockup, no drop shadow, no glow, no 3D, no clip-art cloud, no aircraft, no rocket, no generic arrow floating separately, no watermark. A single production-ready logo.

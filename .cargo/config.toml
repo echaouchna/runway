@@ -1,0 +1,6 @@
+# Faster links on aarch64 Linux: lld instead of the system linker (measured:
+# incremental build ~7 s -> ~2 s, test build ~13 s -> ~4 s). Requires `lld`
+# (`apt install lld`, `pacman -S lld`, `dnf install lld`). x86_64 Linux already
+# uses Rust's bundled lld by default, and macOS's linker is fast.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

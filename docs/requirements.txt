@@ -1,0 +1,3 @@
+# Documentation site (mkdocs build --strict). Pinned for reproducible builds.
+mkdocs==1.6.1
+mkdocs-material==9.6.21

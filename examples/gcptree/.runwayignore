@@ -1,0 +1,8 @@
+# Files runway does not upload for the Cloud Build (gitignore syntax).
+# Credentials such as .aws/ and .env files are always excluded.
+.cache/
+.agents/
+.codex/
+node_modules/
+test/
+gcptree.config.json

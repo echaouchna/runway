@@ -1,0 +1,12 @@
+/target
+# CARGO_HOME of the GitLab CI; the project config is versioned
+/.cargo/*
+!/.cargo/config.toml
+.runway/
+*.swp
+/site-build/
+/_site/
+.venv/
+.DS_Store
+# Local notes, never committed
+*.local.md

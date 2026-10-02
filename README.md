@@ -1,0 +1,189 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="site/assets/runway-logo-dark.svg">
+  <img src="site/assets/runway-logo.png" alt="runway" width="420">
+</picture>
+
+**Cloud Run deployments from one file and one command.**
+
+Build, identity, secrets, traffic and guardrails for Google Cloud Run,
+described in a `runway.yaml` next to your code.
+
+[![CI](https://github.com/OWNER/runway/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/runway/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Status: beta](https://img.shields.io/badge/status-beta-orange)
+
+[Documentation](https://OWNER.github.io/runway/docs) ·
+[Getting started](https://OWNER.github.io/runway/docs/getting-started/) ·
+[Configuration](https://OWNER.github.io/runway/docs/configuration/) ·
+[Changelog](CHANGELOG.md) ·
+[Roadmap](docs/roadmap.md)
+
+</div>
+
+---
+
+```yaml
+# runway.yaml
+version: 1
+app: hello
+provider:
+  project: my-project
+  region: europe-west1
+  enable_apis: true
+  create_build_resources: true
+service:
+  source: .                  # Dockerfile, or buildpacks when there is none
+  service_account: "hello-run@${project}.iam.gserviceaccount.com"
+  identity: { create: true }
+  secrets:
+    API_KEY: { secret: api-key }
+stages:
+  dev: {}
+  prod:
+    service: { min_instances: 1 }
+```
+
+```console
+$ runway plan --stage dev      # exact diff against the live service
+$ runway deploy --stage dev    # provision, build, roll out, wait until healthy
+✓ hello-dev created in 74s
+URL:      https://hello-dev-…-ew.a.run.app
+```
+
+## Why runway
+
+Deploying to Cloud Run is easy once. Doing it well, every day, across
+stages, usually means CI YAML for builds, Terraform for the service, IAM and
+secrets, and shell glue between them. runway puts the **whole lifecycle of a
+Cloud Run service** in one file and one tool:
+
+- **One file, one command.** Image build, runtime identity and least-privilege
+  grants, secrets, buckets, probes, scaling, IAP, tags and traffic.
+- **No state file, no cluster.** runway reads the live project, changes only
+  what differs, and is safe to re-run. An interrupted deploy resumes.
+- **Exact plans.** `runway plan` shows field-level changes to the service,
+  the image, the traffic split and every grant before anything happens.
+- **A URL per branch, canaries on main.** `--preview $BRANCH` deploys without
+  traffic; `--traffic 10` starts a canary; `runway traffic --promote` finishes it.
+- **Secrets without the dance.** Declare a secret, runway creates it empty,
+  grants who may fill it, and stops the deploy (with the exact command) until
+  it has a value.
+- **Built for real organizations.** Org-policy-friendly first deploys,
+  service tags, IAP, impersonation and Workload Identity Federation for CI.
+
+## How it works
+
+```mermaid
+%%{init: {"theme": "base", "htmlLabels": false, "themeVariables": {"fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif", "fontSize": "16px", "lineColor": "#64748b", "edgeLabelBackground": "#f8fafc"}, "flowchart": {"curve": "basis", "nodeSpacing": 36, "rankSpacing": 44, "wrappingWidth": 280, "minNodeWidth": 240}}}%%
+flowchart TB
+    config("runway.yaml<br/>Source or image · stages · resources")
+    live[("Live Google Cloud<br/>Service · IAM · registry · resources")]
+    runway("runway<br/>Validate + resolve configuration<br/>Compare desired and live state")
+    plan("runway plan<br/>Read-only diff + explicit unknowns")
+
+    subgraph deploy["runway deploy · apply only what differs"]
+        direction TB
+        prepare("Prepare resources<br/>APIs · IAM · secrets · storage")
+        image("Build or reuse an image<br/>Cloud Build → Artifact Registry<br/>Or use an existing image")
+        service("Reconcile Cloud Run<br/>Wait for readiness<br/>Configure access and traffic")
+        ready(["Ready service + URL<br/>Branch previews · canaries · rollback"])
+        prepare --> image --> service --> ready
+    end
+
+    config -->|"Desired configuration"| runway
+    live -->|"Read current state"| runway
+    runway --> plan
+    runway --> prepare
+
+    classDef input fill:#ecfeff,stroke:#0891b2,color:#164e63,stroke-width:2px
+    classDef engine fill:#0b1020,stroke:#22d3ee,color:#e7ecff,stroke-width:3px
+    classDef preview fill:#f0f9ff,stroke:#0891b2,color:#164e63,stroke-width:2px
+    classDef step fill:#f5f3ff,stroke:#8b5cf6,color:#4c1d95,stroke-width:2px
+    classDef result fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:2px
+    class config,live input
+    class runway engine
+    class plan preview
+    class prepare,image,service step
+    class ready result
+    style deploy fill:#faf5ff,stroke:#a78bfa,color:#5b21b6,stroke-width:2px
+```
+
+Every step reads live state before making changes. An existing image skips
+the build, and an interrupted deployment can be run again safely. The live
+project is the state: no state file or cluster to maintain.
+
+## Install
+
+> runway is in **closed beta**. Binaries and the container image are
+> published with each [release](https://github.com/OWNER/runway/releases).
+
+```sh
+# from source (Rust 1.91+)
+cargo install --locked --git https://github.com/OWNER/runway runway
+
+# container image (CI)
+docker run --rm ghcr.io/OWNER/runway:latest runway --help
+```
+
+runway uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
+`gcloud auth application-default login` locally, Workload Identity Federation
+in CI. Shell completions: `runway completions bash|zsh|fish|nushell|xonsh|elvish|powershell`.
+
+## Quick start
+
+```sh
+runway init --app hello --project my-project   # runway.yaml + a runnable example
+runway doctor --stage dev                      # credentials, APIs, permissions
+runway deploy --stage dev
+runway logs --stage dev --follow
+```
+
+Then read [Getting started](https://OWNER.github.io/runway/docs/getting-started/).
+
+## Features
+
+| Area | What you get |
+|---|---|
+| **Build** | Dockerfile or Google Cloud buildpacks on Cloud Build; content-addressed images (same source = no rebuild); base-image updates trigger rebuilds; release tags from your changelog |
+| **Identity** | Runtime service account created on demand; roles on exactly one project, bucket, dataset, secret or repository; impersonation |
+| **Secrets** | References as env vars or files; created empty with adders; deploy waits for values; new versions roll out with the next deploy |
+| **Traffic** | Branch previews with their own URL, canaries, promote, explicit splits, rollback |
+| **Guardrails** | Private by default, IAP, Resource Manager tags (service and project), org-policy-friendly bootstrap, ownership labels |
+| **Platform** | API enablement, buckets, Artifact Registry, sidecars (any image) and an OpenTelemetry Collector sidecar, Cloud Storage volumes, HTTP probes |
+| **Operations** | `plan`, `info`, `logs`, `describe` (ASCII/Mermaid), `undeploy` (keeps data), JSON output, stable exit codes, retries that understand IAM propagation |
+
+See [Limitations and status](docs/limitations.md) for what runway does not
+do yet and what has been verified against Google Cloud.
+
+## How it compares
+
+| | CI + Terraform | GitOps (Argo CD) | runway |
+|---|---|---|---|
+| What the app team maintains | CI YAML + HCL, often in several repos | CI + manifests + controllers' CRDs | one `runway.yaml` |
+| Extra infrastructure | state buckets, Terraform pipeline | a Kubernetes cluster and controllers | none |
+| Branch previews / canaries | build it yourself | possible, Kubernetes-centric | built in |
+| Drift | next apply | continuously healed | next plan / deploy |
+
+Terraform remains a good fit for shared platform resources (networks, load
+balancers, DNS). runway focuses on the part that changes every day: the
+Cloud Run application.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md) · [Configuration](docs/configuration.md) · [Commands](docs/commands.md)
+- [Previews, canaries and traffic](docs/traffic.md) · [Secrets](docs/secrets.md) · [CI/CD](docs/ci-cd.md)
+- [Permissions](docs/permissions.md) · [How it works](docs/how-it-works.md) · [Undeploying](docs/undeploy.md)
+- [Architecture](docs/architecture.md) · [Roadmap](docs/roadmap.md) · [Limitations and status](docs/limitations.md)
+
+## Contributing
+
+Contributions are welcome: bug reports, documentation, features. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
+Security issues: see [SECURITY.md](SECURITY.md), please do not open a public issue.
+
+## License
+
+[Apache License 2.0](LICENSE). runway is not affiliated with or endorsed by
+Google. Google Cloud and Cloud Run are trademarks of Google LLC.
