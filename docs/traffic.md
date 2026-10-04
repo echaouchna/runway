@@ -23,6 +23,23 @@ new revision. A deploy whose revision template did not change (for example a
 traffic-only or ingress-only change) sends the live template back untouched,
 so Cloud Run creates no revision.
 
+**Nothing is redeployed when the URL already serves it.** Before creating a
+revision, runway reads the revision behind the URL the deploy changes: the
+main URL (one revision serving 100%), the preview's tag, or the canary. If
+that revision already runs the same image and configuration (resources,
+scaling, environment, secrets, probes, volumes, sidecars, identity), it keeps
+serving. No revision is created and no traffic moves; only what really
+differs is applied, such as a new canary percentage or ingress. For example:
+
+- Redeploying `feature/login` after another branch was previewed leaves its
+  URL on its revision.
+- A main deploy after a preview, with production's code unchanged, changes
+  nothing.
+
+`plan` shows the same result (a note names the revision kept), and it shows
+`+ revision` when a preview or canary needs a revision of its own although
+its configuration matches.
+
 Typical CI (GitLab):
 
 ```yaml

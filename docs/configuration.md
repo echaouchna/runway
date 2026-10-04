@@ -168,6 +168,57 @@ authentication or TLS proxy, a log forwarder.
 CPU is allocated per container: with request-based billing, sidecars only get
 CPU while requests are being served.
 
+## Removing access
+
+**What runway records.** The grants runway itself adds for a service are
+recorded on the service (annotation `runway.dev/grants`, no state file), as
+soon as they are made:
+
+- the runtime account's roles, both `identity.roles` and those implied by
+  secrets and volumes;
+- secret `adders`;
+- `iap.members`.
+
+A configured grant that was already in place when runway checked it is never
+recorded: someone else granted it.
+
+The record is saved even when the deploy fails later, for example on an
+empty secret, a failed build, a refused rollout or a post-rollout step. A
+write whose answer was lost (timeout, 5xx) counts as runway's if a later
+read shows it: runway reads once more before failing, so this holds even
+when the deploy stops right there.
+
+Two exceptions leave grants unrecorded; they then look pre-existing to the
+next deploy and are never revoked:
+
+- a first deploy that fails before the service exists has nowhere to record;
+- a lost write whose confirming read fails too.
+
+**What happens when you remove one.** Removing a recorded entry from
+`runway.yaml` revokes it after the rollout of a **main deploy** (no
+`--preview`, no `--traffic`), once a single revision serves all of the
+traffic. Until then, nothing is revoked:
+
+- previews and canaries never revoke;
+- neither does a deploy after which other revisions still serve part of the
+  traffic, since they may still need the access.
+
+The entry stays recorded and is revoked by the next main deploy; `runway
+plan` for a main deploy lists it with `-`. Preview URLs (no traffic) of older
+revisions may lose that access. A revocation that fails stays recorded and is
+retried. Adding an IAP member or an adder shows just that member, for example
+`+ IAP access (grant to group:new@example.com)`.
+
+**What is never revoked:**
+
+- Access runway did not grant: given by hand or by another tool (even if it
+  is also in `runway.yaml`), or removed from `runway.yaml` before the first
+  deploy that recorded grants.
+- Roles of a runtime account that runway did not create for this service:
+  another service may share that account and need the role. They are kept,
+  and `plan` says so.
+- The shared build account's roles.
+
 ## Stage override precedence
 
 From highest to lowest:

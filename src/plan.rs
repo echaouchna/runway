@@ -49,6 +49,9 @@ pub struct ServiceSpec {
 pub struct TrafficSpec {
     pub mode: crate::traffic::Mode,
     pub entries: Vec<crate::traffic::Entry>,
+    /// The target already behind the mode's URL, when its revision runs
+    /// this configuration: it keeps serving, no revision is created.
+    pub serve: Option<crate::traffic::Target>,
 }
 
 impl Default for TrafficSpec {
@@ -57,6 +60,7 @@ impl Default for TrafficSpec {
         Self {
             entries: crate::traffic::plan(None, &mode),
             mode,
+            serve: None,
         }
     }
 }
@@ -99,6 +103,7 @@ impl ServiceSpec {
         self.traffic = TrafficSpec {
             entries: crate::traffic::plan(None, &mode),
             mode,
+            serve: None,
         };
         self
     }
@@ -106,7 +111,8 @@ impl ServiceSpec {
     /// The split for this mode given the live traffic (`None`: new service).
     pub fn with_current_traffic(&self, current: Option<&crate::traffic::Current>) -> Self {
         let mut s = self.clone();
-        s.traffic.entries = crate::traffic::plan(current, &s.traffic.mode);
+        s.traffic.entries =
+            crate::traffic::plan_with(current, &s.traffic.mode, s.traffic.serve.clone());
         s
     }
 
@@ -715,6 +721,7 @@ pub fn render_text(p: &Plan) -> String {
                 crate::provision::StepState::InSync => "=",
                 crate::provision::StepState::Pending => "+",
                 crate::provision::StepState::Unknown => "?",
+                crate::provision::StepState::PendingRemoval => "-",
             };
             s.push_str(&diff_line(&c, "  ", mark, &st.step, Some(&st.detail)));
         }

@@ -117,9 +117,37 @@ what is missing, and is retried per the `retry` policy):
    requires for `allUsers` is in place first).
 11. IAP: make sure the IAP service agent exists and can invoke the service;
     grant `roles/iap.httpsResourceAccessor` to `iap.members`.
-12. Public access (`allUsers` invoker added or removed).
+12. Main deploys only, once one revision serves all traffic: revoke what
+    runway granted earlier but `runway.yaml` no longer lists (IAP members,
+    runtime roles, adders; see
+    [Removing access](configuration.md#removing-access)). Then record on the
+    service what runway granted (also done right after provisioning, so a
+    failed build or rollout loses nothing).
+13. Public access (`allUsers` invoker added or removed).
 
 `runway describe` prints this order for a given configuration.
+
+**What runs at the same time.** The order above is a dependency order, not
+a queue:
+
+- The registry login runs while APIs are enabled.
+- Steps 4 to 7 run in waves: everything in a wave starts together, and a
+  wave starts when the previous one is done. The waves are project tags;
+  then buckets, the repository, secrets and service accounts; then grants;
+  then the secret value check.
+- Grants that change the same IAM policy (or the same BigQuery access list,
+  which has no etag) run one after another; grants on different policies run
+  together.
+- The build (step 8) starts as soon as its own prerequisites exist (source
+  bucket, repository, build service account and its grants). The runtime
+  account, its grants and the secrets are provisioned while it runs.
+- After the rollout, service tags are bound together, then the two IAP
+  steps run together (they change different policies).
+- Public access always comes last.
+
+Results are printed in this order. If a step fails, the steps already running
+finish, the next wave does not start, and the error is reported. A build
+still running keeps going in Cloud Build, and the next deploy reuses it.
 
 **First deploy with `bootstrap`.** Tags can only be bound to a service that
 exists, but an organization policy such as `constraints/run.allowedIngress`

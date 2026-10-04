@@ -108,14 +108,22 @@ pub(crate) async fn resolve_secret_versions(
 ) -> Result<crate::config::Deployment, Error> {
     let mut out = d.clone();
     let svc = &mut out.service;
-    let refs = svc.secrets.iter_mut().chain(
-        svc.sidecars
-            .values_mut()
-            .flat_map(|sc| sc.secrets.iter_mut()),
-    );
-    for (key, s) in refs.filter(|(_, s)| s.pin_latest && s.version == "latest") {
-        let full = s.full_name(&d.project);
-        match prov.newest_enabled_version(&full).await {
+    let refs: Vec<_> = svc
+        .secrets
+        .iter_mut()
+        .chain(
+            svc.sidecars
+                .values_mut()
+                .flat_map(|sc| sc.secrets.iter_mut()),
+        )
+        .filter(|(_, s)| s.pin_latest && s.version == "latest")
+        .collect();
+    // One lookup per secret, all at once; results are applied in order.
+    let names: Vec<String> = refs.iter().map(|(_, s)| s.full_name(&d.project)).collect();
+    let versions =
+        futures::future::join_all(names.iter().map(|n| prov.newest_enabled_version(n))).await;
+    for (((key, s), full), version) in refs.into_iter().zip(names).zip(versions) {
+        match version {
             Ok(Some(v)) => s.version = v,
             Ok(None) if strict => {
                 return Err(Error::prerequisite(format!(

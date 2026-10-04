@@ -119,6 +119,14 @@ impl Current {
 /// Traffic after deploying a new revision in `mode`. `current` is `None` when
 /// the service does not exist yet (the new revision then gets everything).
 pub fn plan(current: Option<&Current>, mode: &Mode) -> Vec<Entry> {
+    plan_with(current, mode, None)
+}
+
+/// [`plan`] with what the mode's URL should serve: `None` for a new revision
+/// (entries following `latest` are pinned first, since it moves), or the
+/// target already behind that URL when its revision runs the desired
+/// configuration (no revision is created, so nothing needs pinning).
+pub fn plan_with(current: Option<&Current>, mode: &Mode, serve: Option<Target>) -> Vec<Entry> {
     let Some(cur) = current else {
         return vec![Entry::new(
             Target::Latest,
@@ -129,10 +137,13 @@ pub fn plan(current: Option<&Current>, mode: &Mode) -> Vec<Entry> {
             },
         )];
     };
-    let pinned = cur.pinned();
+    let (pinned, serve) = match serve {
+        None => (cur.pinned(), Target::Latest),
+        Some(target) => (cur.entries.clone(), target),
+    };
     let out = match mode {
         Mode::Full => {
-            let mut v = vec![Entry::new(Target::Latest, 100, "")];
+            let mut v = vec![Entry::new(serve, 100, "")];
             v.extend(Current::tags_except(&pinned, &[CANARY_TAG]));
             v
         }
@@ -157,7 +168,7 @@ pub fn plan(current: Option<&Current>, mode: &Mode) -> Vec<Entry> {
                     .collect::<Vec<_>>(),
                 &[tag],
             ));
-            v.push(Entry::new(Target::Latest, 0, tag.clone()));
+            v.push(Entry::new(serve, 0, tag.clone()));
             v
         }
         Mode::Canary { percent } => {
@@ -170,7 +181,7 @@ pub fn plan(current: Option<&Current>, mode: &Mode) -> Vec<Entry> {
                 .collect();
             if served.is_empty() {
                 // Nothing else serves: the canary is the whole service.
-                let mut v = vec![Entry::new(Target::Latest, 100, CANARY_TAG)];
+                let mut v = vec![Entry::new(serve, 100, CANARY_TAG)];
                 v.extend(Current::tags_except(&pinned, &[CANARY_TAG]));
                 return normalize(v);
             }
@@ -183,7 +194,7 @@ pub fn plan(current: Option<&Current>, mode: &Mode) -> Vec<Entry> {
                     .collect::<Vec<_>>(),
                 &[CANARY_TAG],
             ));
-            v.push(Entry::new(Target::Latest, *percent, CANARY_TAG));
+            v.push(Entry::new(serve, *percent, CANARY_TAG));
             v
         }
     };
@@ -383,6 +394,62 @@ mod tests {
             entries,
             latest_ready: ready.into(),
         }
+    }
+
+    #[test]
+    fn serving_the_existing_target_leaves_traffic_unchanged() {
+        // Production on s-1, feat-a's revision s-2, feat-b latest (s-3).
+        let live = cur(
+            vec![
+                Entry::new(rev("s-1"), 100, ""),
+                Entry::new(rev("s-2"), 0, "feat-a"),
+                Entry::new(Target::Latest, 0, "feat-b"),
+            ],
+            "s-3",
+        );
+        // feat-a again, its revision already runs this configuration.
+        let feat_a = Mode::Preview {
+            tag: "feat-a".into(),
+        };
+        assert_eq!(
+            plan_with(Some(&live), &feat_a, Some(rev("s-2"))),
+            live.entries
+        );
+        // The main deploy, s-1 already serves it: nothing moves.
+        assert_eq!(
+            plan_with(Some(&live), &Mode::Full, Some(rev("s-1"))),
+            live.entries
+        );
+        // Without a matching revision, feat-a moves to a new one.
+        assert_eq!(
+            plan(Some(&live), &feat_a),
+            [
+                Entry::new(rev("s-1"), 100, ""),
+                Entry::new(Target::Latest, 0, "feat-a"),
+                Entry::new(rev("s-3"), 0, "feat-b"),
+            ]
+        );
+        // A canary kept at the same percentage; a new percentage only
+        // rebalances traffic between the existing revisions.
+        let canary = cur(
+            vec![
+                Entry::new(rev("s-1"), 90, ""),
+                Entry::new(Target::Latest, 10, CANARY_TAG),
+            ],
+            "s-4",
+        );
+        let at = |percent| Mode::Canary { percent };
+        assert_eq!(
+            plan_with(Some(&canary), &at(10), Some(Target::Latest)),
+            canary.entries
+        );
+        assert_eq!(
+            plan_with(Some(&canary), &at(25), Some(Target::Latest)),
+            [
+                Entry::new(rev("s-1"), 75, ""),
+                Entry::new(Target::Latest, 25, CANARY_TAG),
+            ]
+        );
     }
 
     #[test]

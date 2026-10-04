@@ -112,6 +112,79 @@ impl Reconciler<'_> {
         }
     }
 
+    /// The target behind the URL `spec`'s mode changes, when its revision
+    /// already runs `spec` (see [`run::revision_matches`]): deploying then
+    /// needs no new revision. A revision that cannot be read counts as
+    /// different, so the deploy creates a revision as it would otherwise.
+    pub async fn matching_revision(
+        &self,
+        svc: &Service,
+        spec: &ServiceSpec,
+    ) -> Option<(crate::traffic::Target, String)> {
+        let revisions = self.revisions?;
+        let (target, short) = run::mode_target(&run::current_traffic(svc), &spec.traffic.mode)?;
+        let rev = revisions
+            .get_revision()
+            .set_name(format!("{}/revisions/{short}", svc.name))
+            .send()
+            .await
+            .ok()?;
+        run::revision_matches(svc, &rev, spec).then_some((target, short))
+    }
+
+    /// Writes the grant record (`runway.dev/grants`) when it differs from
+    /// `live`'s; true when it wrote. Nothing without a service, nor an empty
+    /// record where there was none.
+    pub async fn save_grant_record(
+        &self,
+        name: &str,
+        live: Option<&Service>,
+        record: &[crate::provision::ManagedGrant],
+    ) -> Result<bool> {
+        let Some(svc) = live else {
+            return Ok(false);
+        };
+        let key = crate::provision::ANNOTATION_GRANTS;
+        let value = crate::provision::encode_grants(record);
+        let current = svc.annotations.get(key);
+        if current == Some(&value) || (current.is_none() && record.is_empty()) {
+            return Ok(false);
+        }
+        self.set_annotation(name, key, &value).await.map(|()| true)
+    }
+
+    /// Sets one service annotation: an update of `annotations` only, so no
+    /// revision is created and traffic is untouched.
+    pub async fn set_annotation(&self, name: &str, key: &str, value: &str) -> Result<()> {
+        for attempt in 1..=MAX_MUTATION_ATTEMPTS {
+            let Some(mut svc) = self.get(name).await? else {
+                return Ok(());
+            };
+            if svc.annotations.get(key).map(String::as_str) == Some(value) {
+                return Ok(());
+            }
+            svc.annotations.insert(key.into(), value.into());
+            match self
+                .run
+                .update_service()
+                .set_service(svc)
+                .set_update_mask(google_cloud_wkt::FieldMask::default().set_paths(["annotations"]))
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e)
+                    if (is_concurrency_conflict(&e) || is_ambiguous(&e))
+                        && attempt < MAX_MUTATION_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(api_error(e, &format!("updating annotations of {name}"))),
+            }
+        }
+        unreachable!("loop returns")
+    }
+
     /// Creates or updates the service so that it matches `spec`.
     pub async fn apply(
         &self,
@@ -197,7 +270,7 @@ impl Reconciler<'_> {
                     check_ownership(&current, app, stage, adopt)?;
                     if !force
                         && run::ownership(&current, app, stage) == Ownership::Owned
-                        && diff(&run::observed_flat(&current), &desired_flat).is_empty()
+                        && run::pending_changes(&current, spec).is_empty()
                         && run::annotations_current(&current, spec)
                     {
                         return Ok(Applied {

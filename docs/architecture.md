@@ -21,11 +21,14 @@ live Service (Cloud Run v2) ─► gcp::run::observed_flat ┴► plan::diff ─
                             └► gcp::run::current_traffic ─► traffic::plan ─► traffic split
 
 deploy:
-  APIs ─► inspect (service + source hash + image lookup, concurrently)
-       ─► project tags ─► buckets, secrets, repository ─► service accounts ─► grants
-       ─► secret values present? ─► build if needed (Cloud Build) ─► service tags
-       ─► create/update (update mask, etag, template reuse) ─► wait until ready
-       ─► IAP ─► public/private access
+  APIs ║ registry login ─► inspect (service + source hash + image lookup, concurrently)
+       ─► waves (provision::waves, Provisioner::apply_all):
+            project tags ─► buckets ║ secrets ║ repository ║ accounts
+            ─► grants (one lane per IAM policy) ─► secret values present?
+          the build starts once its own prerequisites exist and runs ║ the rest
+       ─► service tags ─► create/update (update mask, etag, template reuse)
+       ─► wait until ready ─► tags ║ IAP ─► public/private access
+  (║ = concurrently)
 ```
 
 ## Modules
@@ -72,9 +75,13 @@ deploy:
   images, names the uploaded object, the image tag and a Cloud Build tag.
   Unchanged inputs are not rebuilt; an in-flight build of the same inputs is
   attached to, not duplicated.
-- **Concurrent independent reads.** Plans, deploys, `info`, `doctor` and the
+- **Concurrent independent work.** Plans, deploys, `info`, `doctor` and the
   readiness poll issue independent requests concurrently, so latency is
-  bounded by the slowest call.
+  bounded by the slowest call. Provisioning runs in dependency waves
+  (`provision::waves`). Writes to one IAM policy are serialized in a lane;
+  different policies run together. A source build overlaps the provisioning
+  it does not depend on. Results are reported in step order, and a failure
+  stops before the next wave.
 - **Bounded waits, ambiguity handled.** Every poll has a deadline and honours
   Ctrl-C. Mutations with an ambiguous outcome (timeouts, transport errors,
   5xx) are followed by a read before any retry.
