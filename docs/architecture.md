@@ -43,7 +43,7 @@ deploy:
 | `build` | Deterministic source scan and hash, parallel compression (`package`), base-image digests (`inputs`), Cloud Build (`cloudbuild`), release tags (`release`) |
 | `gcp` | Client construction (ADC, impersonation), Cloud Run request construction and observation (`run`), registry digest adapter, IAM policy edits, buckets, logs, error classification |
 | `deploy` | Reconciliation of the service: ownership, create/update with ambiguity handling, readiness, invoker IAM |
-| `provision` | Stateless steps with a read-only `check` (plan) and an idempotent `apply` (deploy): APIs, project and service tags, buckets, secrets, repository, service accounts, grants, secret values, IAP |
+| `provision` | Stateless steps with a read-only `check` (plan) and an idempotent `apply` (deploy): APIs, project and service tags, buckets, secrets, repository, service accounts, grants, secret values, IAP; removal of access and tags `runway.yaml` does not list on what runway owns (`unlisted`) and of grants it recorded elsewhere |
 | `retry`, `poll` | Per-step retries with backoff and error classification; bounded polling |
 | `describe` | Offline ASCII/Mermaid diagram and explanation of a stack |
 | `commands` | One module per CLI command |

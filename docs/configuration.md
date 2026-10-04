@@ -170,9 +170,36 @@ CPU while requests are being served.
 
 ## Removing access
 
-**What runway records.** The grants runway itself adds for a service are
-recorded on the service (annotation `runway.dev/grants`, no state file), as
-soon as they are made:
+`runway.yaml` is the complete list of access on what runway owns: anything
+else found there is removed. Elsewhere, runway only removes what it granted
+itself.
+
+**Authoritative: what is not listed is removed.** On these, an entry
+`runway.yaml` does not list is removed, whoever added it (by hand, another
+tool, an earlier deploy):
+
+| What | Removed | Only when |
+|---|---|---|
+| IAP access | members of `roles/iap.httpsResourceAccessor` on the service's IAP resource not in `iap.members` (all of them while `iap` is disabled, whoever added them) | always (the service is runway's). Without `iap` and with `iap.googleapis.com` disabled there is nothing to check: no IAP access is in effect |
+| Service tags | tags bound **directly** to the service not in `service.tags` | always. Tags inherited from the project, folder or organization are not bindings on the service and stay |
+| Secret adders | members of `roles/secretmanager.secretVersionAdder` not in `adders` | the secret carries runway's labels for this app and stage (runway created it) |
+| Runtime roles | roles of the runtime account that runway does not grant (`identity.roles`, and those implied by secrets and volumes) | runway created the account for this service. The resources checked are the deployment project and every resource `runway.yaml` grants on, now or in an earlier deploy |
+
+Only unconditional bindings are considered: conditional bindings and other
+roles on the same resources are never touched. Roles granted to the runtime
+account on resources runway has never granted on (a bucket `runway.yaml`
+never referenced, say) cannot be found without Cloud Asset Inventory and stay.
+
+!!! warning
+    A role or IAP member added by hand to what runway owns is removed by the
+    next main deploy. Add it to `runway.yaml` instead. `runway plan` lists
+    every removal with `-` first, for example
+    `- revoke roles/editor on project my-gcp-project from gcptree-run`.
+
+**Provenance: only what runway granted is removed.** Elsewhere (a runtime
+account runway did not create, a secret it did not create), runway removes
+only the grants it added itself. It records them on the service (annotation
+`runway.dev/grants`, no state file) as soon as they are made:
 
 - the runtime account's roles, both `identity.roles` and those implied by
   secrets and volumes;
@@ -189,34 +216,35 @@ read shows it: runway reads once more before failing, so this holds even
 when the deploy stops right there.
 
 Two exceptions leave grants unrecorded; they then look pre-existing to the
-next deploy and are never revoked:
+next deploy and are not revoked in provenance mode:
 
 - a first deploy that fails before the service exists has nowhere to record;
 - a lost write whose confirming read fails too.
 
-**What happens when you remove one.** Removing a recorded entry from
-`runway.yaml` revokes it after the rollout of a **main deploy** (no
+**When removals happen.** After the rollout of a **main deploy** (no
 `--preview`, no `--traffic`), once a single revision serves all of the
-traffic. Until then, nothing is revoked:
+traffic. Until then, nothing is removed:
 
-- previews and canaries never revoke;
+- previews and canaries never remove access or tags;
 - neither does a deploy after which other revisions still serve part of the
   traffic, since they may still need the access.
 
-The entry stays recorded and is revoked by the next main deploy; `runway
-plan` for a main deploy lists it with `-`. Preview URLs (no traffic) of older
-revisions may lose that access. A revocation that fails stays recorded and is
-retried. Adding an IAP member or an adder shows just that member, for example
-`+ IAP access (grant to group:new@example.com)`.
+A recorded grant stays recorded and is revoked by the next main deploy;
+`runway plan` for a main deploy lists each removal with `-`. Preview URLs (no
+traffic) of older revisions may lose that access. A removal that fails is
+retried by the next deploy. IAP, tags, adders and runtime roles are checked
+separately: if runway cannot read one of them, the deploy warns, removes
+nothing there, and still removes the others (`plan` marks it unchecked). Adding an IAP member or an adder shows just that
+member, for example `+ IAP access (grant to group:new@example.com)`.
 
-**What is never revoked:**
+**What is never removed:**
 
-- Access runway did not grant: given by hand or by another tool (even if it
-  is also in `runway.yaml`), or removed from `runway.yaml` before the first
-  deploy that recorded grants.
-- Roles of a runtime account that runway did not create for this service:
-  another service may share that account and need the role. They are kept,
-  and `plan` says so.
+- Project tags, and any access on resources runway does not own: the project
+  policy for other accounts, shared buckets and datasets for other members.
+- In provenance mode: access runway did not grant (given by hand or by
+  another tool, even if also in `runway.yaml`), and roles of a runtime account
+  runway did not create for this service: another service may share that
+  account and need the role. `plan` says so.
 - The shared build account's roles.
 
 ## Stage override precedence

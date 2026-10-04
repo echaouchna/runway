@@ -48,9 +48,42 @@ pub fn set_public(policy: &mut Policy, public: bool) -> bool {
 }
 
 /// IAM compares principals case-insensitively and returns emails in lowercase,
-/// so `group:EM-GO-X@example.com` and `group:em-go-x@example.com` are the same.
+/// so `group:Devs@example.com` and `group:devs@example.com` are the same.
 pub fn same_member(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+/// Members of `role` in unconditional bindings (conditional ones are not
+/// runway's to manage).
+pub fn members_of(policy: &Policy, role: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in policy
+        .bindings
+        .iter()
+        .filter(|b| b.role == role && b.condition.is_none())
+    {
+        for m in &b.members {
+            if !out.iter().any(|o| same_member(o, m)) {
+                out.push(m.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Roles `member` holds in unconditional bindings.
+pub fn roles_of(policy: &Policy, member: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in policy
+        .bindings
+        .iter()
+        .filter(|b| b.condition.is_none() && b.members.iter().any(|m| same_member(m, member)))
+    {
+        if !out.contains(&b.role) {
+            out.push(b.role.clone());
+        }
+    }
+    out
 }
 
 /// Members of `role` (unconditional bindings only) that are missing from the policy.

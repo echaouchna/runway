@@ -34,22 +34,32 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
   does not create. With a tag-based exception, use `service.tags` and
   `service.bootstrap` (see [How it works](how-it-works.md)).
 
-**No state file, so additive grants**
+**No state file**
 
-- Grants, tag bindings and IAP members are additive: runway cannot tell which
-  members it added in the past, so removing an entry from the configuration
-  does not revoke it. Revoke manually (`gcloud ... remove-iam-policy-binding`).
+- `runway.yaml` is the complete list of access on what runway owns (IAP
+  members, tags bound to the service, adders of secrets it created, roles of
+  a runtime account it created): anything else there is removed by the next
+  main deploy, including access added by hand. Elsewhere it only revokes the
+  grants it recorded on the service itself (see
+  [Removing access](configuration.md#removing-access)).
+- Roles granted to the runtime account on resources runway never granted on
+  are not found (that would need Cloud Asset Inventory) and stay.
+- A first deploy that fails before the service exists cannot record its
+  grants: in provenance mode they then look pre-existing and are not revoked.
 - Drift is detected and corrected by the next `plan` / `deploy`, not
   continuously.
-- `deploy` never deletes anything. `undeploy` deletes only the service, the
-  runtime service account runway created for that app and stage (marker in
-  its description), its grants, and optionally the app's images. Buckets and
-  secrets are always kept. Bucket locations cannot change.
+- `deploy` deletes no resources: it only removes access and tag bindings as
+  above. `undeploy` deletes only the service, the runtime service account
+  runway created for that app and stage (marker in its description), its
+  grants, and optionally the app's images. Buckets and secrets are always
+  kept. Bucket locations cannot change.
 
 **Builds and images**
 
 - The default buildpacks builder (`gcr.io/buildpacks/builder:latest`) is a
-  moving tag; pin `service.builder` for reproducible builds. Build-time
+  moving tag, republished often: each new digest makes the next deploy
+  rebuild, even with unchanged source (`deploy` says so). Pin
+  `service.builder` for reproducible builds and fewer rebuilds. Build-time
   environment variables for buildpacks are not configurable yet.
 - Builds run in the service region on the default worker pool; machine types
   and private pools are not configurable yet.
@@ -102,6 +112,10 @@ account.
 **Implemented and tested offline, not yet verified live**
 
 - Previews, canaries and `runway traffic` (tag URLs, pinning, promote).
+- Removing access: revocation of recorded grants, removal of access and tags
+  `runway.yaml` does not list, and their timing (main deploys only). Also
+  reusing a revision that already serves the same image and configuration
+  instead of creating one, and steps running in parallel.
 - Secrets: creation, adders, the stop-until-a-value step, version pinning,
   secret files; grants implied by secrets and volumes.
 - Generic sidecars (`service.sidecars`), including Cloud Run's handling of

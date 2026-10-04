@@ -1264,3 +1264,481 @@ async fn grants_made_before_a_failure_are_recorded() {
     );
     assert_eq!(saved, record);
 }
+
+fn authoritative_deployment() -> Deployment {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("runway.yaml");
+    std::fs::write(
+        &p,
+        format!(
+            r#"
+version: 1
+app: gcptree
+provider: {{project: my-gcp-project, region: europe-west1}}
+secrets:
+  apikey:
+    name: gcptree-prod-api-key
+    adders: [group:devops@example.com]
+service:
+  image: europe-west1-docker.pkg.dev/my-gcp-project/apps/gcptree:1
+  service_account: {SA}
+  identity:
+    create: true
+    roles:
+      - role: roles/bigquery.dataViewer
+        dataset: billing-data-1234.billingdata
+      - role: roles/bigquery.jobUser
+        project: billing-data-1234
+  env:
+    API_KEY: "${{secrets.apikey}}"
+  tags:
+    "123456789012/allow-public-access": "true"
+  iap:
+    members: [group:finops@example.com]
+stages: {{prod: {{}}}}
+"#
+        ),
+    )
+    .unwrap();
+    config::load_and_resolve(&p, "prod", &Overrides::default())
+        .unwrap()
+        .1
+        .deployment
+}
+
+/// Live state with access runway.yaml does not list, in each scope; the
+/// runtime account and the secret are runway's when `owned`.
+async fn unlisted_project(owned: bool) -> MockServer {
+    let s = MockServer::start().await;
+    let json200 = |v: Value| ResponseTemplate::new(200).set_body_json(v);
+    let sa = format!("serviceAccount:{SA}");
+    Mock::given(method("GET"))
+        .and(path("/v3/projects/my-gcp-project"))
+        .respond_with(json200(
+            json!({"name": "projects/123456", "projectId": "my-gcp-project"}),
+        ))
+        .mount(&s)
+        .await;
+    let (description, labels) = if owned {
+        (
+            "managed-by=runway app=gcptree stage=prod role=runtime",
+            json!({"managed-by": "runway", "runway-app": "gcptree", "runway-stage": "prod"}),
+        )
+    } else {
+        ("created by hand", json!({}))
+    };
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/projects/my-gcp-project/serviceAccounts/{SA}"
+        )))
+        .respond_with(json200(json!({"email": SA, "description": description})))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/projects/my-gcp-project/secrets/gcptree-prod-api-key",
+        ))
+        .respond_with(json200(json!({
+            "name": "projects/my-gcp-project/secrets/gcptree-prod-api-key",
+            "labels": labels
+        })))
+        .mount(&s)
+        .await;
+    let cond = json!({"expression": "request.time < timestamp('2030-01-01T00:00:00Z')", "title": "temporary"});
+    for (res, bindings) in [
+        (
+            format!("/v1/{IAP_RES}"),
+            json!([
+                {"role": "roles/iap.httpsResourceAccessor",
+                 "members": ["group:finops@example.com", "user:manual@example.com"]},
+                {"role": "roles/iap.httpsResourceAccessor", "members": ["user:temp@example.com"], "condition": cond},
+                {"role": "roles/iap.admin", "members": ["user:admin@example.com"]}
+            ]),
+        ),
+        (
+            "/v1/projects/my-gcp-project/secrets/gcptree-prod-api-key".to_string(),
+            json!([
+                {"role": "roles/secretmanager.secretVersionAdder",
+                 "members": ["group:devops@example.com", "user:intruder@example.com"]},
+                {"role": "roles/secretmanager.secretAccessor", "members": [sa]}
+            ]),
+        ),
+        (
+            "/v3/projects/my-gcp-project".to_string(),
+            json!([
+                {"role": "roles/editor", "members": [sa, "user:owner@example.com"]},
+                {"role": "roles/cloudsql.client", "members": [sa], "condition": cond}
+            ]),
+        ),
+        (
+            "/v3/projects/billing-data-1234".to_string(),
+            json!([
+                {"role": "roles/bigquery.jobUser", "members": [sa]},
+                {"role": "roles/bigquery.dataEditor", "members": [sa]}
+            ]),
+        ),
+    ] {
+        // Any method: Secret Manager reads policies with GET.
+        Mock::given(path(format!("{res}:getIamPolicy")))
+            .respond_with(json200(
+                json!({"version": 3, "etag": "BwX1", "bindings": bindings}),
+            ))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{res}:setIamPolicy")))
+            .respond_with(json200(json!({"version": 3, "etag": "BwX2"})))
+            .mount(&s)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(
+            "/bigquery/v2/projects/billing-data-1234/datasets/billingdata",
+        ))
+        .respond_with(json200(json!({"access": [
+            {"role": "READER", "userByEmail": SA},
+            {"role": "WRITER", "userByEmail": SA},
+            {"role": "READER", "userByEmail": "keep@example.com"}
+        ]})))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v3/tagValues/namespaced"))
+        .and(query_param("name", "123456789012/allow-public-access/true"))
+        .respond_with(json200(json!({"name": "tagValues/777"})))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v3/tagBindings"))
+        .respond_with(json200(json!({"tagBindings": [
+            {"name": "tagBindings/keep", "tagValue": "tagValues/777"},
+            {"name": "tagBindings/extra", "tagValue": "tagValues/888",
+             "tagValueNamespacedName": "123456789012/env/dev"}
+        ]})))
+        .mount(&s)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v3/tagBindings/extra"))
+        .respond_with(json200(json!({
+            "name": "operations/untag",
+            "done": true,
+            "response": {"@type": "type.googleapis.com/google.protobuf.Empty"}
+        })))
+        .mount(&s)
+        .await;
+    s
+}
+
+fn removal_names(steps: &[runway::provision::Step]) -> Vec<String> {
+    use runway::provision::Step;
+    let mut out: Vec<String> = steps
+        .iter()
+        .map(|s| match s {
+            Step::Revoke(g) => format!(
+                "{} {} {}",
+                g.member,
+                g.role,
+                g.target.as_ref().map_or("iap".into(), |t| t.to_string())
+            ),
+            Step::Untag { value, .. } => format!("untag {value}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn access_runway_yaml_does_not_list_is_removed_from_what_runway_owns() {
+    let d = authoritative_deployment();
+    let server = unlisted_project(true).await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let found = prov.unlisted(&[]).await;
+    assert!(found.unchecked.is_empty(), "{:?}", found.unchecked);
+    let steps = found.steps;
+    let sa = format!("serviceAccount:{SA}");
+    let mut expected = vec![
+        "user:manual@example.com roles/iap.httpsResourceAccessor iap".to_string(),
+        "user:intruder@example.com roles/secretmanager.secretVersionAdder secret projects/my-gcp-project/secrets/gcptree-prod-api-key".into(),
+        format!("{sa} roles/editor project my-gcp-project"),
+        format!("{sa} roles/bigquery.dataEditor project billing-data-1234"),
+        format!("{sa} roles/bigquery.dataEditor dataset billing-data-1234.billingdata"),
+        "untag 123456789012/env/dev".into(),
+    ];
+    expected.sort();
+    assert_eq!(removal_names(&steps), expected);
+
+    // Applied: only the unlisted entries go, everything else stays.
+    let retry = RetryConfig {
+        attempts: 1,
+        ..Default::default()
+    };
+    let iap_and_tag: Vec<_> = steps
+        .iter()
+        .filter(|s| {
+            matches!(s, runway::provision::Step::Untag { .. })
+                || matches!(s, runway::provision::Step::Revoke(g) if g.target.is_none())
+        })
+        .cloned()
+        .collect();
+    let done = prov
+        .apply_all(&iap_and_tag, &retry, &Progress::silent(), &|_| {})
+        .await
+        .unwrap();
+    assert!(
+        done.iter().all(|r| r.outcome == StepOutcome::Changed),
+        "{done:?}"
+    );
+    let reqs = server.received_requests().await.unwrap();
+    let iap_set = set_policy_bodies(&reqs, &format!("/v1/{IAP_RES}"));
+    let bindings = &iap_set[0]["policy"]["bindings"];
+    assert_eq!(bindings[0]["members"], json!(["group:finops@example.com"]));
+    assert_eq!(
+        bindings[1]["members"],
+        json!(["user:temp@example.com"]),
+        "conditional bindings are not runway's"
+    );
+    assert_eq!(bindings[2]["role"], "roles/iap.admin", "other roles stay");
+    assert!(
+        reqs.iter()
+            .any(|r| r.method.as_str() == "DELETE" && r.url.path() == "/v3/tagBindings/extra")
+    );
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| r.method.as_str() == "DELETE" && r.url.path() == "/v3/tagBindings/keep")
+    );
+}
+
+#[tokio::test]
+async fn an_account_or_secret_runway_did_not_create_keeps_its_access() {
+    let d = authoritative_deployment();
+    let server = unlisted_project(false).await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let found = prov.unlisted(&[]).await;
+    assert!(found.unchecked.is_empty(), "{:?}", found.unchecked);
+    let steps = found.steps;
+    assert_eq!(
+        removal_names(&steps),
+        [
+            "untag 123456789012/env/dev",
+            "user:manual@example.com roles/iap.httpsResourceAccessor iap",
+        ]
+    );
+}
+
+#[test]
+fn removals_found_twice_are_planned_once() {
+    use runway::config::RoleTarget;
+    use runway::provision::{ManagedGrant, Step, merge_removals};
+    let grant = |member: &str, role: &str| {
+        Step::Revoke(ManagedGrant {
+            member: member.into(),
+            role: role.into(),
+            target: Some(RoleTarget::Dataset {
+                project: "billing-data-1234".into(),
+                dataset: "billingdata".into(),
+            }),
+            runtime: true,
+        })
+    };
+    let recorded = vec![grant("group:Devs@example.com", "WRITER")];
+    let merged = merge_removals(
+        recorded,
+        vec![
+            grant("group:devs@example.com", "roles/bigquery.dataEditor"),
+            grant("group:devs@example.com", "roles/bigquery.dataViewer"),
+        ],
+    );
+    assert_eq!(merged.len(), 2, "{merged:?}");
+}
+
+#[tokio::test]
+async fn what_cannot_be_read_is_reported_and_the_rest_still_removed() {
+    let d = authoritative_deployment();
+    let server = unlisted_project(true).await;
+    Mock::given(path("/v3/projects/my-gcp-project:getIamPolicy"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({"error": {
+            "code": 403, "message": "permission denied", "status": "PERMISSION_DENIED"
+        }})))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let found = prov.unlisted(&[]).await;
+    assert_eq!(found.unchecked.len(), 1, "{:?}", found.unchecked);
+    assert!(found.unchecked[0].starts_with("runtime account roles: "));
+    let names = removal_names(&found.steps);
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(names.iter().all(|n| !n.starts_with("serviceAccount:")));
+}
+
+#[tokio::test]
+async fn revoking_a_dataset_role_keeps_conditional_entries() {
+    use runway::config::RoleTarget;
+    use runway::provision::{ManagedGrant, Step};
+    let server = MockServer::start().await;
+    let ds = "/bigquery/v2/projects/billing-data-1234/datasets/billingdata";
+    let cond = json!({"expression": "request.time < timestamp('2030-01-01T00:00:00Z')", "title": "temporary"});
+    Mock::given(method("GET"))
+        .and(path(ds))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access": [
+            {"role": "WRITER", "userByEmail": SA},
+            {"role": "WRITER", "userByEmail": SA, "condition": cond},
+            {"role": "READER", "userByEmail": SA},
+            {"role": "WRITER", "userByEmail": "keep@example.com"}
+        ]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(ds))
+        .respond_with(|r: &Request| {
+            let b: Value = serde_json::from_slice(&r.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(b)
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/projects/my-gcp-project/serviceAccounts/{SA}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "email": SA,
+            "description": "managed-by=runway app=gcptree stage=prod role=runtime"
+        })))
+        .mount(&server)
+        .await;
+    let d = authoritative_deployment();
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let step = Step::Revoke(ManagedGrant {
+        member: format!("serviceAccount:{SA}"),
+        role: "roles/bigquery.dataEditor".into(),
+        target: Some(RoleTarget::Dataset {
+            project: "billing-data-1234".into(),
+            dataset: "billingdata".into(),
+        }),
+        runtime: true,
+    });
+    let r = prov.apply(&step).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed, "{r:?}");
+    let reqs = server.received_requests().await.unwrap();
+    let patch = reqs
+        .iter()
+        .find(|r| r.method.as_str() == "PATCH")
+        .expect("one patch");
+    let body: Value = serde_json::from_slice(&patch.body).unwrap();
+    let access = body["access"].as_array().unwrap();
+    assert_eq!(access.len(), 3, "{access:?}");
+    assert!(
+        access
+            .iter()
+            .any(|a| a["role"] == "WRITER" && a["userByEmail"] == SA && !a["condition"].is_null()),
+        "the conditional entry is not runway's: {access:?}"
+    );
+    assert!(
+        !access
+            .iter()
+            .any(|a| a["role"] == "WRITER" && a["userByEmail"] == SA && a["condition"].is_null())
+    );
+}
+
+fn iap_error(reason: Option<&str>) -> ResponseTemplate {
+    let details = match reason {
+        Some(r) => json!([{
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": r,
+            "domain": "googleapis.com",
+            "metadata": {"service": "iap.googleapis.com"}
+        }]),
+        None => json!([]),
+    };
+    ResponseTemplate::new(403).set_body_json(json!({"error": {
+        "code": 403, "message": "denied", "status": "PERMISSION_DENIED", "details": details
+    }}))
+}
+
+/// Unlisted removals with IAP disabled in runway.yaml and nothing recorded;
+/// `error`: what reading the IAP policy answers instead of the policy.
+async fn unlisted_without_iap(error: Option<ResponseTemplate>) -> runway::provision::Unlisted {
+    let mut d = authoritative_deployment();
+    d.service.iap.enabled = false;
+    d.service.iap.members.clear();
+    let server = unlisted_project(true).await;
+    if let Some(e) = error {
+        Mock::given(path(format!("/v1/{IAP_RES}:getIamPolicy")))
+            .respond_with(e)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    prov.unlisted(&[]).await
+}
+
+#[tokio::test]
+async fn iap_members_left_after_iap_is_disabled_are_removed_without_a_record() {
+    let found = unlisted_without_iap(None).await;
+    assert!(found.unchecked.is_empty(), "{:?}", found.unchecked);
+    let iap: Vec<String> = removal_names(&found.steps)
+        .into_iter()
+        .filter(|n| n.ends_with(" iap"))
+        .collect();
+    assert_eq!(
+        iap,
+        [
+            "group:finops@example.com roles/iap.httpsResourceAccessor iap",
+            "user:manual@example.com roles/iap.httpsResourceAccessor iap",
+        ],
+        "nothing is listed once IAP is disabled, recorded or not"
+    );
+}
+
+#[tokio::test]
+async fn iap_never_used_is_not_a_warning_but_an_unreadable_policy_is() {
+    let disabled = unlisted_without_iap(Some(iap_error(Some("SERVICE_DISABLED")))).await;
+    assert!(disabled.unchecked.is_empty(), "{:?}", disabled.unchecked);
+    assert!(
+        removal_names(&disabled.steps)
+            .iter()
+            .all(|n| !n.ends_with(" iap"))
+    );
+
+    let denied = unlisted_without_iap(Some(iap_error(None))).await;
+    assert_eq!(denied.unchecked.len(), 1, "{:?}", denied.unchecked);
+    assert!(denied.unchecked[0].starts_with("IAP access: "));
+}

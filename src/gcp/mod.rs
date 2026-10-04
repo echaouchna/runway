@@ -261,6 +261,11 @@ pub fn is_not_found(e: &GaxError) -> bool {
     status_code(e) == Some(Code::NotFound) || e.http_status_code() == Some(404)
 }
 
+/// The API serving the request is not enabled on the project.
+pub fn is_service_disabled(e: &GaxError) -> bool {
+    error_reason(e).is_some_and(|(r, _)| r == "SERVICE_DISABLED" || r == "API_DISABLED")
+}
+
 /// The request may or may not have been applied by the server.
 pub fn is_ambiguous(e: &GaxError) -> bool {
     if e.is_timeout() || e.is_io() || e.is_transport() || e.is_exhausted() {

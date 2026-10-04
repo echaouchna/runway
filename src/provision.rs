@@ -15,7 +15,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::bucket;
 use crate::gcp::{
     GaxError, Session, api_error, iam, is_ambiguous, is_concurrency_conflict, is_not_found,
-    status_code,
+    is_service_disabled, status_code,
 };
 use crate::naming;
 use google_cloud_api_serviceusage_v1::client::ServiceUsage;
@@ -92,8 +92,16 @@ pub enum Step {
     IapInvoker,
     /// Grant `roles/iap.httpsResourceAccessor` to the configured members.
     IapAccess,
-    /// Revoke a grant runway recorded that is no longer in the configuration.
+    /// Revoke a grant runway recorded that is no longer in the configuration,
+    /// or access the configuration does not list (see [`Provisioner::unlisted`]).
     Revoke(ManagedGrant),
+    /// Delete a tag binding on the service that `service.tags` does not list.
+    Untag {
+        /// The binding's resource name (`tagBindings/…`).
+        binding: String,
+        /// `KEY/VALUE` (namespaced) for display.
+        value: String,
+    },
 }
 
 /// Service annotation listing the grants runway manages for the service
@@ -166,6 +174,34 @@ pub fn managed_grants(d: &Deployment) -> Vec<ManagedGrant> {
         }
     }
     unique
+}
+
+/// Found by [`Provisioner::unlisted`].
+#[derive(Debug, Default)]
+pub struct Unlisted {
+    /// Removals, one per member, role or tag.
+    pub steps: Vec<Step>,
+    /// What could not be read, with why: nothing is removed there.
+    pub unchecked: Vec<String>,
+}
+
+/// `removals` followed by those of `more` they do not already cover (the
+/// same member, role and resource).
+pub fn merge_removals(mut removals: Vec<Step>, more: Vec<Step>) -> Vec<Step> {
+    for step in more {
+        let covered = removals.iter().any(|r| match (r, &step) {
+            (Step::Revoke(a), Step::Revoke(b)) => {
+                iam::same_member(&a.member, &b.member)
+                    && normalize_dataset_role(&a.role) == normalize_dataset_role(&b.role)
+                    && a.target == b.target
+            }
+            (a, b) => a == b,
+        });
+        if !covered {
+            removals.push(step);
+        }
+    }
+    removals
 }
 
 /// The value of [`ANNOTATION_GRANTS`].
@@ -260,13 +296,16 @@ impl Step {
                     .map_or(g.member.as_str(), |e| e.split('@').next().unwrap_or(e));
                 format!("revoke {} on {} from {who}", g.role, g.on())
             }
+            Step::Untag { value, .. } => format!("unbind tag {value}"),
         }
     }
 
     /// Steps that need the service to exist.
     pub fn needs_service(&self) -> bool {
-        matches!(self, Step::Tag { .. } | Step::IapInvoker | Step::IapAccess)
-            || matches!(self, Step::Revoke(g) if g.target.is_none())
+        matches!(
+            self,
+            Step::Tag { .. } | Step::IapInvoker | Step::IapAccess | Step::Untag { .. }
+        ) || matches!(self, Step::Revoke(g) if g.target.is_none())
     }
 
     /// Steps of a wave depend only on earlier waves: project tags (which
@@ -285,7 +324,7 @@ impl Step {
             Step::Grant { .. } | Step::GrantMembers { .. } => 2,
             Step::SecretValues(_) => 3,
             // After the rollout, once the new revision no longer needs it.
-            Step::Revoke(_) => 4,
+            Step::Revoke(_) | Step::Untag { .. } => 4,
         }
     }
 
@@ -880,12 +919,15 @@ impl<'a> Provisioner<'a> {
                 )?);
             }
         }
-        if !d.service.tags.is_empty() {
-            // Tag bindings on regional resources use the regional endpoint.
-            let regional = ep.tag_bindings.clone().unwrap_or_else(|| {
-                format!("https://{}-cloudresourcemanager.googleapis.com", d.region)
-            });
-            c.tag_bindings = Some(build_client_at!(TagBindings, session, Some(regional))?);
+        // Also without `service.tags`: tags bound to the service that the
+        // configuration does not list are removed. Tag bindings on regional
+        // resources use the regional endpoint.
+        let regional = ep
+            .tag_bindings
+            .clone()
+            .unwrap_or_else(|| format!("https://{}-cloudresourcemanager.googleapis.com", d.region));
+        c.tag_bindings = Some(build_client_at!(TagBindings, session, Some(regional))?);
+        if c.tag_values.is_none() {
             c.tag_values = Some(build_client_at!(
                 TagValues,
                 session,
@@ -1446,6 +1488,16 @@ impl<'a> Provisioner<'a> {
                 .await
             }
             Step::Revoke(g) => self.check_revoke(g).await?,
+            Step::Untag { binding, .. } => {
+                if self.tag_binding_exists(binding).await? {
+                    (
+                        StepState::PendingRemoval,
+                        "not in service.tags: unbind".into(),
+                    )
+                } else {
+                    (StepState::InSync, "already unbound".into())
+                }
+            }
         })
     }
 
@@ -1635,6 +1687,7 @@ impl<'a> Provisioner<'a> {
                 members_outcome(&added)
             }
             Step::Revoke(g) => self.revoke(g).await?,
+            Step::Untag { binding, value } => self.unbind_tag(binding, value).await?,
         };
         Ok(StepResult {
             step: name,
@@ -2205,8 +2258,10 @@ impl<'a> Provisioner<'a> {
             let access: Vec<Access> = ds
                 .access
                 .into_iter()
+                // Conditional entries are not runway's: keep them.
                 .filter(|a| {
-                    !(normalize_dataset_role(&a.role) == normalize_dataset_role(&b.role)
+                    !(a.condition.is_none()
+                        && normalize_dataset_role(&a.role) == normalize_dataset_role(&b.role)
                         && (a.user_by_email.eq_ignore_ascii_case(email)
                             || iam::same_member(&a.iam_member, &member)))
                 })
@@ -2260,6 +2315,317 @@ impl<'a> Provisioner<'a> {
             }
         }
         unreachable!("loop returns")
+    }
+
+    /// What runway removes because the configuration does not list it, on
+    /// what it owns (authoritative mode; one step per member, role or tag):
+    ///
+    /// - members of the IAP accessor role on the service's IAP resource;
+    /// - adders of the secrets runway created for this app and stage;
+    /// - roles of the runtime account, when runway created it for this
+    ///   service, on every resource runway knows: configured and recorded
+    ///   targets, and the deployment project;
+    /// - tags bound directly to the service (inherited ones are not bindings
+    ///   on the service and are left alone).
+    ///
+    /// Only unconditional bindings; other roles are never touched. The service
+    /// must exist. Each of the four is read on its own: one that cannot be
+    /// read is reported in [`Unlisted::unchecked`], the others still count.
+    pub async fn unlisted(&self, recorded: &[ManagedGrant]) -> Unlisted {
+        let (iap, adders, runtime, tags) = tokio::join!(
+            self.unlisted_iap(),
+            self.unlisted_adders(),
+            self.unlisted_roles(recorded),
+            self.unlisted_tags(),
+        );
+        let mut out = Unlisted::default();
+        for (what, found) in [
+            ("IAP access", iap),
+            ("secret adders", adders),
+            ("runtime account roles", runtime),
+            ("service tags", tags),
+        ] {
+            match found {
+                Ok(steps) => out.steps.extend(steps),
+                Err(e) => out.unchecked.push(format!("{what}: {e}")),
+            }
+        }
+        out
+    }
+
+    fn unlisted_revoke(
+        member: &str,
+        role: &str,
+        target: Option<RoleTarget>,
+        runtime: bool,
+    ) -> Step {
+        Step::Revoke(ManagedGrant {
+            member: member.into(),
+            role: role.into(),
+            target,
+            runtime,
+        })
+    }
+
+    /// IAP accessors on the service's IAP resource, whether IAP is configured
+    /// or not (members granted by hand stay after IAP is disabled).
+    async fn unlisted_iap(&self) -> Result<Vec<Step>> {
+        let d = self.d;
+        let t = PolicyTarget::Iap(iap_resource(
+            &self.project_number().await?,
+            &d.region,
+            &d.service_id,
+        ));
+        let configured: &[String] = if d.service.iap.enabled {
+            &d.service.iap.members
+        } else {
+            &[]
+        };
+        let p = match self.get_policy(&t).await {
+            Ok(p) => p,
+            Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+            // IAP never used here: without its API, no IAP access is in
+            // effect, and enabling IAP again brings this check back.
+            Err(e) if !d.service.iap.enabled && is_service_disabled(&e) => {
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(api_error(e, &format!("reading the IAM policy of {t}"))
+                    .hint(needed_role_hint(&t)));
+            }
+        };
+        Ok(iam::members_of(&p, IAP_ACCESSOR_ROLE)
+            .into_iter()
+            .filter(|m| !configured.iter().any(|x| iam::same_member(x, m)))
+            .map(|m| Self::unlisted_revoke(&m, IAP_ACCESSOR_ROLE, None, false))
+            .collect())
+    }
+
+    /// Adders of the secrets runway created for this app and stage.
+    async fn unlisted_adders(&self) -> Result<Vec<Step>> {
+        let d = self.d;
+        let mut out = Vec::new();
+        let ours = naming::ownership_labels(&d.app, &d.stage);
+        for s in d.secrets.values() {
+            let created_by_runway = match self.get_secret(&s.name).await {
+                Ok(secret) => ours.iter().all(|(k, v)| secret.labels.get(k) == Some(v)),
+                Err(e) if is_not_found(&e) => false,
+                Err(e) => return Err(api_error(e, &format!("reading secret {}", s.name))),
+            };
+            if !created_by_runway {
+                continue;
+            }
+            let target = RoleTarget::Secret {
+                name: format!("projects/{}/secrets/{}", d.project, s.name),
+            };
+            let t = PolicyTarget::Secret(format!("projects/{}/secrets/{}", d.project, s.name));
+            if let Some(p) = self.read_policy(&t).await? {
+                for m in iam::members_of(&p, SECRET_ADDER_ROLE) {
+                    if !s.adders.iter().any(|x| iam::same_member(x, &m)) {
+                        out.push(Self::unlisted_revoke(
+                            &m,
+                            SECRET_ADDER_ROLE,
+                            Some(target.clone()),
+                            false,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Roles of a runtime account runway created for this service.
+    async fn unlisted_roles(&self, recorded: &[ManagedGrant]) -> Result<Vec<Step>> {
+        let d = self.d;
+        let mut out = Vec::new();
+        let email = &d.service.service_account;
+        let owned = match self.service_account_description(email).await? {
+            Some(desc) => has_sa_marker(&desc, &d.app, Some(&d.stage), "runtime"),
+            None => false,
+        };
+        if owned {
+            let member = Self::sa_member(email);
+            // Every configured grant to the account, also as a secret adder.
+            let configured: Vec<ManagedGrant> = managed_grants(d)
+                .into_iter()
+                .filter(|g| iam::same_member(&g.member, &member))
+                .collect();
+            let mut targets: Vec<RoleTarget> = vec![RoleTarget::Project {
+                project: d.project.clone(),
+            }];
+            for t in configured
+                .iter()
+                .chain(recorded.iter().filter(|g| g.runtime))
+                .filter_map(|g| g.target.clone())
+            {
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+            for target in targets {
+                let wanted = |role: &str| {
+                    configured.iter().any(|g| {
+                        g.target.as_ref() == Some(&target)
+                            && normalize_dataset_role(&g.role) == normalize_dataset_role(role)
+                    })
+                };
+                let held: Vec<String> = match &target {
+                    RoleTarget::Dataset { project, dataset } => {
+                        match self.get_dataset(project, dataset).await {
+                            Ok(ds) => ds
+                                .access
+                                .iter()
+                                .filter(|a| {
+                                    a.condition.is_none()
+                                        && (a.user_by_email.eq_ignore_ascii_case(email)
+                                            || iam::same_member(&a.iam_member, &member))
+                                })
+                                .map(|a| normalize_dataset_role(&a.role).to_string())
+                                .collect(),
+                            Err(e) if is_not_found(&e) => Vec::new(),
+                            Err(e) => {
+                                return Err(api_error(e, &format!("reading {target}")));
+                            }
+                        }
+                    }
+                    t => {
+                        let policy = self.grant_target(&RoleBinding {
+                            role: String::new(),
+                            target: t.clone(),
+                        });
+                        match policy {
+                            Some(pt) => match self.read_policy(&pt).await? {
+                                Some(p) => iam::roles_of(&p, &member),
+                                None => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        }
+                    }
+                };
+                for role in held {
+                    if !wanted(&role) {
+                        out.push(Self::unlisted_revoke(
+                            &member,
+                            &role,
+                            Some(target.clone()),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Tags bound directly to the service.
+    async fn unlisted_tags(&self) -> Result<Vec<Step>> {
+        let mut out = Vec::new();
+        let wanted = self.wanted_tag_values().await?;
+        for b in self.service_tag_bindings().await? {
+            if !wanted.contains(&b.tag_value) {
+                let value = if b.tag_value_namespaced_name.is_empty() {
+                    self.tag_value_name(&b.tag_value).await
+                } else {
+                    b.tag_value_namespaced_name.clone()
+                };
+                out.push(Step::Untag {
+                    binding: b.name.clone(),
+                    value,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// An IAM policy, `None` when its resource does not exist.
+    async fn read_policy(&self, t: &PolicyTarget) -> Result<Option<Policy>> {
+        match self.get_policy(t).await {
+            Ok(p) => Ok(Some(p)),
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => {
+                Err(api_error(e, &format!("reading the IAM policy of {t}"))
+                    .hint(needed_role_hint(t)))
+            }
+        }
+    }
+
+    /// Resource names (`tagValues/…`) of the values `service.tags` lists.
+    async fn wanted_tag_values(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (key, value) in &self.d.service.tags {
+            let namespaced = format!("{key}/{value}");
+            let tv = missing(&self.clients.tag_values, "TagValues")?
+                .get_namespaced_tag_value()
+                .set_name(&namespaced)
+                .send()
+                .await
+                .map_err(|e| api_error(e, &format!("looking up tag value {namespaced}")))?;
+            out.push(tv.name);
+        }
+        Ok(out)
+    }
+
+    /// `KEY/VALUE` of a tag value, or its resource name if it cannot be read.
+    async fn tag_value_name(&self, value: &str) -> String {
+        match missing(&self.clients.tag_values, "TagValues") {
+            Ok(c) => match c.get_tag_value().set_name(value).send().await {
+                Ok(tv) if !tv.namespaced_name.is_empty() => tv.namespaced_name,
+                _ => value.to_string(),
+            },
+            Err(_) => value.to_string(),
+        }
+    }
+
+    /// Tags bound directly to the service (none when it does not exist).
+    async fn service_tag_bindings(&self) -> Result<Vec<TagBinding>> {
+        let parent = tag_parent(&self.d.project, &self.d.region, &self.d.service_id);
+        let client = missing(&self.clients.tag_bindings, "TagBindings")?;
+        let mut out = Vec::new();
+        let mut token = String::new();
+        loop {
+            let resp = match client
+                .list_tag_bindings()
+                .set_parent(&parent)
+                .set_page_token(token.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) if is_not_found(&e) => return Ok(out),
+                Err(e) => return Err(api_error(e, "listing the service's tag bindings")),
+            };
+            out.extend(resp.tag_bindings);
+            if resp.next_page_token.is_empty() {
+                return Ok(out);
+            }
+            token = resp.next_page_token;
+        }
+    }
+
+    async fn tag_binding_exists(&self, binding: &str) -> Result<bool> {
+        Ok(self
+            .service_tag_bindings()
+            .await?
+            .iter()
+            .any(|b| b.name == binding))
+    }
+
+    async fn unbind_tag(&self, binding: &str, value: &str) -> Result<(StepOutcome, String)> {
+        let res = missing(&self.clients.tag_bindings, "TagBindings")?
+            .delete_tag_binding()
+            .set_name(binding)
+            .poller()
+            .until_done()
+            .await;
+        match res {
+            Ok(_) => Ok((StepOutcome::Changed, format!("unbound {value}"))),
+            Err(e) if is_not_found(&e) => {
+                Ok((StepOutcome::Unchanged, format!("{value} already unbound")))
+            }
+            Err(e) => Err(api_error(e, &format!("unbinding tag {value}"))
+                .hint("the deployer needs roles/resourcemanager.tagUser on the tag value")),
+        }
     }
 
     /// Why a recorded runtime role is kept rather than revoked: the account

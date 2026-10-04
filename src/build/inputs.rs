@@ -228,9 +228,86 @@ pub fn changed_since(deployed: &str, current: &[BaseImage]) -> Vec<(String, Stri
         .collect()
 }
 
+/// Why no image exists for these inputs, compared with the last deploy's
+/// annotations (source hash, base images). For the deploy output: a rebuild
+/// with an unchanged source otherwise looks like a bug.
+pub fn rebuild_reason(
+    deployed_source: Option<&str>,
+    deployed_bases: Option<&str>,
+    source_sha256: &str,
+    bases: &[BaseImage],
+) -> String {
+    let Some(deployed_source) = deployed_source else {
+        return "no image was built for this source yet".into();
+    };
+    if deployed_source != source_sha256 {
+        return "the source changed since the last deploy".into();
+    }
+    let short = |d: &str| crate::naming::short_hash(d.trim_start_matches("sha256:")).to_string();
+    let mut why: Vec<String> = changed_since(deployed_bases.unwrap_or_default(), bases)
+        .into_iter()
+        .map(|(r, old, new)| {
+            format!(
+                "base image {r} changed upstream ({} -> {})",
+                short(&old),
+                short(&new)
+            )
+        })
+        .collect();
+    why.extend(
+        bases
+            .iter()
+            .filter(|b| b.digest.is_none())
+            .map(|b| format!("base image {} could not be resolved", b.reference)),
+    );
+    if why.is_empty() {
+        return "source unchanged, but its image is not in the registry".into();
+    }
+    format!("source unchanged; {}", why.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explains_why_an_image_is_rebuilt() {
+        let base = |d: Option<&str>| BaseImage {
+            reference: "gcr.io/buildpacks/builder:latest".into(),
+            digest: d.map(String::from),
+        };
+        let deployed = "gcr.io/buildpacks/builder:latest@sha256:ee028b481db0";
+        assert_eq!(
+            rebuild_reason(None, None, "abc", &[]),
+            "no image was built for this source yet"
+        );
+        assert_eq!(
+            rebuild_reason(Some("old"), Some(deployed), "abc", &[]),
+            "the source changed since the last deploy"
+        );
+        assert_eq!(
+            rebuild_reason(
+                Some("abc"),
+                Some(deployed),
+                "abc",
+                &[base(Some("sha256:1c5d6ecf8b0d"))]
+            ),
+            "source unchanged; base image gcr.io/buildpacks/builder:latest changed upstream (ee028b481db0 -> 1c5d6ecf8b0d)"
+        );
+        assert_eq!(
+            rebuild_reason(Some("abc"), Some(deployed), "abc", &[base(None)]),
+            "source unchanged; base image gcr.io/buildpacks/builder:latest could not be resolved"
+        );
+        assert_eq!(
+            rebuild_reason(
+                Some("abc"),
+                Some(deployed),
+                "abc",
+                &[base(Some("sha256:ee028b481db0"))]
+            ),
+            "source unchanged, but its image is not in the registry"
+        );
+    }
 
     #[test]
     fn parses_dockerfile_bases() {
