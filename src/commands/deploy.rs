@@ -17,8 +17,12 @@ use crate::naming;
 use crate::output::{OutputFormat, Progress, print_json};
 use crate::plan::{ImagePlan, ServiceSpec, diff};
 use crate::poll::PollConfig;
-use crate::provision::{Provisioner, StepOutcome, StepResult, api_step, post_steps, pre_steps};
+use crate::provision::{
+    ANNOTATION_GRANTS, Provisioner, StepOutcome, StepResult, api_step, encode_grants, grant_record,
+    managed_grants, post_steps, pre_steps, recorded_grants, revoke_steps,
+};
 use crate::retry::{RetryConfig, with_retry};
+use futures::TryFutureExt;
 use google_cloud_build_v1::client::CloudBuild;
 use google_cloud_logging_v2::client::LoggingServiceV2;
 use google_cloud_run_v2::client::{Revisions, Services};
@@ -167,26 +171,35 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
         timeout: args.timeout,
     };
 
-    // 1. APIs first: nothing else can be read or created without them.
+    // 1. APIs first: nothing else can be read or created without them. The
+    //    registry login and the runtime version lookup do not need them.
     let provisioner = Provisioner::new(d, &session, &run_client).await?;
     let mut steps = Vec::new();
-    if let Some(step) = api_step(d) {
+    let enable_apis = async {
+        let Some(step) = api_step(d) else {
+            return Ok(None);
+        };
         p.step("Enabling required APIs");
         let r = with_retry(&retry, p, &step.describe(d), |_| provisioner.apply(&step)).await?;
         report_step(p, &r);
-        steps.push(r);
-    }
-
-    // 2. Inspect: read the live service while hashing the source and resolving
-    //    the image (all read-only). Ownership is checked before any change.
-    let registry = with_retry(&retry, p, "authenticate", |_| registry_client(&session)).await?;
-    let mut version_notes = Vec::new();
-    let resolved_versions =
-        crate::commands::resolve_runtime_versions(d, &registry, &mut version_notes).await;
+        Ok::<_, Error>(Some(r))
+    };
+    let login = async {
+        let registry = with_retry(&retry, p, "authenticate", |_| registry_client(&session)).await?;
+        let mut notes = Vec::new();
+        let resolved = crate::commands::resolve_runtime_versions(d, &registry, &mut notes).await;
+        Ok::<_, Error>((registry, resolved, notes))
+    };
+    let (api, login) = tokio::join!(enable_apis, login);
+    steps.extend(api?);
+    let (registry, resolved_versions, version_notes) = login?;
     let d = &resolved_versions;
     for n in version_notes {
         p.info(n);
     }
+
+    // 2. Inspect: read the live service while hashing the source and resolving
+    //    the image (all read-only). Ownership is checked before any change.
     let (existing, decision) = with_retry(&retry, p, "inspect current state", |_| async {
         let mut notes = Vec::new();
         let (existing, decision) = tokio::join!(
@@ -199,34 +212,23 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
     if let Some(svc) = &existing {
         check_ownership(svc, &d.app, &d.stage, args.adopt)?;
     }
+    // Grants recorded on the service by earlier deploys (see `managed_grants`).
+    let recorded = existing
+        .as_ref()
+        .map(|svc| recorded_grants(&svc.annotations))
+        .unwrap_or_default();
 
-    // 3. Buckets, repository, service accounts, then grants (dependency order).
-    let pre = pre_steps(d);
-    if !pre.is_empty() {
-        p.step("Provisioning buckets, identities and grants");
-    }
-    for step in &pre {
-        let r = with_retry(&retry, p, &step.describe(d), |_| provisioner.apply(step)).await?;
-        report_step(p, &r);
-        steps.push(r);
-    }
-    // Every secret exists and has a value: pin the newest versions.
-    let (pinned_secrets, secret_notes) =
-        with_retry(&retry, p, "resolve secret versions", |_| async {
-            let mut notes = Vec::new();
-            let pinned =
-                crate::commands::resolve_secret_versions(d, &provisioner, &mut notes, true).await?;
-            Ok((pinned, notes))
-        })
-        .await?;
-    for n in secret_notes {
-        p.warn(n);
-    }
-    let d = &pinned_secrets;
-
-    // 4. Image.
-    let mut built: Option<BuiltImage> = None;
-    let image = match (&d.artifact, &decision.image) {
+    // 3. Image: a build, or an existing image (checked before any change).
+    let rebuild = match (&d.artifact, &decision.image) {
+        (Artifact::Build(cfg), img)
+            if args.force_build || cfg.rebuild_always || !img.is_exact() =>
+        {
+            Some(cfg)
+        }
+        _ => None,
+    };
+    let existing_image = match (&d.artifact, &decision.image) {
+        _ if rebuild.is_some() => None,
         (Artifact::Image { .. }, ImagePlan::Unresolved { reference, reason }) => {
             if reason.contains("no such tag") {
                 return Err(Error::prerequisite(format!(
@@ -237,55 +239,7 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
             p.warn(format!(
                 "deploying tag {reference} without a pinned digest ({reason}); Cloud Run resolves it when the revision is created"
             ));
-            reference.clone()
-        }
-        (Artifact::Build(cfg), img)
-            if args.force_build || cfg.rebuild_always || !img.is_exact() =>
-        {
-            let source = decision
-                .source
-                .as_ref()
-                .ok_or_else(|| Error::internal("scanned source missing"))?;
-            let cloudbuild = build_client!(CloudBuild, session)?;
-            let storage = Storage::builder()
-                .with_credentials(session.credentials.clone())
-                .with_retry_policy(crate::gcp::retry_policy())
-                .build()
-                .await
-                .map_err(|e| Error::internal(format!("cannot create Storage client: {e}")))?;
-            let logging = build_client!(LoggingServiceV2, session)?;
-            p.step(format!(
-                "Building {} from {} ({} files, source {})",
-                d.app,
-                cfg.context_dir.display(),
-                source.files,
-                naming::short_hash(&source.sha256)
-            ));
-            let builder = Builder {
-                cloudbuild: &cloudbuild,
-                uploader: &storage,
-                resolver: &registry,
-                logging: Some(&logging),
-                progress: p,
-                poll: PollConfig::default(),
-            };
-            let inputs = BuildInputs {
-                project: &d.project,
-                region: &d.region,
-                app: &d.app,
-                stage: &d.stage,
-                config: cfg,
-                source,
-                image_checked: decision.build.as_ref().and_then(|b| b.will_build) == Some(true),
-                timeout: args.build_timeout,
-                force: args.force_build || cfg.rebuild_always,
-            };
-            // A retry re-checks for the image / an in-flight build first, so it
-            // never builds the same source twice.
-            let out = with_retry(&retry, p, "build image", |_| builder.build(&inputs)).await?;
-            let pinned = out.pinned.clone();
-            built = Some(out);
-            pinned
+            Some(reference.clone())
         }
         (_, ImagePlan::Pinned { reference, .. }) => {
             if decision.build.is_some() {
@@ -293,14 +247,137 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
             } else {
                 p.info(format!("image: {reference}"));
             }
-            reference.clone()
+            Some(reference.clone())
         }
         _ => return Err(Error::internal("inconsistent image plan")),
+    };
+
+    // 4. Buckets, repository, service accounts, then grants, in waves of
+    //    independent steps. A build only waits for its own prerequisites: the
+    //    runtime identity, its grants and secrets are provisioned while it runs.
+    let pre = pre_steps(d);
+    let (before_build, alongside): (Vec<_>, Vec<_>) = if rebuild.is_some() {
+        pre.into_iter().partition(|s| s.build_prerequisite(d))
+    } else {
+        (pre, Vec::new())
+    };
+    if !before_build.is_empty() || !alongside.is_empty() {
+        p.step("Provisioning buckets, identities and grants");
+    }
+    let report = |r: &StepResult| report_step(p, r);
+    let record_now = || grant_record(&recorded, &managed_grants(d), &provisioner.granted(), true);
+    match provisioner
+        .apply_all(&before_build, &retry, p, &report)
+        .await
+    {
+        Ok(done) => steps.extend(done),
+        Err(e) => {
+            let _ = save_grants(&reconciler, &name, existing.as_ref(), &record_now(), p).await;
+            return Err(e);
+        }
+    }
+    let provision = async {
+        let done = provisioner
+            .apply_all(&alongside, &retry, p, &report)
+            .await?;
+        // Every secret exists and has a value: pin the newest versions.
+        let (pinned, notes) = with_retry(&retry, p, "resolve secret versions", |_| async {
+            let mut notes = Vec::new();
+            let pinned =
+                crate::commands::resolve_secret_versions(d, &provisioner, &mut notes, true).await?;
+            Ok((pinned, notes))
+        })
+        .await?;
+        Ok::<_, Error>((done, pinned, notes))
+    }
+    .map_err(|e| match rebuild {
+        Some(_) => e.hint(
+            "a build still running continues in Cloud Build; the next deploy reuses its image",
+        ),
+        None => e,
+    });
+    let build = async {
+        let Some(cfg) = rebuild else {
+            return Ok(None);
+        };
+        let source = decision
+            .source
+            .as_ref()
+            .ok_or_else(|| Error::internal("scanned source missing"))?;
+        let cloudbuild = build_client!(CloudBuild, session)?;
+        let storage = Storage::builder()
+            .with_credentials(session.credentials.clone())
+            .with_retry_policy(crate::gcp::retry_policy())
+            .build()
+            .await
+            .map_err(|e| Error::internal(format!("cannot create Storage client: {e}")))?;
+        let logging = build_client!(LoggingServiceV2, session)?;
+        p.step(format!(
+            "Building {} from {} ({} files, source {})",
+            d.app,
+            cfg.context_dir.display(),
+            source.files,
+            naming::short_hash(&source.sha256)
+        ));
+        let builder = Builder {
+            cloudbuild: &cloudbuild,
+            uploader: &storage,
+            resolver: &registry,
+            logging: Some(&logging),
+            progress: p,
+            poll: PollConfig::default(),
+        };
+        let inputs = BuildInputs {
+            project: &d.project,
+            region: &d.region,
+            app: &d.app,
+            stage: &d.stage,
+            config: cfg,
+            source,
+            image_checked: decision.build.as_ref().and_then(|b| b.will_build) == Some(true),
+            timeout: args.build_timeout,
+            force: args.force_build || cfg.rebuild_always,
+        };
+        // A retry re-checks for the image / an in-flight build first, so it
+        // never builds the same source twice.
+        Ok(Some(
+            with_retry(&retry, p, "build image", |_| builder.build(&inputs)).await?,
+        ))
+    };
+    // The first failure stops the deploy; the other branch is not awaited.
+    let joined = tokio::try_join!(build, provision);
+    // What runway granted so far is recorded now, whatever comes next: a grant
+    // made before a failure (an empty secret, a failed build, a rollout
+    // refused) would otherwise look pre-existing and never be revoked.
+    let saved = save_grants(&reconciler, &name, existing.as_ref(), &record_now(), p).await;
+    let (built, (done, pinned_secrets, secret_notes)): (Option<BuiltImage>, _) = joined?;
+    // A record written changed the service's etag: the rollout starts from it.
+    let existing = match saved? {
+        true => reconciler.get(&name).await?,
+        false => existing,
+    };
+    steps.extend(done);
+    for n in secret_notes {
+        p.warn(n);
+    }
+    let d = &pinned_secrets;
+    let image = match (&built, existing_image) {
+        (Some(out), _) => out.pinned.clone(),
+        (None, Some(reference)) => reference,
+        (None, None) => return Err(Error::internal("no image to deploy")),
     };
 
     // 5. Service.
     // Release tag on the image, once its digest is known.
     let mut annotations = decision.annotations.clone();
+    // The grants runway granted (never those it found in place), and those
+    // removed from runway.yaml, which stay recorded until they are revoked.
+    let desired_grants = managed_grants(d);
+    let revokes = revoke_steps(&recorded, d);
+    let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
+    if !record.is_empty() || !recorded.is_empty() {
+        annotations.insert(ANNOTATION_GRANTS.to_string(), encode_grants(&record));
+    }
     let mut release = None;
     if let (Some((kind, version, path)), Artifact::Build(b)) = (&release_request, &d.artifact) {
         let digest = image
@@ -387,9 +464,10 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
                 d.service_id
             ));
         }
-        for step in &tag_steps {
-            let r = with_retry(&retry, p, &step.describe(d), |_| provisioner.apply(step)).await?;
-            report_step(p, &r);
+        for r in provisioner
+            .apply_all(&tag_steps, &retry, p, &report)
+            .await?
+        {
             done_tags.push(r.step.clone());
             steps.push(r);
         }
@@ -436,15 +514,44 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
 
     // 6. Tags and IAP (before public access, so that a tag allowing public
     //    access is bound before `allUsers` is granted).
-    for step in post_steps(d)
-        .iter()
+    // Then access removed from runway.yaml is revoked, but only by a main
+    // deploy after which one revision serves all traffic: a preview, a canary
+    // or a revision still serving part of the traffic may need it.
+    let revoke_now = mode == crate::traffic::Mode::Full && run::one_revision_serves_all(&svc);
+    if !revokes.is_empty() && !revoke_now {
+        p.info(format!(
+            "{} grant(s) removed from runway.yaml are kept until a main deploy serves all traffic",
+            revokes.len()
+        ));
+    }
+    let remaining: Vec<_> = post_steps(d)
+        .into_iter()
         .filter(|s| !done_tags.contains(&s.describe(d)))
-    {
-        let r = with_retry(&retry, p, &step.describe(d), |_| provisioner.apply(step))
-            .await
-            .map_err(|e| after_rollout(e, d, url.as_deref()))?;
-        report_step(p, &r);
-        steps.push(r);
+        .chain(revokes.iter().filter(|_| revoke_now).cloned())
+        .collect();
+    match provisioner.apply_all(&remaining, &retry, p, &report).await {
+        Ok(done) => steps.extend(done),
+        Err(e) => {
+            let live = reconciler.get(&name).await.ok().flatten();
+            let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
+            let _ = save_grants(&reconciler, &name, live.as_ref(), &record, p).await;
+            return Err(after_rollout(e, d, url.as_deref()));
+        }
+    }
+    // IAP members granted after the rollout, and revocations done.
+    let final_record = grant_record(
+        &recorded,
+        &desired_grants,
+        &provisioner.granted(),
+        !revoke_now,
+    );
+    if final_record != record {
+        let value = encode_grants(&final_record);
+        with_retry(&retry, p, "record grants", |_| {
+            reconciler.set_annotation(&name, ANNOTATION_GRANTS, &value)
+        })
+        .await
+        .map_err(|e| after_rollout(e, d, url.as_deref()))?;
     }
 
     // 7. Public access.
@@ -461,7 +568,11 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
         region: d.region.clone(),
         service: d.service_id.clone(),
         url: url.clone(),
-        revision: run::short_revision(&svc.latest_ready_revision).to_string(),
+        // The revision behind the URL this deploy targets (with an existing
+        // revision kept serving, not necessarily the latest one).
+        revision: run::mode_target(&run::current_traffic(&svc), &mode)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| run::short_revision(&svc.latest_ready_revision).to_string()),
         image,
         change: applied.change,
         public: d.service.public,
@@ -493,6 +604,26 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
     Ok(())
 }
 
+/// [`Reconciler::save_grant_record`], warning when it fails: before a failure
+/// is reported, saving is best effort (the failure is what matters).
+async fn save_grants(
+    reconciler: &Reconciler<'_>,
+    name: &str,
+    live: Option<&Service>,
+    record: &[crate::provision::ManagedGrant],
+    p: &Progress,
+) -> Result<bool> {
+    reconciler
+        .save_grant_record(name, live, record)
+        .await
+        .inspect_err(|e| {
+            p.warn(format!(
+                "cannot record the grants runway added ({}); removing them from runway.yaml will not revoke them",
+                e.message
+            ))
+        })
+}
+
 /// One idempotent roll-out attempt: re-reads the service (except on the first
 /// attempt), checks ownership, applies changes and waits for readiness.
 async fn roll_out(
@@ -512,23 +643,38 @@ async fn roll_out(
         check_ownership(svc, &d.app, &d.stage, adopt)?;
     }
     let mut spec = run::spec_for_live(base_spec, existing.as_ref());
-    // An owned service whose spec already matches but whose latest revision
-    // failed gets a fresh revision (for example after a grant propagated).
-    let mut force = false;
     // A preview or canary always runs in a revision of its own (marked by a
     // template annotation), even when its code and configuration equal what
     // already serves: otherwise its URL would point at the production revision.
-    if let Some((key, value)) = own_revision_marker(&spec.traffic.mode) {
-        let live = existing
-            .as_ref()
-            .and_then(|s| s.template.as_ref())
-            .and_then(|t| t.annotations.get(key));
-        if existing.is_some() && live.map(String::as_str) != Some(value.as_str()) {
-            force = true;
-        }
+    if let Some((key, value)) = run::revision_marker(&spec.traffic.mode) {
         spec.revision_annotations.insert(key.to_string(), value);
     }
+    let mut force = existing
+        .as_ref()
+        .is_some_and(|s| run::needs_own_revision(s, &spec.traffic.mode));
+    // The revision behind the URL this deploy changes (the main URL, the
+    // preview's tag or the canary) may already run this configuration: it
+    // then keeps serving, and no revision is created nor traffic moved.
+    if let Some(svc) = &existing {
+        let new_revision = force
+            || diff(&run::observed_flat(svc), &spec.flatten())
+                .iter()
+                .any(|c| !run::is_service_level(&c.field));
+        if new_revision
+            && let Some((target, revision)) = reconciler.matching_revision(svc, &spec).await
+        {
+            p.info(format!(
+                "{revision} already runs this configuration: no new revision"
+            ));
+            spec.traffic.serve = Some(target);
+            spec = spec.with_current_traffic(Some(&run::current_traffic(svc)));
+            force = false;
+        }
+    }
+    // An owned service whose spec already matches but whose latest revision
+    // failed gets a fresh revision (for example after a grant propagated).
     if !force
+        && spec.traffic.serve.is_none()
         && let Some(svc) = &existing
         && diff(&run::observed_flat(svc), &spec.flatten()).is_empty()
         && matches!(run::readiness(svc), Readiness::Failed { .. })
@@ -541,7 +687,7 @@ async fn roll_out(
         force = true;
     }
     if let Some(svc) = &existing {
-        for c in diff(&run::observed_flat(svc), &spec.flatten()) {
+        for c in run::pending_changes(svc, &spec) {
             match (&c.before, &c.after) {
                 (Some(b), Some(a)) => p.info(format!("~ {}: {b} -> {a}", c.field)),
                 (None, Some(a)) => p.info(format!("+ {}: {a}", c.field)),
@@ -575,15 +721,6 @@ async fn roll_out(
         }
     };
     Ok((applied, svc))
-}
-
-/// Template annotation giving previews and canaries their own revision.
-fn own_revision_marker(mode: &crate::traffic::Mode) -> Option<(&'static str, String)> {
-    match mode {
-        crate::traffic::Mode::Full => None,
-        crate::traffic::Mode::Preview { tag } => Some(("runway.dev/preview", tag.clone())),
-        crate::traffic::Mode::Canary { .. } => Some(("runway.dev/canary", "true".into())),
-    }
 }
 
 /// What a first `bootstrap` run creates: by default the real service with the

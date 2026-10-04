@@ -158,7 +158,7 @@ async fn removes_what_runway_created_and_keeps_data() {
     )
     .await;
     let (session, run) = clients(&s).await;
-    let prov = Provisioner::with_options(&d, &session, &run, &endpoints(&s.uri()), true)
+    let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
 
@@ -276,7 +276,7 @@ async fn keeps_accounts_without_marker_and_refuses_foreign_services() {
     )
     .await;
     let (session, run) = clients(&s).await;
-    let prov = Provisioner::with_options(&d, &session, &run, &endpoints(&s.uri()), true)
+    let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
     let (items, del_svc, del_sa) = plan(&d, &run, &prov, false).await.unwrap();
@@ -301,7 +301,7 @@ async fn keeps_accounts_without_marker_and_refuses_foreign_services() {
     )
     .await;
     let (session, run) = clients(&s).await;
-    let prov = Provisioner::with_options(&d, &session, &run, &endpoints(&s.uri()), true)
+    let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
     let err = plan(&d, &run, &prov, false).await.unwrap_err();
@@ -320,7 +320,7 @@ async fn never_deletes_a_service_that_changed_owner_after_planning() {
     )
     .await;
     let (session, run) = clients(&s).await;
-    let prov = Provisioner::with_options(&d, &session, &run, &endpoints(&s.uri()), true)
+    let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
     let retry = RetryConfig {

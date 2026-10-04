@@ -92,6 +92,130 @@ pub enum Step {
     IapInvoker,
     /// Grant `roles/iap.httpsResourceAccessor` to the configured members.
     IapAccess,
+    /// Revoke a grant runway recorded that is no longer in the configuration.
+    Revoke(ManagedGrant),
+}
+
+/// Service annotation listing the grants runway manages for the service
+/// (see [`managed_grants`]): the live service is the state, no state file.
+pub const ANNOTATION_GRANTS: &str = "runway.dev/grants";
+
+/// A grant runway manages: removing it from the configuration revokes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ManagedGrant {
+    /// `serviceAccount:…`, `group:…`, `user:…`, `domain:…`.
+    pub member: String,
+    pub role: String,
+    /// The resource; `None` for the service's Identity-Aware Proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RoleTarget>,
+    /// A role of the runtime service account (as opposed to an adder or an
+    /// IAP member): only revoked if runway created the account for this
+    /// service, since another service may share an account it was given.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime: bool,
+}
+
+impl ManagedGrant {
+    fn on(&self) -> String {
+        self.target
+            .as_ref()
+            .map_or("the IAP resource".into(), |t| t.to_string())
+    }
+}
+
+/// What runway grants for this service and revokes once it disappears from
+/// the configuration: the runtime service account's roles (declared and
+/// implied by secrets and volumes), secret adders and IAP members. The build
+/// service account's roles are not managed this way: other apps share it.
+pub fn managed_grants(d: &Deployment) -> Vec<ManagedGrant> {
+    let mut out = Vec::new();
+    for step in pre_steps(d) {
+        match step {
+            Step::Grant { email, binding } if email == d.service.service_account => {
+                out.push(ManagedGrant {
+                    member: format!("serviceAccount:{email}"),
+                    role: binding.role,
+                    target: Some(binding.target),
+                    runtime: true,
+                });
+            }
+            Step::GrantMembers { members, binding } => {
+                out.extend(members.into_iter().map(|member| ManagedGrant {
+                    member,
+                    role: binding.role.clone(),
+                    target: Some(binding.target.clone()),
+                    runtime: false,
+                }));
+            }
+            _ => {}
+        }
+    }
+    if d.service.iap.enabled {
+        out.extend(d.service.iap.members.iter().map(|m| ManagedGrant {
+            member: m.clone(),
+            role: IAP_ACCESSOR_ROLE.into(),
+            target: None,
+            runtime: false,
+        }));
+    }
+    let mut unique = Vec::new();
+    for g in out {
+        if !unique.contains(&g) {
+            unique.push(g);
+        }
+    }
+    unique
+}
+
+/// The value of [`ANNOTATION_GRANTS`].
+pub fn encode_grants(grants: &[ManagedGrant]) -> String {
+    serde_json::to_string(grants).expect("grants serialize")
+}
+
+/// Grants recorded on a live service; none when absent or unreadable.
+pub fn recorded_grants(
+    annotations: &std::collections::HashMap<String, String>,
+) -> Vec<ManagedGrant> {
+    annotations
+        .get(ANNOTATION_GRANTS)
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default()
+}
+
+/// What to record on the service: configured grants runway granted (earlier,
+/// so already recorded, or in this run), and, with `keep_removed`, recorded
+/// grants removed from the configuration that are not revoked yet. A
+/// configured grant that was already present when runway checked it (granted
+/// by hand or by another tool) is never recorded, so never revoked.
+pub fn grant_record(
+    recorded: &[ManagedGrant],
+    desired: &[ManagedGrant],
+    added: &[ManagedGrant],
+    keep_removed: bool,
+) -> Vec<ManagedGrant> {
+    let mut out: Vec<ManagedGrant> = desired
+        .iter()
+        .filter(|g| recorded.contains(g) || added.contains(g))
+        .cloned()
+        .collect();
+    if keep_removed {
+        out.extend(recorded.iter().filter(|g| !desired.contains(g)).cloned());
+    }
+    out
+}
+
+/// Revocations: recorded grants that are no longer in the configuration.
+/// Access runway never recorded (granted by hand or by another tool) is
+/// never revoked.
+pub fn revoke_steps(recorded: &[ManagedGrant], d: &Deployment) -> Vec<Step> {
+    let desired = managed_grants(d);
+    recorded
+        .iter()
+        .filter(|g| !desired.contains(g))
+        .cloned()
+        .map(Step::Revoke)
+        .collect()
 }
 
 impl Step {
@@ -103,12 +227,10 @@ impl Step {
             }
             Step::CreateBucket(b) => format!("bucket gs://{} ({})", b.name, b.location),
             Step::CreateSecret(s) => format!("secret {}", s.name),
-            Step::GrantMembers { members, binding } => format!(
-                "grant {} on {} to {}",
-                binding.role,
-                binding.target,
-                members.join(", ")
-            ),
+            // Members are in the details: plans list only those that change.
+            Step::GrantMembers { binding, .. } => {
+                format!("grant {} on {}", binding.role, binding.target)
+            }
             Step::SecretValues(names) => format!(
                 "value of secret(s) {}",
                 names
@@ -130,13 +252,111 @@ impl Step {
             }
             Step::Tag { key, value } => format!("tag {key}={value}"),
             Step::IapInvoker => "IAP service agent can invoke the service".into(),
-            Step::IapAccess => format!("IAP access for {}", d.service.iap.members.join(", ")),
+            Step::IapAccess => format!("IAP access ({IAP_ACCESSOR_ROLE})"),
+            Step::Revoke(g) => {
+                let who = g
+                    .member
+                    .strip_prefix("serviceAccount:")
+                    .map_or(g.member.as_str(), |e| e.split('@').next().unwrap_or(e));
+                format!("revoke {} on {} from {who}", g.role, g.on())
+            }
         }
     }
 
     /// Steps that need the service to exist.
     pub fn needs_service(&self) -> bool {
         matches!(self, Step::Tag { .. } | Step::IapInvoker | Step::IapAccess)
+            || matches!(self, Step::Revoke(g) if g.target.is_none())
+    }
+
+    /// Steps of a wave depend only on earlier waves: project tags (which
+    /// organization policies may read) before resources, accounts and
+    /// secrets before their grants, grants before the secret values check.
+    /// After the rollout: service tags before IAP.
+    fn wave(&self) -> u8 {
+        match self {
+            Step::EnableApis(_) | Step::ProjectTag { .. } | Step::Tag { .. } => 0,
+            Step::CreateBucket(_)
+            | Step::CreateSecret(_)
+            | Step::CreateRepository { .. }
+            | Step::CreateServiceAccount { .. }
+            | Step::IapInvoker
+            | Step::IapAccess => 1,
+            Step::Grant { .. } | Step::GrantMembers { .. } => 2,
+            Step::SecretValues(_) => 3,
+            // After the rollout, once the new revision no longer needs it.
+            Step::Revoke(_) => 4,
+        }
+    }
+
+    /// Steps that write the same IAM policy (or BigQuery access list, which
+    /// has no etag) share a lane and run one after another.
+    fn lane(&self, d: &Deployment) -> String {
+        match self {
+            Step::Grant { binding, .. } | Step::GrantMembers { binding, .. } => {
+                format!("policy of {}", binding.target)
+            }
+            Step::IapInvoker => "policy of the service".into(),
+            Step::IapAccess => "policy of the IAP resource".into(),
+            Step::Revoke(g) => match &g.target {
+                Some(t) => format!("policy of {t}"),
+                None => "policy of the IAP resource".into(),
+            },
+            other => other.describe(d),
+        }
+    }
+
+    /// Needed before the image can be built: project tags, the source bucket,
+    /// the repository, the build service account and its grants.
+    pub fn build_prerequisite(&self, d: &Deployment) -> bool {
+        let Artifact::Build(b) = &d.artifact else {
+            return false;
+        };
+        match self {
+            Step::EnableApis(_) | Step::ProjectTag { .. } | Step::CreateRepository { .. } => true,
+            Step::CreateBucket(c) => c.name == b.source_bucket,
+            Step::CreateServiceAccount { email, .. } | Step::Grant { email, .. } => {
+                *email == b.build_service_account
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Steps that run one after another, with their index in the step list.
+pub type Lane<'s> = Vec<(usize, &'s Step)>;
+
+/// Groups steps for concurrent execution: waves run in order, the lanes of a
+/// wave concurrently, and the steps of a lane in order. Each step keeps its
+/// index in `steps`, so results can be reported in the original order.
+pub fn waves<'s>(steps: &'s [Step], d: &Deployment) -> Vec<Vec<Lane<'s>>> {
+    let mut by_wave: std::collections::BTreeMap<u8, Vec<(String, Lane<'s>)>> = Default::default();
+    for (i, s) in steps.iter().enumerate() {
+        let lanes = by_wave.entry(s.wave()).or_default();
+        let key = s.lane(d);
+        match lanes.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, lane)) => lane.push((i, s)),
+            None => lanes.push((key, vec![(i, s)])),
+        }
+    }
+    by_wave
+        .into_values()
+        .map(|lanes| lanes.into_iter().map(|(_, lane)| lane).collect())
+        .collect()
+}
+
+/// Outcome and detail of granting a role to members: who was added.
+fn members_outcome(added: &[String]) -> (StepOutcome, String) {
+    if added.is_empty() {
+        (
+            StepOutcome::Unchanged,
+            "every member already has access".into(),
+        )
+    } else {
+        (
+            StepOutcome::Changed,
+            format!("granted to {}", added.join(", ")),
+        )
     }
 }
 
@@ -412,6 +632,8 @@ pub enum StepState {
     Pending,
     /// Could not be determined (for example, missing read permission).
     Unknown,
+    /// Deploy will remove access runway granted earlier (shown with `-`).
+    PendingRemoval,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -568,6 +790,13 @@ pub struct Provisioner<'a> {
     clients: Clients,
     project_number: OnceCell<String>,
     service_usage: String,
+    /// Managed grants this provisioner added (not those already present):
+    /// only what runway granted is recorded, hence ever revoked.
+    granted: std::sync::Mutex<Vec<ManagedGrant>>,
+    /// Grant writes whose answer was lost (timeout, transport error, 5xx), as
+    /// (policy, role, member): the next read decides. Present means runway's
+    /// write committed, so the grant is runway's; missing means it did not.
+    uncertain: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 fn missing<T>(c: &Option<T>, what: &str) -> Result<T>
@@ -589,82 +818,42 @@ impl<'a> Provisioner<'a> {
         run: &'a Services,
         ep: &Endpoints,
     ) -> Result<Self> {
-        Self::with_options(d, session, run, ep, false).await
-    }
-
-    /// Clients needed to tear down what `deploy` created (`undeploy`).
-    pub async fn for_teardown(
-        d: &'a Deployment,
-        session: &'a Session,
-        run: &'a Services,
-    ) -> Result<Self> {
-        Self::with_options(d, session, run, &Endpoints::default(), true).await
-    }
-
-    pub async fn with_options(
-        d: &'a Deployment,
-        session: &'a Session,
-        run: &'a Services,
-        ep: &Endpoints,
-        teardown: bool,
-    ) -> Result<Self> {
         let steps = all_steps(d);
         let mut c = Clients::default();
         let has = |f: &dyn Fn(&Step) -> bool| steps.iter().any(f);
-        let grant = |t: fn(&RoleTarget) -> bool| move |s: &Step| matches!(s, Step::Grant { binding, .. } if t(&binding.target));
-        if teardown || has(&|s| matches!(s, Step::CreateServiceAccount { .. })) {
-            c.iam = Some(build_client_at!(Iam, session, ep.iam.clone())?);
-        }
-        if has(&grant(|t| matches!(t, RoleTarget::Project { .. })))
-            || has(&|s| matches!(s, Step::CreateBucket(_)))
-            || d.service.iap.enabled
-        {
-            c.projects = Some(build_client_at!(
-                Projects,
-                session,
-                ep.resource_manager.clone()
-            )?);
-        }
-        if has(&grant(|t| matches!(t, RoleTarget::Bucket { .. })))
-            || has(&|s| matches!(s, Step::CreateBucket(_)))
-        {
-            c.storage = Some(
-                StorageControl::builder()
-                    .with_credentials(session.credentials.clone())
-                    .build()
-                    .await
-                    .map_err(|e| {
-                        Error::internal(format!("cannot create StorageControl client: {e}"))
-                    })?,
-            );
-        }
-        if has(&grant(|t| matches!(t, RoleTarget::Secret { .. })))
-            || !d.secrets.is_empty()
-            || d.service.all_secrets().next().is_some()
-        {
-            c.secrets = Some(build_client_at!(
-                SecretManagerService,
-                session,
-                ep.secret_manager.clone()
-            )?);
-        }
-        if has(&grant(|t| matches!(t, RoleTarget::Dataset { .. }))) {
-            c.datasets = Some(build_client_at!(
-                DatasetService,
-                session,
-                ep.bigquery.clone()
-            )?);
-        }
-        if teardown
-            || has(&grant(|t| matches!(t, RoleTarget::Repository { .. })))
-            || has(&|s| matches!(s, Step::CreateRepository { .. }))
-        {
-            c.artifact = Some(build_client_at!(
-                ArtifactRegistry,
-                session,
-                ep.artifact_registry.clone()
-            )?);
-        }
+        // IAM and policy clients are always available: revoking a grant that
+        // left the configuration may need any of them (building a client
+        // sends no request).
+        c.iam = Some(build_client_at!(Iam, session, ep.iam.clone())?);
+        c.projects = Some(build_client_at!(
+            Projects,
+            session,
+            ep.resource_manager.clone()
+        )?);
+        c.storage = Some(
+            StorageControl::builder()
+                .with_credentials(session.credentials.clone())
+                .build()
+                .await
+                .map_err(|e| {
+                    Error::internal(format!("cannot create StorageControl client: {e}"))
+                })?,
+        );
+        c.secrets = Some(build_client_at!(
+            SecretManagerService,
+            session,
+            ep.secret_manager.clone()
+        )?);
+        c.datasets = Some(build_client_at!(
+            DatasetService,
+            session,
+            ep.bigquery.clone()
+        )?);
+        c.artifact = Some(build_client_at!(
+            ArtifactRegistry,
+            session,
+            ep.artifact_registry.clone()
+        )?);
         if has(&|s| matches!(s, Step::EnableApis(_))) {
             c.service_usage = Some(build_client_at!(
                 ServiceUsage,
@@ -703,24 +892,34 @@ impl<'a> Provisioner<'a> {
                 ep.resource_manager.clone()
             )?);
         }
-        if d.service.iap.enabled {
-            c.iap = Some(build_client_at!(
-                IdentityAwareProxyAdminService,
-                session,
-                ep.iap.clone()
-            )?);
-        }
+        // Also without IAP: members recorded while it was enabled are revoked.
+        c.iap = Some(build_client_at!(
+            IdentityAwareProxyAdminService,
+            session,
+            ep.iap.clone()
+        )?);
         Ok(Self {
             d,
             session,
             run,
             clients: c,
             project_number: OnceCell::new(),
+            granted: Default::default(),
+            uncertain: Default::default(),
             service_usage: ep
                 .service_usage
                 .clone()
                 .unwrap_or_else(|| "https://serviceusage.googleapis.com".into()),
         })
+    }
+
+    /// Clients needed to tear down what `deploy` created (`undeploy`).
+    pub async fn for_teardown(
+        d: &'a Deployment,
+        session: &'a Session,
+        run: &'a Services,
+    ) -> Result<Self> {
+        Self::new(d, session, run).await
     }
 
     async fn project_number(&self) -> Result<String> {
@@ -869,7 +1068,7 @@ impl<'a> Provisioner<'a> {
                 } else {
                     (
                         StepState::Pending,
-                        format!("will grant {role} on {t} to {}", missing.join(", ")),
+                        format!("grant to {}", missing.join(", ")),
                     )
                 }
             }
@@ -913,19 +1112,97 @@ impl<'a> Provisioner<'a> {
         role: &str,
         members: &[String],
     ) -> Result<StepOutcome> {
+        Ok(
+            match self.add_members(t, role, members, None).await?.is_empty() {
+                true => StepOutcome::Unchanged,
+                false => StepOutcome::Changed,
+            },
+        )
+    }
+
+    /// [`Self::ensure_members`], returning the members runway added, including
+    /// those of a write whose answer was lost but that committed. With
+    /// `grant`, those members are recorded as runway's (see
+    /// [`Self::granted`]) as soon as that is known: also when the step then
+    /// fails, so that the record saved before exiting includes them.
+    async fn add_members(
+        &self,
+        t: &PolicyTarget,
+        role: &str,
+        members: &[String],
+        grant: Option<&dyn Fn(&str) -> ManagedGrant>,
+    ) -> Result<Vec<String>> {
+        let key = t.to_string();
+        let record = |added: &[String]| {
+            if let Some(g) = grant {
+                self.record_granted(added.iter().map(|m| g(m)));
+            }
+        };
+        match self.write_members(t, role, members, &key).await {
+            Ok(added) => {
+                record(&added);
+                Ok(added)
+            }
+            Err(e) => {
+                // A write whose answer was lost may have committed. Confirm with
+                // one more read before failing: the process may end now, and
+                // with it the memory of that write.
+                if !self.has_uncertain(&key, role) {
+                    return Err(e);
+                }
+                let Ok(p) = self.get_policy(t).await else {
+                    return Err(e);
+                };
+                let missing = iam::missing_members(&p, role, members);
+                let confirmed =
+                    self.resolve_uncertain(&key, role, |m| !missing.iter().any(|x| x == m));
+                record(&confirmed);
+                if missing.is_empty() {
+                    // The write committed: the step reached its goal.
+                    return Ok(confirmed);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Read-modify-write of `members` on `role`, with up to four attempts.
+    async fn write_members(
+        &self,
+        t: &PolicyTarget,
+        role: &str,
+        members: &[String],
+        key: &str,
+    ) -> Result<Vec<String>> {
         for attempt in 1..=4 {
             let mut p = self.get_policy(t).await.map_err(|e| {
                 api_error(e, &format!("reading the IAM policy of {t}")).hint(needed_role_hint(t))
             })?;
+            let missing = iam::missing_members(&p, role, members);
+            let mut added = self.resolve_uncertain(key, role, |m| !missing.iter().any(|x| x == m));
             if !iam::add_members(&mut p, role, members) {
-                return Ok(StepOutcome::Unchanged);
+                return Ok(added);
             }
             match self.set_policy(t, p).await {
-                Ok(_) => return Ok(StepOutcome::Changed),
-                Err(e) if (is_concurrency_conflict(&e) || is_ambiguous(&e)) && attempt < 4 => {
-                    continue;
+                Ok(_) => {
+                    for m in missing {
+                        if !added.contains(&m) {
+                            added.push(m);
+                        }
+                    }
+                    return Ok(added);
                 }
                 Err(e) => {
+                    // Confirmed members stay known for the step's next attempt.
+                    self.mark_uncertain(key, role, &added);
+                    if is_ambiguous(&e) {
+                        // The write may have committed: the next read decides.
+                        self.mark_uncertain(key, role, &missing);
+                    }
+                    // A stale etag (conflict) means nothing was written.
+                    if (is_ambiguous(&e) || is_concurrency_conflict(&e)) && attempt < 4 {
+                        continue;
+                    }
                     return Err(
                         api_error(e, &format!("granting {role} on {t}")).hint(needed_role_hint(t))
                     );
@@ -1168,10 +1445,122 @@ impl<'a> Provisioner<'a> {
                 )
                 .await
             }
+            Step::Revoke(g) => self.check_revoke(g).await?,
         })
     }
 
     // ---------- applies (idempotent) ----------
+
+    fn record_granted(&self, grants: impl IntoIterator<Item = ManagedGrant>) {
+        let mut granted = self.granted.lock().expect("not poisoned");
+        for g in grants {
+            if !granted.contains(&g) {
+                granted.push(g);
+            }
+        }
+    }
+
+    /// Remembers members whose write on (`policy`, `role`) had a lost answer.
+    fn mark_uncertain(&self, policy: &str, role: &str, members: &[String]) {
+        let mut u = self.uncertain.lock().expect("not poisoned");
+        for m in members {
+            let entry = (policy.to_string(), role.to_string(), m.clone());
+            if !u.contains(&entry) {
+                u.push(entry);
+            }
+        }
+    }
+
+    fn has_uncertain(&self, policy: &str, role: &str) -> bool {
+        self.uncertain
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .any(|(p, r, _)| p == policy && r == role)
+    }
+
+    /// Resolves the uncertain writes on (`policy`, `role`) against a fresh
+    /// read: returns the members now present (runway's write committed).
+    fn resolve_uncertain(
+        &self,
+        policy: &str,
+        role: &str,
+        present: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let mut confirmed = Vec::new();
+        self.uncertain
+            .lock()
+            .expect("not poisoned")
+            .retain(|(p, r, m)| {
+                if p != policy || r != role {
+                    return true;
+                }
+                if present(m) {
+                    confirmed.push(m.clone());
+                }
+                false
+            });
+        confirmed
+    }
+
+    /// Managed grants this provisioner added so far (see [`grant_record`]).
+    pub fn granted(&self) -> Vec<ManagedGrant> {
+        self.granted.lock().expect("not poisoned").clone()
+    }
+
+    /// Applies `steps` in [`waves`], each with its own retries. `report` sees
+    /// every completed step, in the order of `steps`, as each wave finishes.
+    /// A failure stops before the next wave (lanes already running finish
+    /// first) and is returned after the steps that succeeded are reported.
+    pub async fn apply_all(
+        &self,
+        steps: &[Step],
+        retry: &crate::retry::RetryConfig,
+        progress: &crate::output::Progress,
+        report: &dyn Fn(&StepResult),
+    ) -> Result<Vec<StepResult>> {
+        let mut done = Vec::new();
+        for wave in waves(steps, self.d) {
+            let lanes = wave.into_iter().map(|lane| async move {
+                let mut out = Vec::new();
+                for (i, step) in lane {
+                    let r =
+                        crate::retry::with_retry(retry, progress, &step.describe(self.d), |_| {
+                            self.apply(step)
+                        })
+                        .await;
+                    let failed = r.is_err();
+                    out.push((i, r));
+                    if failed {
+                        break;
+                    }
+                }
+                out
+            });
+            let mut results: Vec<_> = futures::future::join_all(lanes)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            results.sort_by_key(|(i, _)| *i);
+            let mut error = None;
+            for (_, r) in results {
+                match r {
+                    Ok(r) => {
+                        report(&r);
+                        done.push(r);
+                    }
+                    Err(e) => {
+                        error.get_or_insert(e);
+                    }
+                }
+            }
+            if let Some(e) = error {
+                return Err(e);
+            }
+        }
+        Ok(done)
+    }
 
     pub async fn apply(&self, step: &Step) -> Result<StepResult> {
         let name = step.describe(self.d);
@@ -1184,8 +1573,16 @@ impl<'a> Provisioner<'a> {
                 let t = self
                     .grant_target(binding)
                     .ok_or_else(|| Error::internal("unsupported grant target"))?;
-                let o = self.ensure_members(&t, &binding.role, members).await?;
-                (o, format!("{} on {t}", binding.role))
+                let grant = |m: &str| ManagedGrant {
+                    member: m.into(),
+                    role: binding.role.clone(),
+                    target: Some(binding.target.clone()),
+                    runtime: false,
+                };
+                let added = self
+                    .add_members(&t, &binding.role, members, Some(&grant))
+                    .await?;
+                members_outcome(&added)
             }
             Step::SecretValues(names) => self.require_secret_values(names).await?,
             Step::CreateRepository {
@@ -1221,15 +1618,23 @@ impl<'a> Provisioner<'a> {
                     &self.d.region,
                     &self.d.service_id,
                 );
-                let o = self
-                    .ensure_members(
+                let grant = |m: &str| ManagedGrant {
+                    member: m.into(),
+                    role: IAP_ACCESSOR_ROLE.into(),
+                    target: None,
+                    runtime: false,
+                };
+                let added = self
+                    .add_members(
                         &PolicyTarget::Iap(r),
                         IAP_ACCESSOR_ROLE,
                         &self.d.service.iap.members,
+                        Some(&grant),
                     )
                     .await?;
-                (o, format!("{IAP_ACCESSOR_ROLE} granted"))
+                members_outcome(&added)
             }
+            Step::Revoke(g) => self.revoke(g).await?,
         };
         Ok(StepResult {
             step: name,
@@ -1308,30 +1713,82 @@ impl<'a> Provisioner<'a> {
     }
 
     async fn ensure_grant(&self, email: &str, b: &RoleBinding) -> Result<(StepOutcome, String)> {
+        // Roles of the runtime account are runway's to record; the build
+        // account's are not managed (other apps share it).
+        let managed = email == self.d.service.service_account;
+        let grant = |m: &str| ManagedGrant {
+            member: m.into(),
+            role: b.role.clone(),
+            target: Some(b.target.clone()),
+            runtime: true,
+        };
+        let grant: Option<&dyn Fn(&str) -> ManagedGrant> = managed.then_some(&grant);
+        let member = Self::sa_member(email);
+        let granted = || {
+            if let Some(g) = grant {
+                self.record_granted([g(&member)]);
+            }
+            Ok((
+                StepOutcome::Changed,
+                format!("granted {} to {email}", b.role),
+            ))
+        };
         if let RoleTarget::Dataset { project, dataset } = &b.target {
+            let key = b.target.to_string();
+            let read = || async {
+                self.get_dataset(project, dataset)
+                    .await
+                    .map(|ds| dataset_grants(&ds.access, &b.role, email))
+                    .map_err(|e| api_error(e, &format!("reading {}", b.target)))
+            };
             let ds = self
                 .get_dataset(project, dataset)
                 .await
                 .map_err(|e| api_error(e, &format!("reading {}", b.target)))?;
-            if dataset_grants(&ds.access, &b.role, email) {
-                return Ok((
-                    StepOutcome::Unchanged,
-                    format!("{} already granted", b.role),
-                ));
+            let present = dataset_grants(&ds.access, &b.role, email);
+            // A patch of an earlier attempt whose answer was lost committed.
+            let confirmed = !self
+                .resolve_uncertain(&key, &b.role, |_| present)
+                .is_empty();
+            if present {
+                return if confirmed {
+                    granted()
+                } else {
+                    Ok((
+                        StepOutcome::Unchanged,
+                        format!("{} already granted", b.role),
+                    ))
+                };
             }
             let mut access = ds.access.clone();
             access.push(Access::new().set_role(&b.role).set_user_by_email(email));
-            let updated = missing(&self.clients.datasets, "BigQuery")?
+            let updated = match missing(&self.clients.datasets, "BigQuery")?
                 .patch_dataset()
                 .set_project_id(project)
                 .set_dataset_id(dataset)
                 .set_dataset(Dataset::new().set_access(access))
                 .send()
                 .await
-                .map_err(|e| {
-                    api_error(e, &format!("granting {} on {}", b.role, b.target))
-                        .hint("the deployer needs bigquery.datasets.update (roles/bigquery.dataOwner on the dataset)")
-                })?;
+            {
+                Ok(updated) => updated,
+                Err(e) => {
+                    let ambiguous = is_ambiguous(&e);
+                    let err = api_error(e, &format!("granting {} on {}", b.role, b.target))
+                        .hint("the deployer needs bigquery.datasets.update (roles/bigquery.dataOwner on the dataset)");
+                    // The patch may have committed: confirm before failing, the
+                    // process may end now.
+                    if ambiguous {
+                        match read().await {
+                            Ok(true) => return granted(),
+                            Ok(false) => {}
+                            Err(_) => {
+                                self.mark_uncertain(&key, &b.role, std::slice::from_ref(&member))
+                            }
+                        }
+                    }
+                    return Err(err);
+                }
+            };
             // BigQuery has no etag check on patch: verify the entry survived.
             if !dataset_grants(&updated.access, &b.role, email) {
                 return Err(Error::new(
@@ -1342,18 +1799,20 @@ impl<'a> Provisioner<'a> {
                     ),
                 ));
             }
-            return Ok((
-                StepOutcome::Changed,
-                format!("granted {} to {email}", b.role),
-            ));
+            return granted();
         }
         let t = self
             .grant_target(b)
             .expect("non-dataset targets have a policy");
-        let o = self
-            .ensure_members(&t, &b.role, &[Self::sa_member(email)])
+        let added = self
+            .add_members(&t, &b.role, std::slice::from_ref(&member), grant)
             .await?;
-        Ok((o, format!("{} for {email}", b.role)))
+        let outcome = if added.is_empty() {
+            StepOutcome::Unchanged
+        } else {
+            StepOutcome::Changed
+        };
+        Ok((outcome, format!("{} for {email}", b.role)))
     }
 
     fn project_resource(number: &str) -> String {
@@ -1768,28 +2227,154 @@ impl<'a> Provisioner<'a> {
         let t = self
             .grant_target(b)
             .expect("non-dataset targets have a policy");
-        let members = [Self::sa_member(email)];
+        self.revoke_members(&t, &b.role, &[Self::sa_member(email)])
+            .await
+    }
+
+    /// Removes `members` from `role` on a policy (read-modify-write with etag).
+    async fn revoke_members(
+        &self,
+        t: &PolicyTarget,
+        role: &str,
+        members: &[String],
+    ) -> Result<StepOutcome> {
         for attempt in 1..=4 {
-            let mut p = match self.get_policy(&t).await {
+            let mut p = match self.get_policy(t).await {
                 Ok(p) => p,
                 Err(e) if is_not_found(&e) => return Ok(StepOutcome::Unchanged),
                 Err(e) => return Err(api_error(e, &format!("reading the IAM policy of {t}"))),
             };
-            if !iam::remove_members(&mut p, &b.role, &members) {
+            if !iam::remove_members(&mut p, role, members) {
                 return Ok(StepOutcome::Unchanged);
             }
-            match self.set_policy(&t, p).await {
+            match self.set_policy(t, p).await {
                 Ok(_) => return Ok(StepOutcome::Changed),
                 Err(e) if (is_concurrency_conflict(&e) || is_ambiguous(&e)) && attempt < 4 => {
                     continue;
                 }
                 Err(e) => {
-                    return Err(api_error(e, &format!("revoking {} on {t}", b.role))
-                        .hint(needed_role_hint(&t)));
+                    return Err(
+                        api_error(e, &format!("revoking {role} on {t}")).hint(needed_role_hint(t))
+                    );
                 }
             }
         }
         unreachable!("loop returns")
+    }
+
+    /// Why a recorded runtime role is kept rather than revoked: the account
+    /// was not created by runway for this service (another one may share it
+    /// and need the role), or it no longer exists.
+    async fn kept_account(&self, g: &ManagedGrant) -> Result<Option<String>> {
+        let Some(email) = g
+            .member
+            .strip_prefix("serviceAccount:")
+            .filter(|_| g.runtime)
+        else {
+            return Ok(None);
+        };
+        Ok(match self.service_account_description(email).await? {
+            Some(desc) if has_sa_marker(&desc, &self.d.app, Some(&self.d.stage), "runtime") => None,
+            Some(_) => Some(format!(
+                "kept: {email} was not created by runway for this service"
+            )),
+            None => Some(format!("{email} no longer exists")),
+        })
+    }
+
+    /// The policy holding a recorded grant (`None` for a BigQuery dataset).
+    async fn revoke_target(&self, g: &ManagedGrant) -> Result<Option<PolicyTarget>> {
+        Ok(match &g.target {
+            Some(RoleTarget::Dataset { .. }) => None,
+            Some(t) => self.grant_target(&RoleBinding {
+                role: g.role.clone(),
+                target: t.clone(),
+            }),
+            None => Some(PolicyTarget::Iap(iap_resource(
+                &self.project_number().await?,
+                &self.d.region,
+                &self.d.service_id,
+            ))),
+        })
+    }
+
+    async fn check_revoke(&self, g: &ManagedGrant) -> Result<(StepState, String)> {
+        if let Some(why) = self.kept_account(g).await? {
+            return Ok((StepState::InSync, why));
+        }
+        let present = match (&g.target, self.revoke_target(g).await?) {
+            (Some(RoleTarget::Dataset { project, dataset }), _) => {
+                let email = g
+                    .member
+                    .strip_prefix("serviceAccount:")
+                    .unwrap_or(&g.member);
+                match self.get_dataset(project, dataset).await {
+                    Ok(ds) => dataset_grants(&ds.access, &g.role, email),
+                    Err(e) if is_not_found(&e) => false,
+                    Err(e) => {
+                        return Err(api_error(
+                            e,
+                            &format!("reading dataset {project}.{dataset}"),
+                        ));
+                    }
+                }
+            }
+            (_, Some(t)) => match self.get_policy(&t).await {
+                Ok(p) => {
+                    iam::missing_members(&p, &g.role, std::slice::from_ref(&g.member)).is_empty()
+                }
+                Err(e) if is_not_found(&e) => false,
+                Err(e) => {
+                    return Err(api_error(e, &format!("reading the IAM policy of {t}"))
+                        .hint(needed_role_hint(&t)));
+                }
+            },
+            (_, None) => return Err(Error::internal("unsupported grant target")),
+        };
+        Ok(if present {
+            (
+                StepState::PendingRemoval,
+                format!("removed from runway.yaml: revoke from {}", g.member),
+            )
+        } else {
+            (
+                StepState::InSync,
+                format!("{} already has no access", g.member),
+            )
+        })
+    }
+
+    async fn revoke(&self, g: &ManagedGrant) -> Result<(StepOutcome, String)> {
+        if let Some(why) = self.kept_account(g).await? {
+            return Ok((StepOutcome::Unchanged, why));
+        }
+        let outcome = match (&g.target, g.member.strip_prefix("serviceAccount:")) {
+            (Some(t), Some(email)) if g.runtime => {
+                self.revoke_grant(
+                    email,
+                    &RoleBinding {
+                        role: g.role.clone(),
+                        target: t.clone(),
+                    },
+                )
+                .await?
+            }
+            _ => {
+                let t = self
+                    .revoke_target(g)
+                    .await?
+                    .ok_or_else(|| Error::internal("unsupported grant target"))?;
+                self.revoke_members(&t, &g.role, std::slice::from_ref(&g.member))
+                    .await?
+            }
+        };
+        Ok((
+            outcome,
+            match outcome {
+                StepOutcome::Changed => format!("revoked from {}", g.member),
+                StepOutcome::Unchanged => format!("{} already has no access", g.member),
+            },
+        ))
     }
 
     /// Deletes the app's image package from the repository (all its tags and digests).
@@ -2183,6 +2768,225 @@ service:
   iap: { members: [group:finops@example.com] }
 stages: { prod: {} }
 "#;
+
+    /// Describes every wave as lanes of step names.
+    fn wave_names(steps: &[Step], d: &Deployment) -> Vec<Vec<Vec<String>>> {
+        waves(steps, d)
+            .into_iter()
+            .map(|w| {
+                w.into_iter()
+                    .map(|lane| lane.into_iter().map(|(_, s)| s.describe(d)).collect())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn wave_of(waves: &[Vec<Vec<String>>], needle: &str) -> usize {
+        waves
+            .iter()
+            .position(|w| w.iter().flatten().any(|n| n.contains(needle)))
+            .unwrap_or_else(|| panic!("missing `{needle}` in {waves:#?}"))
+    }
+
+    #[test]
+    fn waves_keep_dependencies_and_serialize_writes_to_one_policy() {
+        let yaml = FULL
+            .replace(
+                "      - { role: roles/storage.objectUser, bucket: \"${buckets.cache}\" }",
+                "      - { role: roles/storage.objectUser, bucket: \"${buckets.cache}\" }\n      - { role: roles/storage.objectViewer, bucket: \"${project}-runway-sources\" }\n  secrets:\n    API_KEY: { secret: \"${secrets.api-key}\" }",
+            )
+            .replace(
+                "buckets:",
+                "secrets:\n  api-key: { adders: [group:devs@example.com] }\nbuckets:",
+            );
+        let (_dir, d) = deployment(&yaml);
+        let steps = pre_steps(&d);
+        let w = wave_names(&steps, &d);
+        let account = wave_of(&w, "service account gcptree-run@");
+        let secret = wave_of(&w, "secret api-key");
+        assert_eq!(
+            account,
+            wave_of(&w, "bucket gs://my-gcp-project-gcptree-cache")
+        );
+        assert_eq!(account, secret, "resources are created together");
+        assert!(account < wave_of(&w, "roles/storage.objectUser on bucket"));
+        assert!(secret < wave_of(&w, "roles/secretmanager.secretVersionAdder"));
+        assert!(wave_of(&w, "roles/secretmanager.secretAccessor") < wave_of(&w, "value of secret"));
+
+        // Two accounts granted on the source bucket: one lane, in step order.
+        let grants = &w[wave_of(&w, "roles/storage.objectUser on bucket")];
+        let lane = |needle: &str| {
+            grants
+                .iter()
+                .find(|l| l.iter().any(|n| n.contains(needle)))
+                .unwrap_or_else(|| panic!("no lane with `{needle}`: {grants:#?}"))
+        };
+        let sources = lane("on bucket gs://my-gcp-project-runway-sources");
+        assert_eq!(sources.len(), 2, "{sources:#?}");
+        assert!(
+            sources[0].ends_with("to runway-build"),
+            "build grant first: {sources:#?}"
+        );
+        assert!(sources[1].ends_with("to gcptree-run"));
+        let secret_policy = lane("on secret projects/my-gcp-project/secrets/api-key");
+        assert_eq!(
+            secret_policy.len(),
+            2,
+            "adders and accessor share the policy"
+        );
+        assert_ne!(
+            lane("on bucket gs://my-gcp-project-gcptree-cache"),
+            lane("on project billing-data-1234"),
+            "different policies run concurrently"
+        );
+        assert_eq!(
+            waves(&steps, &d).iter().flatten().flatten().count(),
+            steps.len(),
+            "every step exactly once"
+        );
+    }
+
+    #[test]
+    fn a_build_waits_only_for_the_build_resources() {
+        let (_dir, d) = deployment(FULL);
+        let (build, rest): (Vec<_>, Vec<_>) = pre_steps(&d)
+            .into_iter()
+            .partition(|s| s.build_prerequisite(&d));
+        let names = |v: &[Step]| v.iter().map(|s| s.describe(&d)).collect::<Vec<_>>();
+        let (build, rest) = (names(&build), names(&rest));
+        for needed in [
+            "bucket gs://my-gcp-project-runway-sources",
+            "Artifact Registry repository europe-west1/runway",
+            "service account runway-build@",
+            "roles/logging.logWriter on project my-gcp-project to runway-build",
+            "roles/artifactregistry.writer",
+            "roles/storage.objectViewer on bucket gs://my-gcp-project-runway-sources",
+        ] {
+            assert!(
+                build.iter().any(|n| n.contains(needed)),
+                "{needed}: {build:#?}"
+            );
+        }
+        for later in [
+            "bucket gs://my-gcp-project-gcptree-cache",
+            "service account gcptree-run@",
+            "roles/bigquery.jobUser",
+            "roles/storage.objectUser",
+        ] {
+            assert!(rest.iter().any(|n| n.contains(later)), "{later}: {rest:#?}");
+        }
+    }
+
+    #[test]
+    fn grants_removed_from_the_configuration_are_revoked_once_recorded() {
+        let yaml = FULL.replace(
+            "  iap: { members: [group:finops@example.com] }",
+            "  secrets:\n    API_KEY: { secret: \"${secrets.api-key}\" }\n  iap: { members: [group:finops@example.com] }",
+        )
+        .replace(
+            "buckets:",
+            "secrets:\n  api-key: { adders: [group:devs@example.com] }\nbuckets:",
+        );
+        let (_dir, d) = deployment(&yaml);
+        let managed = managed_grants(&d);
+        let has =
+            |member: &str, role: &str| managed.iter().any(|g| g.member == member && g.role == role);
+        let run = "serviceAccount:gcptree-run@my-gcp-project.iam.gserviceaccount.com";
+        assert!(has(run, "roles/bigquery.jobUser"), "declared role");
+        assert!(
+            has(run, "roles/secretmanager.secretAccessor"),
+            "implied by a secret"
+        );
+        assert!(has("group:devs@example.com", SECRET_ADDER_ROLE), "adder");
+        assert!(
+            has("group:finops@example.com", IAP_ACCESSOR_ROLE),
+            "IAP member"
+        );
+        assert!(
+            !managed.iter().any(|g| g.member.contains("runway-build@")),
+            "the shared build account is never revoked: {managed:#?}"
+        );
+        assert!(
+            managed
+                .iter()
+                .filter(|g| g.runtime)
+                .all(|g| g.member == run)
+        );
+
+        // Round trip through the service annotation.
+        let annotations = [(ANNOTATION_GRANTS.to_string(), encode_grants(&managed))].into();
+        assert_eq!(recorded_grants(&annotations), managed);
+        assert!(recorded_grants(&Default::default()).is_empty());
+
+        // Recorded but no longer configured: revoked. Configured: kept.
+        let old = ManagedGrant {
+            member: "group:old@example.com".into(),
+            role: IAP_ACCESSOR_ROLE.into(),
+            target: None,
+            runtime: false,
+        };
+        let mut recorded = managed.clone();
+        recorded.push(old.clone());
+        let revokes = revoke_steps(&recorded, &d);
+        assert_eq!(revokes, [Step::Revoke(old)]);
+        assert_eq!(
+            revokes[0].describe(&d),
+            "revoke roles/iap.httpsResourceAccessor on the IAP resource from group:old@example.com"
+        );
+        assert!(revokes[0].needs_service());
+        assert!(revoke_steps(&managed, &d).is_empty(), "nothing removed");
+
+        // Revocations come after every other step.
+        let mut all = post_steps(&d);
+        all.extend(revokes);
+        let w = wave_names(&all, &d);
+        assert!(w.last().unwrap()[0][0].starts_with("revoke "), "{w:#?}");
+    }
+
+    #[test]
+    fn only_grants_runway_added_are_recorded() {
+        let g = |member: &str| ManagedGrant {
+            member: member.into(),
+            role: IAP_ACCESSOR_ROLE.into(),
+            target: None,
+            runtime: false,
+        };
+        let (earlier, added, manual, removed) =
+            (g("group:a"), g("group:b"), g("group:c"), g("group:r"));
+        let recorded = [earlier.clone(), removed.clone()];
+        let desired = [earlier.clone(), added.clone(), manual.clone()];
+        // `manual` was already in place when runway checked it: not runway's.
+        assert_eq!(
+            grant_record(&recorded, &desired, std::slice::from_ref(&added), true),
+            [earlier.clone(), added.clone(), removed],
+            "removed grants stay recorded until revoked"
+        );
+        assert_eq!(
+            grant_record(&recorded, &desired, std::slice::from_ref(&added), false),
+            [earlier, added],
+            "once revoked"
+        );
+    }
+
+    #[test]
+    fn service_tags_come_before_iap_which_uses_two_policies() {
+        let yaml = FULL.replace(
+            "  iap: { members: [group:finops@example.com] }",
+            "  tags: { \"123/allow\": \"yes\" }\n  iap: { members: [group:finops@example.com] }",
+        );
+        let (_dir, d) = deployment(&yaml);
+        let w = wave_names(&post_steps(&d), &d);
+        assert_eq!(
+            w,
+            vec![
+                vec![vec!["tag 123/allow=yes".to_string()]],
+                vec![
+                    vec!["IAP service agent can invoke the service".to_string()],
+                    vec!["IAP access (roles/iap.httpsResourceAccessor)".to_string()],
+                ],
+            ]
+        );
+    }
 
     #[test]
     fn steps_run_in_dependency_order() {

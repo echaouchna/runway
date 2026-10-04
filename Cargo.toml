@@ -66,6 +66,16 @@ wiremock = "0.6"
 assert_cmd = "2"
 predicates = "3"
 
+# Local builds and tests: line tables only (backtraces keep file:line) and no
+# debug info for dependencies. Measured from scratch (`cargo test --no-run`):
+# target/ 3.9 GB instead of 8.5 GB, 42 s instead of 59 s. For a debugger
+# session: CARGO_PROFILE_DEV_DEBUG=true cargo build.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 strip = true
 lto = "thin"

@@ -149,13 +149,15 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
         }))
         .collect();
 
-    // Same template as the live one: send it back untouched, so that changes
-    // to traffic or ingress alone never create a revision.
+    // Same template as the live one, or a revision behind the mode's URL that
+    // already runs this configuration: send the template back untouched, so
+    // that changes to traffic or ingress alone never create a revision.
     let reuse = existing.filter(|e| {
-        spec.revision_annotations.is_empty()
-            && crate::plan::diff(&observed_flat(e), &spec.flatten())
-                .iter()
-                .all(|c| is_service_level(&c.field))
+        spec.traffic.serve.is_some()
+            || (spec.revision_annotations.is_empty()
+                && crate::plan::diff(&observed_flat(e), &spec.flatten())
+                    .iter()
+                    .all(|c| is_service_level(&c.field)))
     });
     let template = match reuse.and_then(|e| e.template.clone()) {
         Some(t) => t,
@@ -425,6 +427,13 @@ pub fn spec_for_live(spec: &ServiceSpec, svc: Option<&Service>) -> ServiceSpec {
             s.annotations.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
+    // The grant record does not describe the image: a spec that does not set
+    // it (plan) keeps it.
+    if let Some(v) = svc.annotations.get(crate::provision::ANNOTATION_GRANTS) {
+        s.annotations
+            .entry(crate::provision::ANNOTATION_GRANTS.to_string())
+            .or_insert_with(|| v.clone());
+    }
     s
 }
 
@@ -438,8 +447,107 @@ pub fn annotations_current(svc: &Service, spec: &ServiceSpec) -> bool {
         .all(|(k, v)| svc.annotations.get(k) == Some(v))
 }
 
+/// What a deploy changes on the live service. When a revision behind the
+/// mode's URL already runs this configuration (`traffic.serve`), revision
+/// fields are left alone: only service-level fields can change.
+pub fn pending_changes(svc: &Service, spec: &ServiceSpec) -> Vec<crate::plan::FieldChange> {
+    let mut changes = crate::plan::diff(&observed_flat(svc), &spec.flatten());
+    if spec.traffic.serve.is_some() {
+        changes.retain(|c| is_service_level(&c.field));
+    }
+    changes
+}
+
+/// Template annotation giving previews and canaries a revision of their own,
+/// so that their URL never points at the revision serving production.
+pub fn revision_marker(mode: &crate::traffic::Mode) -> Option<(&'static str, String)> {
+    match mode {
+        crate::traffic::Mode::Full => None,
+        crate::traffic::Mode::Preview { tag } => Some(("runway.dev/preview", tag.clone())),
+        crate::traffic::Mode::Canary { .. } => Some(("runway.dev/canary", "true".into())),
+    }
+}
+
+/// True when a preview or canary needs a new revision because the latest one
+/// is not already its own.
+pub fn needs_own_revision(svc: &Service, mode: &crate::traffic::Mode) -> bool {
+    revision_marker(mode).is_some_and(|(key, value)| {
+        let live = svc.template.as_ref().and_then(|t| t.annotations.get(key));
+        live != Some(&value)
+    })
+}
+
+/// The traffic target behind the URL a deploy in `mode` changes, with its
+/// revision: the main URL (one target serving 100%), the preview's tag or the
+/// canary tag. `None` when there is no such single revision.
+pub fn mode_target(
+    cur: &crate::traffic::Current,
+    mode: &crate::traffic::Mode,
+) -> Option<(crate::traffic::Target, String)> {
+    use crate::traffic::{CANARY_TAG, Mode, Target};
+    let entry = match mode {
+        Mode::Full => match cur
+            .entries
+            .iter()
+            .filter(|e| e.percent > 0)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [e] if e.percent == 100 => Some(*e),
+            _ => None,
+        },
+        Mode::Preview { tag } => cur.entries.iter().find(|e| &e.tag == tag),
+        Mode::Canary { .. } => cur.entries.iter().find(|e| e.tag == CANARY_TAG),
+    }?;
+    let revision = match &entry.target {
+        Target::Latest => cur.latest_ready.clone(),
+        Target::Revision(r) => r.clone(),
+    };
+    (!revision.is_empty()).then(|| (entry.target.clone(), revision))
+}
+
+/// True when one revision serves all of the service's traffic. Grants removed
+/// from the configuration are revoked only then, after a main deploy: no
+/// other revision serving traffic can still need them.
+pub fn one_revision_serves_all(svc: &Service) -> bool {
+    mode_target(&current_traffic(svc), &crate::traffic::Mode::Full).is_some()
+}
+
+/// True when `rev` runs exactly the revision part of `spec` (image,
+/// resources, scaling, env, secrets, probes, volumes, sidecars, identity) and
+/// carries the marker of a preview or canary spec. Service-level fields are
+/// compared elsewhere.
+pub fn revision_matches(
+    svc: &Service,
+    rev: &google_cloud_run_v2::model::Revision,
+    spec: &ServiceSpec,
+) -> bool {
+    if spec.image.is_empty() {
+        return false;
+    }
+    let marked = spec
+        .revision_annotations
+        .iter()
+        .all(|(k, v)| rev.annotations.get(k) == Some(v));
+    let template = RevisionTemplate::new()
+        .set_containers(rev.containers.clone())
+        .set_volumes(rev.volumes.clone())
+        .set_service_account(&rev.service_account)
+        .set_max_instance_request_concurrency(rev.max_instance_request_concurrency)
+        .set_or_clear_timeout(rev.timeout)
+        .set_or_clear_scaling(rev.scaling.clone());
+    let revision_fields = |m: BTreeMap<String, String>| -> BTreeMap<String, String> {
+        m.into_iter()
+            .filter(|(k, _)| !is_service_level(k))
+            .collect()
+    };
+    marked
+        && revision_fields(observed_flat(&svc.clone().set_template(template)))
+            == revision_fields(spec.flatten())
+}
+
 /// Fields that live on the Service, not on the revision template.
-fn is_service_level(field: &str) -> bool {
+pub fn is_service_level(field: &str) -> bool {
     matches!(field, "ingress" | "iap" | "invoker_iam_disabled")
         || field == "traffic"
         || field.starts_with("traffic.")
@@ -1139,6 +1247,122 @@ mod tests {
                 .iter()
                 .any(|c| c.field == "sidecars.otel-collector" && c.after.is_none()),
             "{changes:?}"
+        );
+    }
+
+    /// A revision as Cloud Run reports it, created from `t`.
+    fn revision_of(t: &RevisionTemplate) -> google_cloud_run_v2::model::Revision {
+        google_cloud_run_v2::model::Revision::new()
+            .set_containers(t.containers.clone())
+            .set_volumes(t.volumes.clone())
+            .set_service_account(&t.service_account)
+            .set_max_instance_request_concurrency(t.max_instance_request_concurrency)
+            .set_or_clear_timeout(t.timeout)
+            .set_or_clear_scaling(t.scaling.clone())
+            .set_annotations(t.annotations.clone())
+    }
+
+    #[test]
+    fn revocations_wait_until_one_revision_serves_all_traffic() {
+        use crate::traffic::{Entry, Target};
+        let with = |entries: Vec<Entry>| {
+            let mut svc = desired_service(&spec(), "n", None);
+            svc.latest_ready_revision = "projects/p/locations/r/services/n/revisions/n-2".into();
+            with_traffic(&svc, &entries)
+        };
+        assert!(one_revision_serves_all(&with(vec![
+            Entry::new(Target::Latest, 100, ""),
+            Entry::new(Target::Revision("n-1".into()), 0, "feat-a"),
+        ])));
+        assert!(
+            !one_revision_serves_all(&with(vec![
+                Entry::new(Target::Revision("n-1".into()), 90, ""),
+                Entry::new(Target::Latest, 10, "canary"),
+            ])),
+            "the stable revision may still need a removed grant"
+        );
+    }
+
+    #[test]
+    fn a_revision_already_running_the_configuration_is_kept() {
+        use crate::traffic::{Current, Entry, Mode, Target};
+        let s = spec();
+        let live = desired_service(&s, "n", None);
+        let rev = revision_of(live.template.as_ref().unwrap());
+        assert!(revision_matches(&live, &rev, &s), "same configuration");
+
+        let mut env = s.clone();
+        env.env.insert("NEW".into(), "1".into());
+        assert!(!revision_matches(&live, &rev, &env), "env differs");
+        let mut image = s.clone();
+        image.image = "other@sha256:9".into();
+        assert!(!revision_matches(&live, &rev, &image), "image differs");
+        let mut pending = s.clone();
+        pending.image = String::new();
+        assert!(
+            !revision_matches(&live, &rev, &pending),
+            "image not built yet"
+        );
+
+        // A preview only reuses a revision carrying its own marker.
+        let mode = Mode::Preview {
+            tag: "feat-a".into(),
+        };
+        let mut preview = s.clone().with_traffic_mode(mode.clone());
+        let (key, value) = revision_marker(&mode).unwrap();
+        preview
+            .revision_annotations
+            .insert(key.into(), value.clone());
+        assert!(
+            !revision_matches(&live, &rev, &preview),
+            "production revision"
+        );
+        let marked = rev.clone().set_annotations([(key, value)]);
+        assert!(revision_matches(&live, &marked, &preview));
+
+        // Which revision is behind the URL a mode changes.
+        let traffic = Current {
+            entries: vec![
+                Entry::new(Target::Revision("n-1".into()), 100, ""),
+                Entry::new(Target::Latest, 0, "feat-a"),
+            ],
+            latest_ready: "n-2".into(),
+        };
+        assert_eq!(
+            mode_target(&traffic, &Mode::Full),
+            Some((Target::Revision("n-1".into()), "n-1".into()))
+        );
+        assert_eq!(
+            mode_target(&traffic, &mode),
+            Some((Target::Latest, "n-2".into()))
+        );
+        assert_eq!(mode_target(&traffic, &Mode::Canary { percent: 10 }), None);
+        let split = Current {
+            entries: vec![
+                Entry::new(Target::Revision("n-1".into()), 90, ""),
+                Entry::new(Target::Latest, 10, "canary"),
+            ],
+            latest_ready: "n-2".into(),
+        };
+        assert_eq!(
+            mode_target(&split, &Mode::Full),
+            None,
+            "two revisions serve"
+        );
+
+        // Kept revision: revision fields are left alone, service fields still apply.
+        let mut kept = env.clone();
+        kept.ingress = "internal".into();
+        kept.traffic.serve = Some(Target::Latest);
+        let fields: Vec<String> = pending_changes(&live, &kept)
+            .into_iter()
+            .map(|c| c.field)
+            .collect();
+        assert_eq!(fields, ["ingress"]);
+        assert_eq!(
+            desired_service(&kept, "n", Some(&live)).template,
+            live.template,
+            "template sent back as is: no new revision"
         );
     }
 

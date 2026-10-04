@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::image_ref::ImageRef;
 use crate::naming;
 use schema::{RawConfig, RawProvider, RawService, RawStage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -488,13 +488,13 @@ pub struct IdentityConfig {
     pub roles: Vec<RoleBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleBinding {
     pub role: String,
     pub target: RoleTarget,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RoleTarget {
     Project {

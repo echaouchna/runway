@@ -80,40 +80,10 @@ Cloud Run service** in one file and one tool:
 
 ## How it works
 
-```mermaid
-%%{init: {"theme": "base", "htmlLabels": false, "themeVariables": {"fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif", "fontSize": "16px", "lineColor": "#64748b", "edgeLabelBackground": "#f8fafc"}, "flowchart": {"curve": "basis", "nodeSpacing": 36, "rankSpacing": 44, "wrappingWidth": 280, "minNodeWidth": 240}}}%%
-flowchart TB
-    config("runway.yaml<br/>Source or image · stages · resources")
-    live[("Live Google Cloud<br/>Service · IAM · registry · resources")]
-    runway("runway<br/>Validate + resolve configuration<br/>Compare desired and live state")
-    plan("runway plan<br/>Read-only diff + explicit unknowns")
-
-    subgraph deploy["runway deploy · apply only what differs"]
-        direction TB
-        prepare("Prepare resources<br/>APIs · IAM · secrets · storage")
-        image("Build or reuse an image<br/>Cloud Build → Artifact Registry<br/>Or use an existing image")
-        service("Reconcile Cloud Run<br/>Wait for readiness<br/>Configure access and traffic")
-        ready(["Ready service + URL<br/>Branch previews · canaries · rollback"])
-        prepare --> image --> service --> ready
-    end
-
-    config -->|"Desired configuration"| runway
-    live -->|"Read current state"| runway
-    runway --> plan
-    runway --> prepare
-
-    classDef input fill:#ecfeff,stroke:#0891b2,color:#164e63,stroke-width:2px
-    classDef engine fill:#0b1020,stroke:#22d3ee,color:#e7ecff,stroke-width:3px
-    classDef preview fill:#f0f9ff,stroke:#0891b2,color:#164e63,stroke-width:2px
-    classDef step fill:#f5f3ff,stroke:#8b5cf6,color:#4c1d95,stroke-width:2px
-    classDef result fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:2px
-    class config,live input
-    class runway engine
-    class plan preview
-    class prepare,image,service step
-    class ready result
-    style deploy fill:#faf5ff,stroke:#a78bfa,color:#5b21b6,stroke-width:2px
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="site/assets/how-it-works-dark.svg">
+  <img src="site/assets/how-it-works-light.svg" alt="runway.yaml and the live Google Cloud project go into runway, which compares desired and live state field by field with no state file. runway plan shows the exact changes (for example memory 512Mi to 1Gi, an IAP group added, another removed). runway deploy runs independent steps together in waves: APIs and registry login; buckets, secrets, repository and accounts; grants, one lane per IAM policy; the build in parallel with the app's grants; then the rollout, tags and IAP, and revoking removed access. The result is a ready Cloud Run service with its main URL, branch preview URLs and a canary." width="100%">
+</picture>
 
 Every step reads live state before making changes. An existing image skips
 the build, and an interrupted deployment can be run again safely. The live

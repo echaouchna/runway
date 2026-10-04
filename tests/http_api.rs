@@ -388,3 +388,151 @@ async fn cloud_run_create_uses_service_id_and_parent() {
     );
     assert_eq!(b["labels"]["runway-stage"], "dev");
 }
+
+/// A revision as Cloud Run reports it, created from `spec`'s template.
+fn revision_json(name: &str, spec: &ServiceSpec) -> Value {
+    let t = runway::gcp::run::desired_service(spec, name, None)
+        .template
+        .unwrap();
+    serde_json::to_value(
+        google_cloud_run_v2::model::Revision::new()
+            .set_name(name)
+            .set_containers(t.containers)
+            .set_volumes(t.volumes)
+            .set_service_account(t.service_account)
+            .set_max_instance_request_concurrency(t.max_instance_request_concurrency)
+            .set_or_clear_timeout(t.timeout)
+            .set_or_clear_scaling(t.scaling)
+            .set_annotations(t.annotations),
+    )
+    .unwrap()
+}
+
+fn marked(spec: &ServiceSpec, tag: &str) -> ServiceSpec {
+    use runway::traffic::Mode;
+    let mut s = spec
+        .clone()
+        .with_traffic_mode(Mode::Preview { tag: tag.into() });
+    s.revision_annotations
+        .insert("runway.dev/preview".into(), tag.into());
+    s
+}
+
+#[tokio::test]
+async fn a_revision_already_serving_the_configuration_is_kept() {
+    use google_cloud_run_v2::model::{
+        Condition, TrafficTarget, TrafficTargetAllocationType, condition,
+    };
+    use runway::gcp::run;
+    let server = MockServer::start().await;
+    let name = "projects/p/locations/europe-west1/services/hello-dev";
+    let rev = |n: &str| format!("{name}/revisions/hello-dev-0000{n}");
+    let prod = spec();
+    let feat_a = marked(&prod, "feat-a");
+    let mut feat_b = marked(&prod, "feat-b");
+    feat_b.image = "europe-west1-docker.pkg.dev/p/apps/hello@sha256:bbbb".into();
+
+    // Production on -00001, feat-a on -00002; the latest revision (the
+    // service template) is feat-b's, with other code.
+    let target = |t: TrafficTargetAllocationType, r: &str, pct: i32, tag: &str| {
+        TrafficTarget::new()
+            .set_type(t)
+            .set_revision(r)
+            .set_percent(pct)
+            .set_tag(tag)
+    };
+    let live = run::desired_service(&feat_b, name, None)
+        .set_name(name)
+        .set_etag("\"etag-5\"")
+        .set_generation(5)
+        .set_observed_generation(5)
+        .set_uri("https://hello-dev-xyz-ew.a.run.app")
+        .set_latest_ready_revision(rev("3"))
+        .set_latest_created_revision(rev("3"))
+        .set_terminal_condition(
+            Condition::new()
+                .set_type("Ready")
+                .set_state(condition::State::ConditionSucceeded),
+        )
+        .set_traffic([
+            target(TrafficTargetAllocationType::Revision, &rev("1"), 100, ""),
+            target(
+                TrafficTargetAllocationType::Revision,
+                &rev("2"),
+                0,
+                "feat-a",
+            ),
+            target(TrafficTargetAllocationType::Latest, "", 0, "feat-b"),
+        ]);
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{name}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::to_value(&live).unwrap()),
+        )
+        .mount(&server)
+        .await;
+    for (n, s) in [("1", &prod), ("2", &feat_a)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{}", rev(n))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(revision_json(&rev(n), s)))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let creds = anonymous::Builder::new().build();
+    let services = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(creds.clone())
+        .build()
+        .await
+        .unwrap();
+    let revisions = google_cloud_run_v2::client::Revisions::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(creds)
+        .build()
+        .await
+        .unwrap();
+    let progress = Progress::silent();
+    let rec = Reconciler {
+        run: &services,
+        revisions: Some(&revisions),
+        progress: &progress,
+        poll: PollConfig::fast(),
+        timeout: Duration::from_secs(5),
+    };
+    let t = Target {
+        parent: "projects/p/locations/europe-west1",
+        service_id: "hello-dev",
+        name,
+        app: "hello",
+        stage: "dev",
+        adopt: false,
+        force: false,
+    };
+    let live = rec.get(name).await.unwrap().unwrap();
+
+    // The main deploy (production code) and feat-a again (same code): the
+    // revisions behind those URLs are kept, nothing is written.
+    for (desired, expected) in [(&prod, "hello-dev-00001"), (&feat_a, "hello-dev-00002")] {
+        let mut s = run::spec_for_live(desired, Some(&live));
+        let (target, revision) = rec
+            .matching_revision(&live, &s)
+            .await
+            .unwrap_or_else(|| panic!("{expected} runs this configuration"));
+        assert_eq!(revision, expected);
+        s.traffic.serve = Some(target);
+        let applied = rec.apply(&t, &s, Some(live.clone())).await.unwrap();
+        assert_eq!(applied.change, ServiceChange::Unchanged, "{expected}");
+    }
+
+    // feat-a with new code: its revision does not match.
+    let mut changed = feat_a.clone();
+    changed.env.insert("NEW".into(), "1".into());
+    let s = run::spec_for_live(&changed, Some(&live));
+    assert_eq!(rec.matching_revision(&live, &s).await, None);
+}

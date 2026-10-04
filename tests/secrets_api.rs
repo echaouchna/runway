@@ -66,7 +66,11 @@ fn configuration_implies_creation_access_and_a_value_check() {
     );
     pos("grant roles/storage.objectUser on bucket gs://my-data");
     let adders = pos("grant roles/secretmanager.secretVersionAdder");
-    assert!(names[adders].contains("group:devops@example.com"));
+    assert!(
+        matches!(&steps[adders], Step::GrantMembers { members, .. } if members == &["group:devops@example.com"]),
+        "{:?}",
+        steps[adders]
+    );
     let values = pos("value of secret(s) gcptree-prod-api-key");
     assert!(create < accessor && accessor < values && adders < values);
     assert_eq!(

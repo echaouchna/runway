@@ -21,14 +21,20 @@ use crate::plan::{
     render_text,
 };
 use crate::poll::PollConfig;
-use crate::provision::{Provisioner, StepCheck, StepState, all_steps};
-use google_cloud_run_v2::client::Services;
+use crate::provision::{
+    ANNOTATION_GRANTS, Provisioner, StepCheck, StepState, all_steps, managed_grants,
+    recorded_grants, revoke_steps,
+};
+use google_cloud_run_v2::client::{Revisions, Services};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Read-only access to Google Cloud used while planning.
 pub struct Remote<'a> {
     pub run: &'a Services,
+    /// Reads the revision behind the URL a deploy changes; `None` assumes a
+    /// new revision is needed whenever the revision fields differ.
+    pub revisions: Option<&'a Revisions>,
     pub resolver: &'a dyn DigestResolver,
     /// Checks provisioning steps; `None` skips them (reported as unknown).
     pub provisioner: Option<&'a Provisioner<'a>>,
@@ -200,6 +206,76 @@ pub async fn decide_image(
     }
 }
 
+/// Changes to an owned service, as deploy makes them. A preview or canary
+/// runs in a revision of its own, which a field diff cannot show. When the
+/// revision behind the URL the mode changes already runs the configuration,
+/// it keeps serving: only service-level changes remain.
+async fn revision_aware_changes(
+    svc: &google_cloud_run_v2::model::Service,
+    spec: &ServiceSpec,
+    image: &ImagePlan,
+    remote: Option<&Remote<'_>>,
+    progress: &Progress,
+    notes: &mut Vec<String>,
+) -> (ServiceAction, Vec<crate::plan::FieldChange>) {
+    let mode = &spec.traffic.mode;
+    let mut spec = spec.clone();
+    if let Some((key, value)) = run::revision_marker(mode) {
+        spec.revision_annotations.insert(key.to_string(), value);
+    }
+    let own = run::needs_own_revision(svc, mode);
+    let observed = run::observed_flat(svc);
+    let new_revision = own
+        || crate::plan::diff(&observed, &spec.flatten())
+            .iter()
+            .any(|c| !run::is_service_level(&c.field));
+    if new_revision && image.is_exact() {
+        let matching = match remote {
+            Some(r) => {
+                Reconciler {
+                    run: r.run,
+                    revisions: r.revisions,
+                    progress,
+                    poll: PollConfig::default(),
+                    timeout: Duration::from_secs(30),
+                }
+                .matching_revision(svc, &spec)
+                .await
+            }
+            None => None,
+        };
+        if let Some((target, revision)) = matching {
+            notes.push(format!(
+                "{revision} already runs this configuration: deploy keeps it serving and creates no revision"
+            ));
+            spec.traffic.serve = Some(target);
+            spec = spec.with_current_traffic(Some(&run::current_traffic(svc)));
+            let changes = run::pending_changes(svc, &spec);
+            let action = if changes.is_empty() {
+                ServiceAction::NoChange
+            } else {
+                ServiceAction::Update
+            };
+            return (action, changes);
+        }
+    }
+    let (mut action, mut changes) = compute_changes(Some(&observed), &spec, image);
+    if own && !changes.iter().any(|c| !run::is_service_level(&c.field)) {
+        changes.push(crate::plan::FieldChange {
+            field: "revision".into(),
+            before: None,
+            after: Some(match mode {
+                crate::traffic::Mode::Preview { tag } => {
+                    format!("new, of its own for preview `{tag}` (same configuration)")
+                }
+                _ => "new, of its own for the canary (same configuration)".into(),
+            }),
+        });
+        action = ServiceAction::Update;
+    }
+    (action, changes)
+}
+
 /// Computes a plan; `remote = None` means offline.
 pub async fn compute(
     d: &Deployment,
@@ -209,23 +285,41 @@ pub async fn compute(
 ) -> Result<(Plan, ImageDecision)> {
     let mut notes = Vec::new();
     let name = d.service_name();
-    // Packaging, registry lookup, service read and IAM read are independent:
-    // run them concurrently so a plan costs about one round trip.
-    let (decision, live) = match &remote {
-        None => (decide_image(d, None, &mut notes).await?, None),
+    let all_steps = all_steps(d);
+    let provisioner = remote.as_ref().and_then(|r| r.provisioner);
+    // Packaging, registry lookup, service read, IAM read and the checks that
+    // do not need the service are independent: they run concurrently, so a
+    // plan costs about one round trip.
+    let (decision, live, early_checks) = match &remote {
+        None => (decide_image(d, None, &mut notes).await?, None, Vec::new()),
         Some(r) => {
             let rec = Reconciler {
                 run: r.run,
-                revisions: None,
+                revisions: r.revisions,
                 progress,
                 poll: PollConfig::default(),
                 timeout: Duration::from_secs(30),
             };
+            let early = async {
+                match provisioner {
+                    Some(prov) => {
+                        futures::future::join_all(
+                            all_steps
+                                .iter()
+                                .filter(|s| !s.needs_service())
+                                .map(|s| prov.check(s, false)),
+                        )
+                        .await
+                    }
+                    None => Vec::new(),
+                }
+            };
             let mut img_notes = Vec::new();
-            let (decision, svc, public) = tokio::join!(
+            let (decision, svc, public, early) = tokio::join!(
                 decide_image(d, Some(r.resolver), &mut img_notes),
                 rec.get(&name),
                 rec.current_public(&name),
+                early,
             );
             notes.extend(img_notes);
             // With `enable_apis`, a disabled Cloud Run API is a pending step,
@@ -244,7 +338,7 @@ pub async fn compute(
                 }
                 (svc, public) => (svc?, public?),
             };
-            (decision?, Some((svc, public)))
+            (decision?, Some((svc, public)), early)
         }
     };
     let spec = ServiceSpec::from_deployment(
@@ -272,6 +366,29 @@ pub async fn compute(
     }
 
     let live_exists = live.as_ref().map(|(svc, _)| svc.is_some());
+    // Grants recorded by earlier deploys: those removed from runway.yaml are
+    // revoked (after the rollout).
+    let live_svc = live.as_ref().and_then(|(svc, _)| svc.as_ref());
+    let recorded = live_svc
+        .map(|svc| recorded_grants(&svc.annotations))
+        .unwrap_or_default();
+    // Only a main deploy revokes (once one revision serves all traffic): a
+    // preview or canary leaves them for the next main deploy.
+    let mut revokes = revoke_steps(&recorded, d);
+    if !revokes.is_empty() && *mode != crate::traffic::Mode::Full {
+        notes.push(format!(
+            "{} grant(s) removed from runway.yaml are revoked by the next main deploy, not by a preview or canary",
+            revokes.len()
+        ));
+        revokes.clear();
+    }
+    if live_svc.is_some_and(|svc| !svc.annotations.contains_key(ANNOTATION_GRANTS))
+        && !managed_grants(d).is_empty()
+    {
+        notes.push(format!(
+            "runway records the grants it adds on the service ({ANNOTATION_GRANTS}), so that removing one from runway.yaml revokes it; grants already in place are never recorded nor revoked"
+        ));
+    }
     let (action, changes, access) = match live {
         None => {
             let (_, changes) = compute_changes(None, &spec, &decision.image);
@@ -304,8 +421,15 @@ pub async fn compute(
             let access = AccessPlan::new(d.service.public, public);
             match run::ownership(&svc, &d.app, &d.stage) {
                 Ownership::Owned => {
-                    let (a, c) =
-                        compute_changes(Some(&run::observed_flat(&svc)), &spec, &decision.image);
+                    let (a, c) = revision_aware_changes(
+                        &svc,
+                        &spec,
+                        &decision.image,
+                        remote.as_ref(),
+                        progress,
+                        &mut notes,
+                    )
+                    .await;
                     // Release metadata: explain rebuilds caused by base image updates.
                     if let (Some(deployed), Some(src)) = (
                         svc.annotations.get(naming::ANNOTATION_BASE_IMAGES),
@@ -347,15 +471,36 @@ pub async fn compute(
             }
         }
     };
-    // Provisioning steps: all checks are read-only and run concurrently.
-    let all_steps = all_steps(d);
+    // Service-scoped checks (tags, IAP) once it is known whether the service
+    // exists; then every check in step order.
     let service_exists = matches!(live_exists, Some(true));
-    let steps: Vec<StepCheck> = match remote.as_ref().and_then(|r| r.provisioner) {
+    let steps: Vec<StepCheck> = match provisioner {
         Some(prov) => {
-            futures::future::join_all(all_steps.iter().map(|s| prov.check(s, service_exists))).await
+            let (late, revoked) = tokio::join!(
+                futures::future::join_all(
+                    all_steps
+                        .iter()
+                        .filter(|s| s.needs_service())
+                        .map(|s| prov.check(s, service_exists)),
+                ),
+                futures::future::join_all(revokes.iter().map(|s| prov.check(s, service_exists))),
+            );
+            let (mut early, mut late) = (early_checks.into_iter(), late.into_iter());
+            all_steps
+                .iter()
+                .filter_map(|s| {
+                    if s.needs_service() {
+                        late.next()
+                    } else {
+                        early.next()
+                    }
+                })
+                .chain(revoked)
+                .collect()
         }
         None => all_steps
             .iter()
+            .chain(revokes.iter())
             .map(|s| StepCheck {
                 step: s.describe(d),
                 state: StepState::Unknown,
@@ -413,6 +558,7 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
             .await
             .map_err(|e| e.hint("use `runway plan --offline` to plan without credentials"))?;
         let run = build_client!(Services, session)?;
+        let revisions = build_client!(Revisions, session)?;
         let registry = registry_client(&session).await?;
         let mut version_notes = Vec::new();
         let d = &crate::commands::resolve_runtime_versions(d, &registry, &mut version_notes).await;
@@ -424,6 +570,7 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
             d,
             Some(Remote {
                 run: &run,
+                revisions: Some(&revisions),
                 resolver: &registry,
                 provisioner: Some(&provisioner),
             }),

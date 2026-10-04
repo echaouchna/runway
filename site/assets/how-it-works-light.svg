@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 612" width="1240" height="612" role="img" aria-label="How runway works">
+<defs>
+<filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0b1020" flood-opacity="0.08"/></filter>
+<marker id="head" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto"><path d="M1.5,1.5 L11,6 L1.5,10.5 L4,6 z" fill="#94a3b8"/></marker>
+<marker id="head-green" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto"><path d="M1.5,1.5 L11,6 L1.5,10.5 L4,6 z" fill="#059669"/></marker>
+<linearGradient id="engine" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3030ef"/><stop offset="1" stop-color="#7c3aed"/></linearGradient>
+</defs>
+<rect x="24" y="36" width="250" height="300" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#shadow)"/>
+<rect x="24" y="50" width="4" height="272" rx="2" fill="#0891b2"/>
+<text xml:space="preserve" x="44" y="66" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#0f172a" text-anchor="start">runway.yaml</text>
+<text xml:space="preserve" x="46" y="88" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">app</tspan><tspan fill="#0f172a">: hello</tspan></text>
+<text xml:space="preserve" x="46" y="113" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">service</tspan><tspan fill="#0f172a">:</tspan></text>
+<text xml:space="preserve" x="46" y="138" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">  source</tspan><tspan fill="#0f172a">: .</tspan></text>
+<text xml:space="preserve" x="46" y="163" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">  memory</tspan><tspan fill="#0f172a">: 512Mi</tspan></text>
+<text xml:space="preserve" x="46" y="188" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">  identity</tspan><tspan fill="#0f172a">: { roles: … }</tspan></text>
+<text xml:space="preserve" x="46" y="213" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">  iap</tspan><tspan fill="#0f172a">: { members: … }</tspan></text>
+<text xml:space="preserve" x="46" y="238" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">stages</tspan><tspan fill="#0f172a">:</tspan></text>
+<text xml:space="preserve" x="46" y="263" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">  dev</tspan><tspan fill="#0f172a">: {}</tspan></text>
+<text xml:space="preserve" x="46" y="288" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13"><tspan fill="#7c3aed">  prod</tspan><tspan fill="#0f172a">: { min_instances: 1 }</tspan></text>
+<text xml:space="preserve" x="46" y="318" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start" font-style="italic">one file, next to your code</text>
+<rect x="24" y="366" width="250" height="196" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#shadow)"/>
+<rect x="24" y="380" width="4" height="168" rx="2" fill="#059669"/>
+<text xml:space="preserve" x="44" y="396" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#0f172a" text-anchor="start">Google Cloud</text>
+<rect x="183.0" y="381" width="75.0" height="22" rx="11" fill="none" stroke="#e2e8f0"/>
+<text xml:space="preserve" x="220.5" y="396" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b" text-anchor="middle">live state</text>
+<circle cx="50" cy="415" r="3.5" fill="#059669"/>
+<text xml:space="preserve" x="62" y="420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#0f172a" text-anchor="start">service, revisions, traffic</text>
+<circle cx="50" cy="445" r="3.5" fill="#059669"/>
+<text xml:space="preserve" x="62" y="450" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#0f172a" text-anchor="start">IAM policies, accounts</text>
+<circle cx="50" cy="475" r="3.5" fill="#059669"/>
+<text xml:space="preserve" x="62" y="480" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#0f172a" text-anchor="start">registry, buckets, secrets</text>
+<text xml:space="preserve" x="46" y="540" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="start" font-style="italic">read before every change</text>
+<rect x="326" y="226" width="172" height="150" rx="18" fill="url(#engine)" filter="url(#shadow)"/>
+<text xml:space="preserve" x="412" y="276" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="800" fill="#ffffff" text-anchor="middle">runway</text>
+<text xml:space="preserve" x="412" y="304" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e7ecff" text-anchor="middle">desired vs live</text>
+<text xml:space="preserve" x="412" y="326" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#e7ecff" text-anchor="middle">field by field</text>
+<text xml:space="preserve" x="412" y="354" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">no state file</text>
+<path d="M274,186 C302,186 290,262 306,262 L322,262" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<path d="M274,464 C302,464 290,340 306,340 L322,340" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<rect x="548" y="36" width="668" height="128" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#shadow)"/>
+<rect x="548" y="50" width="4" height="100" rx="2" fill="#b45309"/>
+<text xml:space="preserve" x="568" y="66" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#0f172a" text-anchor="start">runway plan</text>
+<rect x="1131.6" y="51" width="68.4" height="22" rx="11" fill="none" stroke="#e2e8f0"/>
+<text xml:space="preserve" x="1165.8" y="66" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b" text-anchor="middle">read-only</text>
+<rect x="568" y="80" width="181.4" height="26" rx="7" fill="#b45309" fill-opacity="0.14" stroke="#b45309" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="658.7" y="97.32" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="600" fill="#b45309" text-anchor="middle">~ memory  512Mi → 1Gi</text>
+<rect x="761.4" y="80" width="144.4" height="26" rx="7" fill="#059669" fill-opacity="0.14" stroke="#059669" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="833.6" y="97.32" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="600" fill="#059669" text-anchor="middle">+ IAP  group:new</text>
+<rect x="917.8" y="80" width="144.4" height="26" rx="7" fill="#dc2626" fill-opacity="0.14" stroke="#dc2626" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="990.0" y="97.32" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="600" fill="#dc2626" text-anchor="middle">− IAP  group:old</text>
+<rect x="1074.2" y="80" width="77.80000000000001" height="26" rx="7" fill="#059669" fill-opacity="0.14" stroke="#059669" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="1113.1000000000001" y="97.32" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="600" fill="#059669" text-anchor="middle">✓ exact</text>
+<text xml:space="preserve" x="568" y="142" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#64748b" text-anchor="start">every change before it happens, and what is only known at deploy time</text>
+<path d="M498,260 C524,260 512,100 528,100 L544,100" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<rect x="548" y="190" width="668" height="236" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#shadow)"/>
+<rect x="548" y="204" width="4" height="208" rx="2" fill="#7c3aed"/>
+<text xml:space="preserve" x="568" y="220" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#0f172a" text-anchor="start">runway deploy</text>
+<rect x="1078.8" y="205" width="121.19999999999999" height="22" rx="11" fill="none" stroke="#e2e8f0"/>
+<text xml:space="preserve" x="1139.4" y="220" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b" text-anchor="middle">only what differs</text>
+<text xml:space="preserve" x="568" y="238" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#64748b" text-anchor="start">independent steps run together, in waves</text>
+<circle cx="578" cy="262" r="10" fill="#7c3aed" fill-opacity="0.16" stroke="#7c3aed" stroke-opacity="0.6"/>
+<text xml:space="preserve" x="578" y="266" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#7c3aed" text-anchor="middle">1</text>
+<rect x="568" y="284" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="624.0" y="301.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">APIs</text>
+<rect x="568" y="316" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="624.0" y="333.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">registry login</text>
+<path d="M682,297 L696,297" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<circle cx="708" cy="262" r="10" fill="#7c3aed" fill-opacity="0.16" stroke="#7c3aed" stroke-opacity="0.6"/>
+<text xml:space="preserve" x="708" y="266" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#7c3aed" text-anchor="middle">2</text>
+<rect x="698" y="284" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="754.0" y="301.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">buckets</text>
+<rect x="698" y="316" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="754.0" y="333.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">secrets</text>
+<rect x="698" y="348" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="754.0" y="365.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">repository</text>
+<rect x="698" y="380" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="754.0" y="397.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">accounts</text>
+<path d="M812,297 L826,297" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<circle cx="838" cy="262" r="10" fill="#7c3aed" fill-opacity="0.16" stroke="#7c3aed" stroke-opacity="0.6"/>
+<text xml:space="preserve" x="838" y="266" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#7c3aed" text-anchor="middle">3</text>
+<rect x="828" y="284" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="884.0" y="301.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">grants</text>
+<text xml:space="preserve" x="884.0" y="337" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#64748b" text-anchor="middle" font-style="italic">one lane per policy</text>
+<path d="M942,297 L956,297" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<circle cx="968" cy="262" r="10" fill="#7c3aed" fill-opacity="0.16" stroke="#7c3aed" stroke-opacity="0.6"/>
+<text xml:space="preserve" x="968" y="266" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#7c3aed" text-anchor="middle">4</text>
+<rect x="958" y="284" width="112" height="26" rx="7" fill="#7c3aed" fill-opacity="0.14" stroke="#7c3aed" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="1014.0" y="301.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#7c3aed" text-anchor="middle">build</text>
+<rect x="958" y="316" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="1014.0" y="333.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">app grants</text>
+<path d="M1072,297 L1086,297" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<circle cx="1098" cy="262" r="10" fill="#7c3aed" fill-opacity="0.16" stroke="#7c3aed" stroke-opacity="0.6"/>
+<text xml:space="preserve" x="1098" y="266" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#7c3aed" text-anchor="middle">5</text>
+<rect x="1088" y="284" width="112" height="26" rx="7" fill="#7c3aed" fill-opacity="0.14" stroke="#7c3aed" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="1144.0" y="301.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#7c3aed" text-anchor="middle">roll out</text>
+<rect x="1088" y="316" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="1144.0" y="333.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">tags · IAP</text>
+<rect x="1088" y="348" width="112" height="26" rx="7" fill="#f1f5f9" fill-opacity="1" stroke="#0891b2" stroke-opacity="0.55"/>
+<text xml:space="preserve" x="1144.0" y="365.32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0f172a" text-anchor="middle">revoke removed</text>
+<path d="M1014.0,344 l0,0" />
+<text xml:space="preserve" x="1014.0" y="364" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="400" fill="#64748b" text-anchor="middle" font-style="italic">in parallel</text>
+<path d="M498,300 L544,300" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<rect x="548" y="452" width="668" height="122" rx="14" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#shadow)"/>
+<rect x="548" y="466" width="4" height="94" rx="2" fill="#059669"/>
+<text xml:space="preserve" x="568" y="482" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#0f172a" text-anchor="start">Cloud Run</text>
+<rect x="1158.0" y="467" width="42.0" height="22" rx="11" fill="none" stroke="#e2e8f0"/>
+<text xml:space="preserve" x="1179.0" y="482" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b" text-anchor="middle">ready</text>
+<rect x="568" y="496" width="157.4" height="62" rx="9" fill="#059669" fill-opacity="0.1" stroke="#059669" stroke-opacity="0.5"/>
+<text xml:space="preserve" x="581" y="519" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#0f172a" text-anchor="start">hello-prod.run.app</text>
+<text xml:space="preserve" x="581" y="543" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#059669" text-anchor="start">100%</text>
+<rect x="739.4" y="496" width="215.79999999999998" height="62" rx="9" fill="#0891b2" fill-opacity="0.1" stroke="#0891b2" stroke-opacity="0.5"/>
+<text xml:space="preserve" x="752.4" y="519" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#0f172a" text-anchor="start">feature-login---hello-prod</text>
+<text xml:space="preserve" x="752.4" y="543" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#0891b2" text-anchor="start">0% · preview</text>
+<rect x="969.1999999999999" y="496" width="164.7" height="62" rx="9" fill="#7c3aed" fill-opacity="0.1" stroke="#7c3aed" stroke-opacity="0.5"/>
+<text xml:space="preserve" x="982.1999999999999" y="519" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12.5" font-weight="600" fill="#0f172a" text-anchor="start">canary---hello-prod</text>
+<text xml:space="preserve" x="982.1999999999999" y="543" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#7c3aed" text-anchor="start">10% · canary</text>
+<path d="M882,426 L882,448" fill="none" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#head)"/>
+<path d="M546,530 C470,530 380,516 300,516 L278,516" fill="none" stroke="#059669" stroke-width="1.8" stroke-linecap="round" stroke-dasharray="5 5" marker-end="url(#head-green)"/>
+<text xml:space="preserve" x="426" y="598" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#64748b" text-anchor="middle" font-style="italic">the project is the state</text>
+</svg>

@@ -771,3 +771,496 @@ async fn project_tag_is_bound_first_and_awaited_until_effective() {
         StepOutcome::Unchanged
     );
 }
+
+/// Mocks for revocations: the IAP policy and a project policy, each with a
+/// configured entry, a recorded one removed from the configuration, and (IAP)
+/// one granted by hand. `owned`: the runtime account carries runway's marker.
+async fn revocation_project(owned: bool) -> MockServer {
+    let s = MockServer::start().await;
+    let json200 = |v: Value| ResponseTemplate::new(200).set_body_json(v);
+    Mock::given(method("GET"))
+        .and(path("/v3/projects/my-gcp-project"))
+        .respond_with(json200(
+            json!({"name": "projects/123456", "projectId": "my-gcp-project"}),
+        ))
+        .mount(&s)
+        .await;
+    let description = if owned {
+        "managed-by=runway app=gcptree stage=prod role=runtime"
+    } else {
+        "created by hand"
+    };
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/projects/my-gcp-project/serviceAccounts/{SA}"
+        )))
+        .respond_with(json200(json!({"email": SA, "description": description})))
+        .mount(&s)
+        .await;
+    let sa = format!("serviceAccount:{SA}");
+    for (res, bindings) in [
+        (
+            format!("/v1/{IAP_RES}"),
+            json!([{"role": "roles/iap.httpsResourceAccessor",
+                    "members": ["group:finops@example.com", "group:old@example.com", "group:manual@example.com"]}]),
+        ),
+        (
+            "/v3/projects/billing-data-1234".to_string(),
+            json!([{"role": "roles/bigquery.jobUser", "members": [sa]},
+                   {"role": "roles/bigquery.dataEditor", "members": [sa]}]),
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(format!("{res}:getIamPolicy")))
+            .respond_with(json200(
+                json!({"version": 1, "etag": "BwX1", "bindings": bindings}),
+            ))
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{res}:setIamPolicy")))
+            .respond_with(json200(json!({"version": 1, "etag": "BwX2"})))
+            .mount(&s)
+            .await;
+    }
+    s
+}
+
+fn removed_from_config() -> Vec<runway::provision::ManagedGrant> {
+    use runway::config::RoleTarget;
+    use runway::provision::ManagedGrant;
+    vec![
+        ManagedGrant {
+            member: "group:old@example.com".into(),
+            role: "roles/iap.httpsResourceAccessor".into(),
+            target: None,
+            runtime: false,
+        },
+        ManagedGrant {
+            member: format!("serviceAccount:{SA}"),
+            role: "roles/bigquery.dataEditor".into(),
+            target: Some(RoleTarget::Project {
+                project: "billing-data-1234".into(),
+            }),
+            runtime: true,
+        },
+    ]
+}
+
+async fn provisioner_for<'a>(
+    server: &MockServer,
+    d: &'a Deployment,
+    session: &'a Session,
+    run: &'a google_cloud_run_v2::client::Services,
+) -> Provisioner<'a> {
+    Provisioner::with_endpoints(d, session, run, &endpoints(&server.uri()))
+        .await
+        .unwrap()
+}
+
+fn set_policy_bodies(reqs: &[Request], res: &str) -> Vec<Value> {
+    reqs.iter()
+        .filter(|r| r.url.path() == format!("{res}:setIamPolicy"))
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn removed_grants_are_revoked_and_plans_show_only_what_changes() {
+    use runway::provision::{managed_grants, revoke_steps};
+    let mut d = deployment();
+    d.service.iap.members.push("group:new@example.com".into());
+    let server = revocation_project(true).await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+
+    let mut recorded = managed_grants(&d);
+    recorded.extend(removed_from_config());
+    let revokes = revoke_steps(&recorded, &d);
+    assert_eq!(revokes.len(), 2, "only what left the configuration");
+
+    // Plan: the new member alone, then the two removals.
+    let iap = prov.check(&runway::provision::Step::IapAccess, true).await;
+    assert_eq!(iap.state, StepState::Pending);
+    assert_eq!(iap.detail, "grant to group:new@example.com");
+    for step in &revokes {
+        let c = prov.check(step, true).await;
+        assert_eq!(c.state, StepState::PendingRemoval, "{c:?}");
+    }
+
+    // Deploy: both revoked, nothing else touched.
+    let retry = RetryConfig {
+        attempts: 1,
+        ..Default::default()
+    };
+    let done = prov
+        .apply_all(&revokes, &retry, &Progress::silent(), &|_| {})
+        .await
+        .unwrap();
+    assert!(
+        done.iter().all(|r| r.outcome == StepOutcome::Changed),
+        "{done:?}"
+    );
+    let reqs = server.received_requests().await.unwrap();
+    let iap_set = set_policy_bodies(&reqs, &format!("/v1/{IAP_RES}"));
+    assert_eq!(
+        iap_set[0]["policy"]["bindings"][0]["members"],
+        json!(["group:finops@example.com", "group:manual@example.com"]),
+        "the member granted by hand stays"
+    );
+    let project_set = set_policy_bodies(&reqs, "/v3/projects/billing-data-1234");
+    assert_eq!(
+        project_set[0]["policy"]["bindings"],
+        json!([{"role": "roles/bigquery.jobUser", "members": [format!("serviceAccount:{SA}")]}])
+    );
+}
+
+#[tokio::test]
+async fn roles_of_an_account_runway_did_not_create_are_kept() {
+    use runway::provision::{managed_grants, revoke_steps};
+    let d = deployment();
+    let server = revocation_project(false).await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let mut recorded = managed_grants(&d);
+    recorded.extend(removed_from_config());
+    let revokes = revoke_steps(&recorded, &d);
+    let role = revokes
+        .iter()
+        .find(|s| s.describe(&d).contains("dataEditor"))
+        .unwrap();
+    let check = prov.check(role, true).await;
+    assert_eq!(check.state, StepState::InSync);
+    assert!(check.detail.starts_with("kept: "), "{}", check.detail);
+    let r = prov.apply(role).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Unchanged);
+    let reqs = server.received_requests().await.unwrap();
+    assert!(
+        set_policy_bodies(&reqs, "/v3/projects/billing-data-1234").is_empty(),
+        "a shared or user-provided account keeps its roles"
+    );
+}
+
+#[tokio::test]
+async fn members_already_present_are_not_recorded_as_runways() {
+    use runway::provision::{Step, grant_record, managed_grants};
+    // finops already has access (perhaps granted by hand); new does not.
+    let mut d = deployment();
+    d.service.iap.members.push("group:new@example.com".into());
+    let server = revocation_project(true).await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let r = prov.apply(&Step::IapAccess).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed);
+    assert_eq!(r.detail, "granted to group:new@example.com");
+    let added: Vec<String> = prov.granted().into_iter().map(|g| g.member).collect();
+    assert_eq!(added, ["group:new@example.com"]);
+
+    let record = grant_record(&[], &managed_grants(&d), &prov.granted(), true);
+    let members: Vec<&str> = record.iter().map(|g| g.member.as_str()).collect();
+    assert!(members.contains(&"group:new@example.com"));
+    assert!(
+        !members.contains(&"group:finops@example.com"),
+        "removing finops from runway.yaml later must not revoke access runway did not grant"
+    );
+}
+
+#[tokio::test]
+async fn recorded_iap_members_are_revoked_after_iap_is_disabled() {
+    use runway::provision::{Step, managed_grants, revoke_steps};
+    let enabled = deployment();
+    let recorded = managed_grants(&enabled);
+    let mut d = enabled.clone();
+    d.service.iap.enabled = false;
+    d.service.iap.members.clear();
+    let server = revocation_project(true).await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let revokes = revoke_steps(&recorded, &d);
+    let iap = revokes
+        .iter()
+        .find(|s| matches!(s, Step::Revoke(g) if g.target.is_none()))
+        .expect("the IAP member is revoked");
+    let r = prov.apply(iap).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed, "{r:?}");
+}
+
+/// IAP policy reads answer without `group:new` for the first `before` reads,
+/// then with it; every policy write answers 503 (its outcome is unknown).
+async fn lost_answer_project(before: u64) -> MockServer {
+    let s = MockServer::start().await;
+    let json200 = |v: Value| ResponseTemplate::new(200).set_body_json(v);
+    Mock::given(method("GET"))
+        .and(path("/v3/projects/my-gcp-project"))
+        .respond_with(json200(
+            json!({"name": "projects/123456", "projectId": "my-gcp-project"}),
+        ))
+        .mount(&s)
+        .await;
+    let policy = |members: Vec<&str>| {
+        json!({"version": 1, "etag": "BwX1",
+               "bindings": [{"role": "roles/iap.httpsResourceAccessor", "members": members}]})
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/{IAP_RES}:getIamPolicy")))
+        .respond_with(json200(policy(vec!["group:finops@example.com"])))
+        .up_to_n_times(before)
+        .with_priority(1)
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/{IAP_RES}:getIamPolicy")))
+        .respond_with(json200(policy(vec![
+            "group:finops@example.com",
+            "group:new@example.com",
+        ])))
+        .with_priority(2)
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/{IAP_RES}:setIamPolicy")))
+        .respond_with(ResponseTemplate::new(503).set_body_json(
+            json!({"error": {"code": 503, "message": "deadline", "status": "UNAVAILABLE"}}),
+        ))
+        .mount(&s)
+        .await;
+    s
+}
+
+async fn iap_provisioner_run(
+    server: &MockServer,
+) -> (Deployment, Session, google_cloud_run_v2::client::Services) {
+    let mut d = deployment();
+    d.service.iap.members.push("group:new@example.com".into());
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    (d, session, run)
+}
+
+#[tokio::test]
+async fn a_write_whose_answer_was_lost_but_committed_is_runways() {
+    use runway::provision::Step;
+    // The write answers 503, yet the next read shows the member: it committed.
+    let server = lost_answer_project(1).await;
+    let (d, session, run) = iap_provisioner_run(&server).await;
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let r = prov.apply(&Step::IapAccess).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed, "{r:?}");
+    let added: Vec<String> = prov.granted().into_iter().map(|g| g.member).collect();
+    assert_eq!(added, ["group:new@example.com"]);
+}
+
+#[tokio::test]
+async fn a_lost_final_answer_is_confirmed_before_the_step_fails() {
+    use runway::provision::{Step, grant_record, managed_grants};
+    // One step attempt (`--retries 0`), a fresh provisioner (a new CLI run):
+    // the four writes answer 503 and the last one committed. Without a
+    // confirming read, the deploy would exit and the next run would take the
+    // member for pre-existing, never revoking it.
+    let server = lost_answer_project(4).await;
+    let (d, session, run) = iap_provisioner_run(&server).await;
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let retry = RetryConfig {
+        attempts: 1,
+        ..Default::default()
+    };
+    let done = prov
+        .apply_all(&[Step::IapAccess], &retry, &Progress::silent(), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(done[0].outcome, StepOutcome::Changed, "the write committed");
+    let record = grant_record(&[], &managed_grants(&d), &prov.granted(), true);
+    let members: Vec<&str> = record.iter().map(|g| g.member.as_str()).collect();
+    assert_eq!(members, ["group:new@example.com"]);
+}
+
+#[tokio::test]
+async fn a_write_that_did_not_commit_is_not_claimed() {
+    use runway::provision::Step;
+    // Every write answers 503 and none committed: the step fails and nothing
+    // is claimed as runway's.
+    let server = lost_answer_project(100).await;
+    let (d, session, run) = iap_provisioner_run(&server).await;
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    assert!(prov.apply(&Step::IapAccess).await.is_err());
+    assert!(prov.granted().is_empty());
+}
+
+#[tokio::test]
+async fn a_lost_dataset_patch_that_committed_is_runways() {
+    use runway::provision::{Step, pre_steps};
+    let server = MockServer::start().await;
+    let ds = "/bigquery/v2/projects/billing-data-1234/datasets/billingdata";
+    let access = |with_sa: bool| {
+        let mut a = vec![json!({"role": "READER", "userByEmail": "keep@example.com"})];
+        if with_sa {
+            a.push(json!({"role": "roles/bigquery.dataViewer", "userByEmail": SA}));
+        }
+        json!({"access": a})
+    };
+    Mock::given(method("GET"))
+        .and(path(ds))
+        .respond_with(ResponseTemplate::new(200).set_body_json(access(false)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(ds))
+        .respond_with(ResponseTemplate::new(200).set_body_json(access(true)))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(ds))
+        .respond_with(ResponseTemplate::new(503).set_body_json(
+            json!({"error": {"code": 503, "message": "deadline", "status": "UNAVAILABLE"}}),
+        ))
+        .mount(&server)
+        .await;
+    let d = deployment();
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let step = pre_steps(&d)
+        .into_iter()
+        .find(|s| matches!(s, Step::Grant { binding, .. } if binding.role == "roles/bigquery.dataViewer"))
+        .unwrap();
+    let r = prov.apply(&step).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed, "{r:?}");
+    let granted = prov.granted();
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].role, "roles/bigquery.dataViewer");
+    assert!(granted[0].runtime);
+}
+
+#[tokio::test]
+async fn grants_made_before_a_failure_are_recorded() {
+    use runway::config::RoleTarget;
+    use runway::deploy::Reconciler;
+    use runway::poll::PollConfig;
+    use runway::provision::{ManagedGrant, Step, grant_record, managed_grants, recorded_grants};
+    let server = revocation_project(true).await;
+    // A later step fails: revoking on a project whose policy cannot be read.
+    Mock::given(method("POST"))
+        .and(path("/v3/projects/locked-project:getIamPolicy"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(
+            json!({"error": {"code": 403, "message": "denied", "status": "PERMISSION_DENIED"}}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{SVC}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": SVC, "etag": "\"e1\"",
+            "labels": {"managed-by": "runway", "runway-app": "gcptree", "runway-stage": "prod"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(format!("/v2/{SVC}")))
+        .and(query_param("updateMask", "annotations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": "op"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut d = deployment();
+    d.service.iap.members.push("group:new@example.com".into());
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let steps = [
+        Step::IapAccess,
+        Step::Revoke(ManagedGrant {
+            member: "group:x@example.com".into(),
+            role: "roles/viewer".into(),
+            target: Some(RoleTarget::Project {
+                project: "locked-project".into(),
+            }),
+            runtime: false,
+        }),
+    ];
+    let retry = RetryConfig {
+        attempts: 1,
+        ..Default::default()
+    };
+    assert!(
+        prov.apply_all(&steps, &retry, &Progress::silent(), &|_| {})
+            .await
+            .is_err()
+    );
+    let record = grant_record(&[], &managed_grants(&d), &prov.granted(), true);
+    let members: Vec<&str> = record.iter().map(|g| g.member.as_str()).collect();
+    assert_eq!(
+        members,
+        ["group:new@example.com"],
+        "granted before the failure"
+    );
+
+    let progress = Progress::silent();
+    let rec = Reconciler {
+        run: &run,
+        revisions: None,
+        progress: &progress,
+        poll: PollConfig::fast(),
+        timeout: Duration::from_secs(5),
+    };
+    let live = rec.get(SVC).await.unwrap();
+    assert!(
+        rec.save_grant_record(SVC, live.as_ref(), &record)
+            .await
+            .unwrap()
+    );
+    let reqs = server.received_requests().await.unwrap();
+    let patch = reqs.iter().find(|r| r.method.as_str() == "PATCH").unwrap();
+    let body: Value = serde_json::from_slice(&patch.body).unwrap();
+    let saved = recorded_grants(
+        &body["annotations"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+            .collect(),
+    );
+    assert_eq!(saved, record);
+}
