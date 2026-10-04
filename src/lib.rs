@@ -1,7 +1,7 @@
 //! Runway: deploy applications to Google Cloud Run from a single `runway.yaml`.
 
 /// Documentation site (used in hints and generated files).
-pub const DOCS_URL: &str = "https://echaouchna.github.io/runway/docs";
+pub const DOCS_URL: &str = "https://runway.echaouchna.dev/docs";
 
 /// Version shown by `--version`. Edge builds set `RUNWAY_VERSION` at build
 /// time (for example `0.1.0-edge.42 (1a2b3c4)`) so reports name the commit.
