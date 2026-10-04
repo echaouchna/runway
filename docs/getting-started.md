@@ -65,6 +65,31 @@ cargo install --locked --git https://github.com/echaouchna/runway runway
 cargo install --locked --path .
 ```
 
+### Shell completions
+
+Homebrew installs bash, zsh and fish completions: open a new shell and press
+<kbd>Tab</kbd> after `runway `. A fish that is not Homebrew's own does not
+read Homebrew's completions; add this to `~/.config/fish/config.fish`:
+
+```fish
+if command -q brew
+    set -p fish_complete_path (brew --prefix)/share/fish/vendor_completions.d
+end
+```
+
+With any other installation, write the script once (again after upgrading,
+for new commands and flags):
+
+```sh
+runway completions fish > ~/.config/fish/completions/runway.fish            # fish
+runway completions bash > ~/.local/share/bash-completion/completions/runway # bash
+runway completions zsh > "${fpath[1]}/_runway"                              # zsh, then restart it
+```
+
+Nushell, xonsh, elvish and PowerShell are supported too:
+`runway completions --help` shows where each script goes. Check with
+`complete -C 'runway '` in fish, which lists the commands.
+
 The commands below use the local CLI.
 
 runway authenticates with [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials).

@@ -2,7 +2,7 @@
 
 use crate::cli::{Context, DescribeArgs, DiagramFormat};
 use crate::config::{self, Overrides};
-use crate::describe::{ascii, explain, explanation_text, mermaid};
+use crate::describe::{ascii, ascii_with, explain, explanation_text, mermaid};
 use crate::error::{Error, Result};
 use crate::output::{OutputFormat, print_json};
 use serde::Serialize;
@@ -56,11 +56,21 @@ pub fn run(ctx: &Context, args: DescribeArgs) -> Result<()> {
             explanation,
         }),
         OutputFormat::Text => {
-            println!("# {} (stage {})\n", d.app, d.stage);
+            let p = crate::style::out();
+            // Plain text stays Markdown; colors replace the heading marker.
+            if p.enabled {
+                println!(
+                    "{} {}\n",
+                    p.bold_cyan(&d.app),
+                    p.dim(&format!("(stage {})", d.stage))
+                );
+            } else {
+                println!("# {} (stage {})\n", d.app, d.stage);
+            }
             if args.format == DiagramFormat::Mermaid {
                 println!("```mermaid\n{diagram}```\n");
             } else {
-                println!("{diagram}");
+                println!("{}", ascii_with(d, p));
             }
             if !args.diagram_only {
                 print!("{}", explanation_text(&explanation));
