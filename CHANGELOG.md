@@ -10,6 +10,21 @@ migration notes.
 
 ## [Unreleased]
 
+### Added
+
+- Demo (under a minute): `runway.yaml`, the `describe` diagram, a first
+  deploy, an exact plan, a preview URL, a canary promoted and merged previews
+  pruned. A high-resolution GIF in the README, and an interactive asciinema
+  player on the homepage (pause, copy text; the player is self-hosted, no
+  third-party requests).
+
+### Changed
+
+- The homepage and documentation moved to https://runway.echaouchna.dev
+  (documentation at `/docs/`); links in the CLI (`--help`, error hints,
+  `runway init`), the Homebrew formula and the README point there. The old
+  `echaouchna.github.io/runway` addresses redirect.
+
 ## [0.1.1] - 2026-10-04
 
 ### Changed

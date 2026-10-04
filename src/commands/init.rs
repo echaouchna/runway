@@ -17,7 +17,7 @@ pub const EXAMPLE_DOCKERIGNORE: &str = include_str!("../../examples/hello-python
 
 fn source_config(app: &str, project: &str, region: &str) -> String {
     format!(
-        r#"# runway.yaml - every option: https://echaouchna.github.io/runway/docs/configuration/
+        r#"# runway.yaml - every option: https://runway.echaouchna.dev/docs/configuration/
 version: 1
 app: {app}
 
@@ -65,7 +65,7 @@ stages:
 
 fn image_config(app: &str, project: &str, region: &str, image: &str) -> String {
     format!(
-        r#"# runway.yaml - every option: https://echaouchna.github.io/runway/docs/configuration/
+        r#"# runway.yaml - every option: https://runway.echaouchna.dev/docs/configuration/
 version: 1
 app: {app}
 
@@ -214,7 +214,7 @@ pub fn run(ctx: &Context, args: InitArgs) -> Result<()> {
                 println!("  1. Review {config_name}");
             }
             println!(
-                "  2. Create the prerequisites (or set `provider.create_build_resources: true`): https://echaouchna.github.io/runway/docs/getting-started/#prerequisites"
+                "  2. Create the prerequisites (or set `provider.create_build_resources: true`): https://runway.echaouchna.dev/docs/getting-started/#prerequisites"
             );
             let flag = if config_name == "runway.yaml" {
                 String::new()

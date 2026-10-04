@@ -10,6 +10,7 @@
 <meta property="og:type" content="website">
 <link rel="icon" type="image/svg+xml" href="assets/runway-icon.svg">
 <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="stylesheet" href="assets/vendor/asciinema-player/asciinema-player.css">
 <style>
 :root{--bg:#070b18;--card:#111a3a;--card2:#16214a;--line:#26335f;--text:#e7ecff;--muted:#9aa6d1;--dim:#6b77a6;
   --cyan:#22d3ee;--violet:#a78bfa;--pink:#f472b6;--green:#34d399;--amber:#fbbf24;
@@ -52,6 +53,8 @@ pre{margin:0;padding:18px;font:13.5px/1.6 var(--mono);color:#cfd7ff;overflow-x:a
 pre::-webkit-scrollbar{height:8px}
 pre::-webkit-scrollbar-track{background:transparent}
 pre::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+.term.demo .ap-wrapper{background:#050816}
+.term.demo .ap-player{border-radius:0}
 .k{color:var(--violet)}.s{color:var(--green)}.c{color:var(--dim)}.n{color:var(--amber)}.u{color:var(--cyan)}
 section{padding:64px 0}
 .kicker{font:600 13px/1 var(--mono);color:var(--cyan);letter-spacing:.18em;text-transform:uppercase}
@@ -86,6 +89,7 @@ footer a{color:var(--muted);text-decoration:none;margin-left:18px}
 <nav>
   <a class="logo" href="./"><img src="assets/runway-logo-dark.svg" alt="runway" width="580" height="156"></a>
   <div class="links">
+    <a class="hide" href="#demo">Demo</a>
     <a class="hide" href="#features">Features</a>
     <a class="hide" href="#compare">Compare</a>
     <a href="docs/">Docs</a>
@@ -125,6 +129,18 @@ Traffic:  100% hello-prod-00012 · 0% feature-login
   </div>
 </header>
 </div>
+
+<section id="demo">
+<div class="wrap">
+  <div class="kicker">Demo</div>
+  <h2>See it run, <span class="grad">in under a minute</span></h2>
+  <p class="sub">One <code>runway.yaml</code>, then the offline diagram, a first deploy, an exact plan, a URL per branch, a canary and pruning. Pause any time and copy what you see. Cloud output uses sample names (<code>my-gcp-project</code>); waits are shortened.</p>
+  <div class="term demo">
+    <div class="bar"><i></i><i></i><i></i><span>~/hello</span></div>
+    <div id="demo-player"></div>
+  </div>
+</div>
+</section>
 
 <section id="features">
 <div class="wrap">
@@ -219,5 +235,16 @@ Traffic:  100% hello-prod-00012 · 0% feature-login
   <span><a href="docs/">Docs</a><a href="docs/roadmap/">Roadmap</a><a href="https://github.com/echaouchna/runway/blob/main/CHANGELOG.md">Changelog</a><a href="https://github.com/echaouchna/runway">GitHub</a></span>
 </footer>
 </div>
+<script src="assets/vendor/asciinema-player/asciinema-player.min.js"></script>
+<script>
+// Shows the exact-plan frame until the demo scrolls into view, then plays (once started, it loops).
+const demo = AsciinemaPlayer.create("assets/runway-demo.cast", document.getElementById("demo-player"), {
+  fit: "width", theme: "monokai", loop: true, poster: "npt:0:26", idleTimeLimit: 3,
+  terminalFontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono"),
+});
+new IntersectionObserver((entries, observer) => {
+  if (entries.some(e => e.isIntersecting)) { demo.play(); observer.disconnect(); }
+}, { threshold: 0.4 }).observe(document.getElementById("demo-player"));
+</script>
 </body>
 </html>

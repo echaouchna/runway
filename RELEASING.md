@@ -4,7 +4,7 @@
 
 1. **Repository location**: links, badges, the container image and
    `DOCS_URL` (`src/lib.rs`, used in error hints) point to
-   `github.com/echaouchna/runway` and `echaouchna.github.io/runway`. After a
+   `github.com/echaouchna/runway` and `runway.echaouchna.dev`. After a
    move (for example to an organization), update them all:
    `git grep -lw echaouchna | xargs sed -i 's/\bechaouchna\b/NEW-OWNER/g'`.
 2. **Runners and repository variables** (Settings → Secrets and variables →
@@ -101,7 +101,7 @@ the repository is private.
 ## Documentation site (GitHub Pages)
 
 The `pages` workflow publishes the homepage (`site/`) at
-`https://echaouchna.github.io/runway/` and the documentation (`docs/`, MkDocs
+`https://runway.echaouchna.dev/` and the documentation (`docs/`, MkDocs
 Material) at `/docs/`.
 
 - GitHub Pages from a **private** repository requires a paid plan (Pro,
@@ -112,8 +112,13 @@ Material) at `/docs/`.
   Variables). Then: Settings → Pages → Source: GitHub Actions.
 - Preview locally: `pip install -r docs/requirements.txt && mkdocs serve`
   (docs) and open `site/index.html` (homepage).
-- A custom domain needs a `site/CNAME` file and DNS records; update
-  `DOCS_URL` and `site_url` in `mkdocs.yml`.
+- Custom domain `runway.echaouchna.dev`: a DNS `CNAME` record to
+  `echaouchna.github.io`, set in Settings → Pages → Custom domain (with
+  Enforce HTTPS). Sites deployed by a workflow need no `CNAME` file. The old
+  `echaouchna.github.io/runway` addresses redirect to it. To change the
+  domain, update it there and every link (`git grep runway.echaouchna.dev`:
+  `DOCS_URL` in `src/lib.rs`, `site_url` in `mkdocs.yml`, `Cargo.toml`, the
+  Homebrew formula in `homebrew.yml`, the README, the demo's last frame).
 
 ## Going public checklist
 

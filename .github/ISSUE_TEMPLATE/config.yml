@@ -7,5 +7,5 @@ contact_links:
     url: https://github.com/echaouchna/runway/security/advisories/new
     about: Report vulnerabilities privately, never in a public issue.
   - name: Documentation
-    url: https://echaouchna.github.io/runway/docs
+    url: https://runway.echaouchna.dev/docs
     about: Configuration reference, guides and troubleshooting.

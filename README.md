@@ -13,11 +13,17 @@ described in a `runway.yaml` next to your code.
 [![CI](https://github.com/echaouchna/runway/actions/workflows/ci.yml/badge.svg)](https://github.com/echaouchna/runway/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[Documentation](https://echaouchna.github.io/runway/docs) ·
-[Getting started](https://echaouchna.github.io/runway/docs/getting-started/) ·
-[Configuration](https://echaouchna.github.io/runway/docs/configuration/) ·
+[Documentation](https://runway.echaouchna.dev/docs) ·
+[Getting started](https://runway.echaouchna.dev/docs/getting-started/) ·
+[Configuration](https://runway.echaouchna.dev/docs/configuration/) ·
 [Changelog](CHANGELOG.md) ·
 [Roadmap](docs/roadmap.md)
+
+<a href="https://runway.echaouchna.dev/#demo"><img src="site/assets/runway-demo.gif" alt="runway demo: runway.yaml, the describe diagram, a first deploy, an exact plan, a branch preview URL, a canary promoted, merged previews pruned" width="900"></a>
+
+<sub>One file, then: the offline diagram, a first deploy, an exact plan, a preview URL per branch, a canary and pruning.
+Cloud output uses sample names (<code>my-gcp-project</code>), waits are shortened.
+<a href="https://runway.echaouchna.dev/#demo">Interactive player</a> (pause, copy text)</sub>
 
 </div>
 
@@ -154,7 +160,7 @@ runway uses [Application Default Credentials](https://cloud.google.com/docs/auth
 `gcloud auth application-default login` locally, Workload Identity Federation
 in CI. Shell completions are installed by Homebrew; otherwise
 `runway completions bash|zsh|fish|nushell|xonsh|elvish|powershell` (see
-[Shell completions](https://echaouchna.github.io/runway/docs/getting-started/#shell-completions)).
+[Shell completions](https://runway.echaouchna.dev/docs/getting-started/#shell-completions)).
 
 ## Quick start
 
@@ -165,7 +171,7 @@ runway deploy --stage dev
 runway logs --stage dev --follow
 ```
 
-Then read [Getting started](https://echaouchna.github.io/runway/docs/getting-started/).
+Then read [Getting started](https://runway.echaouchna.dev/docs/getting-started/).
 
 ## Features
 

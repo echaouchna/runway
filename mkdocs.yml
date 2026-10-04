@@ -1,6 +1,6 @@
 site_name: runway
 site_description: Deploy applications to Google Cloud Run from a single runway.yaml
-site_url: https://echaouchna.github.io/runway/docs/
+site_url: https://runway.echaouchna.dev/docs/
 repo_url: https://github.com/echaouchna/runway
 repo_name: runway
 edit_uri: edit/main/docs/
@@ -70,4 +70,4 @@ validation:
     anchors: warn
 
 extra:
-  homepage: https://echaouchna.github.io/runway/
+  homepage: https://runway.echaouchna.dev/

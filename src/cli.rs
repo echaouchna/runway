@@ -46,7 +46,7 @@ Exit codes:
   9    service not found
   130  interrupted
 
-Documentation: https://echaouchna.github.io/runway/docs";
+Documentation: https://runway.echaouchna.dev/docs";
 
 /// Deploy applications to Google Cloud Run from a single runway.yaml.
 #[derive(Debug, Parser)]
