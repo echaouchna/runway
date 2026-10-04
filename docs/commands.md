@@ -45,7 +45,32 @@ and warnings to stderr, so JSON output stays parseable.
 | `runway completions bash\|zsh\|fish\|nushell\|xonsh\|elvish\|powershell` | Print a completion script; `runway completions --help` shows where to install it for each shell. |
 | `runway undeploy --stage S --preview NAME [--yes]` | Only removes a preview's URL (tag); nothing is deleted. |
 | `runway undeploy --stage S [--yes] [--delete-images] [--retries N]` | Without `--yes`: prints what would be deleted and what is kept (read-only). With `--yes`: deletes the Cloud Run service, revokes the grants of the runtime service account and deletes it **only if runway created it for this app and stage** and nothing else runs as it, then (opt-in) the app's images. Never deletes buckets, never disables APIs, keeps shared build infrastructure and everything that existed before, and lists it all. |
-| `runway describe [--stage S] [--format ascii\|mermaid] [--diagram-only]` | Offline: a diagram of the stack (pure ASCII, or Mermaid wrapped in a code block) and an explanation (build, access, identity, configuration, storage, APIs, deployment order, failure handling). `-o json` returns both. |
+| `runway describe [--stage S] [--format ascii\|mermaid] [--diagram-only]` | Offline: a diagram of the stack (pure ASCII, or Mermaid wrapped in a code block) and an explanation (build, access, identity, configuration, storage, APIs, deployment order, failure handling). `-o json` returns both. See [Stack diagrams](#stack-diagrams). |
+
+## Stack diagrams
+
+`runway describe` reads only `runway.yaml`. In a terminal the ASCII diagram
+and the explanation are colored: the service stands out, permissions and
+what they apply to are highlighted, names and values are cyan, lines and
+boxes are dimmed. Without colors (a file, a pipe, `NO_COLOR`,
+`--color never`) the same text is plain Markdown, ready to paste into a
+README or a pull request.
+
+`--format mermaid` prints a Mermaid flowchart, rendered by GitHub, GitLab
+and most documentation tools. To view it from the terminal, render it with
+[mermaid-cli](https://github.com/mermaid-js/mermaid-cli)
+(`brew install mermaid-cli`, or `npx -p @mermaid-js/mermaid-cli mmdc`):
+
+```sh
+runway describe --stage prod --format mermaid -o json | jq -r .diagram > stack.mmd
+mmdc -i stack.mmd -o stack.png -t dark -b transparent
+```
+
+Then open `stack.png`, or show it in the terminal where images are supported:
+`kitten icat stack.png` (kitty, Ghostty), `wezterm imgcat stack.png`
+(WezTerm), `imgcat stack.png` (iTerm2), or `chafa stack.png` in any
+terminal (character art). Text-only Mermaid renderers do not support the
+node shapes runway uses; the ASCII format is the terminal view.
 
 ## Plans and image digests
 

@@ -4,7 +4,10 @@
 use crate::config::{Artifact, Deployment, RoleTarget};
 use crate::naming;
 use crate::provision::{all_steps, required_apis};
+use crate::style::Painter;
 use serde::Serialize;
+
+const PLAIN: Painter = Painter { enabled: false };
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Section {
@@ -100,19 +103,60 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
 fn boxed(lines: &[String], double: bool) -> Vec<String> {
-    let lines: Vec<String> = lines.iter().flat_map(|l| wrap(l, BOX_WIDTH)).collect();
-    let lines = &lines[..];
-    let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let (h, v) = if double { ('=', '#') } else { ('-', '|') };
-    let edge = format!("+{}+", h.to_string().repeat(w + 2));
+    boxed_with(lines, double, PLAIN, |_, l| l.to_string())
+}
+
+/// A box around `lines` (wrapped). `style` colors line `i` of `lines` (not
+/// continuation lines); widths are measured on the plain text. The double
+/// box (the service) gets cyan borders, the others dim ones.
+fn boxed_with(
+    lines: &[String],
+    double: bool,
+    p: Painter,
+    style: impl Fn(usize, &str) -> String,
+) -> Vec<String> {
+    let lines: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(i, l)| wrap(l, BOX_WIDTH).into_iter().map(move |w| (i, w)))
+        .collect();
+    let w = lines
+        .iter()
+        .map(|(_, l)| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let (h, v) = if double { ('=', "#") } else { ('-', "|") };
+    let border = |s: &str| if double { p.cyan(s) } else { p.dim(s) };
+    let edge = border(&format!("+{}+", h.to_string().repeat(w + 2)));
     let mut out = vec![edge.clone()];
-    for l in lines {
+    for (i, l) in &lines {
         let pad = w - l.chars().count();
-        out.push(format!("{v} {l}{} {v}", " ".repeat(pad)));
+        let text = if l.starts_with("  ") {
+            l.clone()
+        } else {
+            style(*i, l)
+        };
+        out.push(format!(
+            "{} {text}{} {}",
+            border(v),
+            " ".repeat(pad),
+            border(v)
+        ));
     }
     out.push(edge);
     out
+}
+
+/// `image: ...`, `runs as: ...`: the label dimmed.
+fn labeled(p: Painter, line: &str) -> String {
+    match line.split_once(": ") {
+        Some((label, rest)) if ["image", "runs as", "env", "tags"].contains(&label) => {
+            format!("{} {rest}", p.dim(&format!("{label}:")))
+        }
+        _ => line.to_string(),
+    }
 }
 
 fn indent(lines: Vec<String>, n: usize) -> Vec<String> {
@@ -122,26 +166,47 @@ fn indent(lines: Vec<String>, n: usize) -> Vec<String> {
         .collect()
 }
 
+/// The diagram without colors (JSON output, files, pipes).
 pub fn ascii(d: &Deployment) -> String {
+    ascii_with(d, PLAIN)
+}
+
+/// The diagram; with colors, the service stands out, permissions and their
+/// targets are highlighted and the lines and boxes recede.
+pub fn ascii_with(d: &Deployment, p: Painter) -> String {
     let s = &d.service;
     let mut out: Vec<String> = Vec::new();
+    let bar = || format!("        {}", p.dim("|"));
+    let down = |label: &str| {
+        if label.is_empty() {
+            format!("        {}", p.dim("v"))
+        } else {
+            format!("        {}  {label}", p.dim("v"))
+        }
+    };
+    let plain = |_: usize, l: &str| l.to_string();
 
     // Who can reach the service.
     out.extend(indent(
-        boxed(&[format!("Clients ({})", access_label(d))], false),
+        boxed_with(
+            &[format!("Clients ({})", access_label(d))],
+            false,
+            p,
+            |_, l| match l.strip_prefix("Clients") {
+                Some(rest) => format!("{}{rest}", p.bold("Clients")),
+                None => l.to_string(),
+            },
+        ),
         2,
     ));
-    out.push("        |".into());
-    out.push(format!(
-        "        v  {}",
-        if s.iap.enabled {
-            "IAP authenticates every request"
-        } else if s.public {
-            "unauthenticated HTTPS"
-        } else {
-            "HTTPS with an identity token"
-        }
-    ));
+    out.push(bar());
+    out.push(down(if s.iap.enabled {
+        "IAP authenticates every request"
+    } else if s.public {
+        "unauthenticated HTTPS"
+    } else {
+        "HTTPS with an identity token"
+    }));
 
     // The service itself.
     let mut svc = vec![
@@ -175,12 +240,21 @@ pub fn ascii(d: &Deployment) -> String {
                 .join(", ")
         ));
     }
-    out.extend(indent(boxed(&svc, true), 2));
+    out.extend(indent(
+        boxed_with(&svc, true, p, |i, l| match i {
+            0 => match l.strip_prefix("Cloud Run service ") {
+                Some(id) => format!("{}{}", p.bold("Cloud Run service "), p.bold_cyan(id)),
+                None => l.to_string(),
+            },
+            _ => labeled(p, l),
+        }),
+        2,
+    ));
 
     // What it talks to.
     let edges = runtime_edges(d);
     if !edges.is_empty() {
-        out.push("        |".into());
+        out.push(bar());
         let lw = edges
             .iter()
             .map(|(l, _)| l.chars().count())
@@ -189,7 +263,13 @@ pub fn ascii(d: &Deployment) -> String {
         for (i, (label, target)) in edges.iter().enumerate() {
             let branch = if i + 1 == edges.len() { "`--" } else { "+--" };
             let pad = " ".repeat(lw - label.chars().count());
-            out.push(format!("        {branch} {label}{pad} --> {target}"));
+            out.push(format!(
+                "        {} {}{pad}{}{}",
+                p.dim(branch),
+                p.yellow(label),
+                p.dim(" --> "),
+                p.cyan(target)
+            ));
         }
     }
 
@@ -197,7 +277,7 @@ pub fn ascii(d: &Deployment) -> String {
     out.push(String::new());
     match &d.artifact {
         Artifact::Build(b) => {
-            out.push("  Build pipeline (runway deploy):".into());
+            out.push(format!("  {}", p.bold("Build pipeline (runway deploy):")));
             let stages = [
                 format!("source {}", b.context_dir.display()),
                 format!("gs://{}", b.source_bucket),
@@ -216,27 +296,37 @@ pub fn ascii(d: &Deployment) -> String {
                 "Cloud Run revision".to_string(),
             ];
             for (i, st) in stages.iter().enumerate() {
-                out.extend(indent(boxed(std::slice::from_ref(st), false), 4));
+                out.extend(indent(
+                    boxed_with(std::slice::from_ref(st), false, p, plain),
+                    4,
+                ));
                 if i + 1 < stages.len() {
-                    out.push("        |".into());
-                    out.push("        v".into());
+                    out.push(bar());
+                    out.push(down(""));
                 }
             }
         }
         Artifact::Image { reference, .. } => {
             out.push(format!(
-                "  Image: {reference} (resolved to an immutable digest at deploy)"
+                "  {} {} {}",
+                p.bold("Image:"),
+                p.cyan(reference),
+                p.dim("(resolved to an immutable digest at deploy)")
             ));
         }
     }
 
     if !d.buckets.is_empty() {
         out.push(String::new());
-        out.push("  Buckets managed by runway:".into());
+        out.push(format!("  {}", p.bold("Buckets managed by runway:")));
         for b in d.buckets.values() {
             out.push(format!(
-                "    gs://{}  ({}, uniform access, public access prevention)",
-                b.name, b.location
+                "    {}  {}",
+                p.cyan(&format!("gs://{}", b.name)),
+                p.dim(&format!(
+                    "({}, uniform access, public access prevention)",
+                    b.location
+                ))
             ));
         }
     }
@@ -554,21 +644,48 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
 }
 
 pub fn explanation_text(sections: &[Section]) -> String {
+    explanation_with(sections, crate::style::out())
+}
+
+/// Without colors the text is Markdown (`code` spans, `-` lists); with
+/// colors, code spans are cyan instead of quoted and list numbers dim.
+fn explanation_with(sections: &[Section], p: Painter) -> String {
     let mut s = String::new();
-    let p = crate::style::out();
     for sec in sections {
         s.push_str(&format!("{}\n", p.bold(&sec.title)));
         for it in &sec.items {
-            let prefix = if it.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                "  "
-            } else {
-                "  - "
-            };
-            s.push_str(&format!("{prefix}{it}\n"));
+            let numbered = it
+                .split_once(". ")
+                .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            match numbered {
+                Some((n, rest)) => s.push_str(&format!(
+                    "  {} {}\n",
+                    p.dim(&format!("{n}.")),
+                    code_spans(p, rest)
+                )),
+                None => s.push_str(&format!("  {} {}\n", p.dim("-"), code_spans(p, it))),
+            }
         }
         s.push('\n');
     }
     s
+}
+
+/// `code` spans in cyan, without their backticks, when colors are on.
+fn code_spans(p: Painter, s: &str) -> String {
+    if !p.enabled || !s.matches('`').count().is_multiple_of(2) {
+        return s.to_string();
+    }
+    s.split('`')
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 {
+                p.cyan(part)
+            } else {
+                part.to_string()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -637,6 +754,62 @@ stages: { prod: {} }
             a.is_ascii(),
             "pure ASCII so it renders in any terminal or CI log"
         );
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    const COLOR: Painter = Painter { enabled: true };
+
+    #[test]
+    fn colored_diagram_keeps_the_plain_layout() {
+        let (_d, d) = deployment();
+        let colored = ascii_with(&d, COLOR);
+        assert_ne!(colored, ascii(&d), "colors are applied");
+        assert_eq!(strip_ansi(&colored), ascii(&d), "boxes stay aligned");
+        assert!(
+            colored.contains(&COLOR.bold_cyan("gcptree-prod")),
+            "{colored}"
+        );
+        assert!(colored.contains(&COLOR.yellow("roles/bigquery.dataViewer")));
+        assert!(colored.contains(&COLOR.cyan("dataset billing-data-1234.billingdata")));
+        assert!(colored.contains(&COLOR.dim("runs as:")));
+    }
+
+    #[test]
+    fn explanation_is_markdown_without_colors_and_highlighted_with() {
+        let (_d, d) = deployment();
+        let sections = explain(&d);
+        let plain = explanation_with(&sections, PLAIN);
+        assert!(plain.contains("  - `GCPTREE_TABLE` = `billing-data-1234.billingdata.t`"));
+        assert!(plain.contains("  1. "), "numbered steps");
+        let colored = explanation_with(&sections, COLOR);
+        assert!(colored.contains(&COLOR.cyan("GCPTREE_TABLE")), "{colored}");
+        assert!(
+            !strip_ansi(&colored).contains('`'),
+            "no backticks with colors"
+        );
+        assert_eq!(strip_ansi(&colored), plain.replace('`', ""));
+    }
+
+    #[test]
+    fn unbalanced_backticks_are_left_alone() {
+        assert_eq!(code_spans(COLOR, "a `b"), "a `b");
+        assert_eq!(code_spans(PLAIN, "`a`"), "`a`");
     }
 
     #[test]

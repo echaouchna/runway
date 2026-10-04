@@ -10,6 +10,23 @@ migration notes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-04
+
+### Changed
+
+- `runway describe` colors its diagram and explanation in terminals and CI
+  logs: the service stands out, permissions are yellow and what they apply
+  to cyan, names and values are cyan instead of quoted, lines and boxes are
+  dimmed. Without colors (files, pipes, `NO_COLOR`, `--color never`) and in
+  JSON, the output is unchanged: plain Markdown and ASCII.
+
+### Added
+
+- Documentation: setting up shell completions for every shell, including
+  fish when it does not come from Homebrew, and previewing
+  `describe --format mermaid` from the terminal with mermaid-cli and a
+  terminal image viewer.
+
 ## [0.1.0] - 2026-10-04
 
 First release: deploy applications to Google Cloud Run from a single
@@ -121,5 +138,6 @@ changes only what differs.
   are only sent when the requested URL's host is an Artifact Registry or
   Container Registry host (a crafted reference could send them elsewhere).
 
-[Unreleased]: https://github.com/echaouchna/runway/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/echaouchna/runway/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/echaouchna/runway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/echaouchna/runway/releases/tag/v0.1.0

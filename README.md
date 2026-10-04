@@ -152,7 +152,9 @@ a release; tagged releases also publish versioned images.
 
 runway uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
 `gcloud auth application-default login` locally, Workload Identity Federation
-in CI. Shell completions (installed by Homebrew): `runway completions bash|zsh|fish|nushell|xonsh|elvish|powershell`.
+in CI. Shell completions are installed by Homebrew; otherwise
+`runway completions bash|zsh|fish|nushell|xonsh|elvish|powershell` (see
+[Shell completions](https://echaouchna.github.io/runway/docs/getting-started/#shell-completions)).
 
 ## Quick start
 
