@@ -201,6 +201,12 @@ fn spec() -> ServiceSpec {
         labels: naming::ownership_labels("hello", "dev"),
         volumes: BTreeMap::new(),
         iap_enabled: false,
+        billing: runway::config::BILLING_REQUEST.into(),
+        startup_cpu_boost: false,
+        execution_environment: None,
+        vpc: None,
+        cloud_sql: Vec::new(),
+        custom_audiences: Vec::new(),
         annotations: BTreeMap::new(),
         revision_annotations: BTreeMap::new(),
         traffic: Default::default(),
@@ -233,7 +239,7 @@ async fn cloud_run_update_sends_mask_etag_and_template() {
         .and(path(svc_path.clone()))
         .and(query_param(
             "updateMask",
-            "labels,annotations,client,clientVersion,ingress,invokerIamDisabled,iapEnabled,template,traffic",
+            "labels,annotations,client,clientVersion,customAudiences,ingress,invokerIamDisabled,iapEnabled,template,traffic",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "name": "projects/p/locations/europe-west1/operations/op-1"
@@ -319,6 +325,8 @@ async fn cloud_run_update_sends_mask_etag_and_template() {
     );
     assert_eq!(c["ports"][0]["containerPort"], 8080);
     assert_eq!(c["resources"]["limits"]["memory"], "512Mi");
+    // Explicit: with `resources` set, an absent cpuIdle means instance-based billing.
+    assert_eq!(c["resources"]["cpuIdle"], true);
     let env = c["env"].as_array().unwrap();
     assert!(env.contains(&json!({"name": "LOG_LEVEL", "value": "info"})));
     assert!(env.contains(&json!({
@@ -362,6 +370,18 @@ async fn cloud_run_create_uses_service_id_and_parent() {
     };
     let name = "projects/p/locations/europe-west1/services/hello-dev";
     assert!(rec.get(name).await.unwrap().is_none());
+    let mut spec = spec();
+    spec.billing = runway::config::BILLING_INSTANCE.into();
+    spec.startup_cpu_boost = true;
+    spec.execution_environment = Some("gen2".into());
+    spec.vpc = Some(runway::config::VpcConfig {
+        network: "projects/host-project/global/networks/shared".into(),
+        subnet: "projects/host-project/regions/europe-west1/subnetworks/run".into(),
+        egress: "all-traffic".into(),
+        network_tags: vec!["run-egress".into()],
+    });
+    spec.cloud_sql = vec!["p:europe-west1:db".into()];
+    spec.custom_audiences = vec!["https://api.example.com".into()];
     let applied = rec
         .apply(
             &Target {
@@ -373,7 +393,7 @@ async fn cloud_run_create_uses_service_id_and_parent() {
                 adopt: false,
                 force: false,
             },
-            &spec(),
+            &spec,
             None,
         )
         .await
@@ -387,6 +407,38 @@ async fn cloud_run_create_uses_service_id_and_parent() {
         "create sends no resource name"
     );
     assert_eq!(b["labels"]["runway-stage"], "dev");
+    use google_cloud_run_v2::model::{ExecutionEnvironment, vpc_access::VpcEgress};
+    assert_eq!(b["customAudiences"], json!(["https://api.example.com"]));
+    let t = &b["template"];
+    assert_eq!(
+        t["executionEnvironment"],
+        json!(ExecutionEnvironment::Gen2.value().unwrap())
+    );
+    assert_eq!(
+        t["vpcAccess"]["egress"],
+        json!(VpcEgress::AllTraffic.value().unwrap())
+    );
+    assert_eq!(
+        t["vpcAccess"]["networkInterfaces"],
+        json!([{
+            "network": "projects/host-project/global/networks/shared",
+            "subnetwork": "projects/host-project/regions/europe-west1/subnetworks/run",
+            "tags": ["run-egress"]
+        }])
+    );
+    assert!(t["volumes"].as_array().unwrap().contains(
+        &json!({"name": "cloudsql", "cloudSqlInstance": {"instances": ["p:europe-west1:db"]}})
+    ));
+    let c = &t["containers"][0];
+    assert!(
+        c["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name": "cloudsql", "mountPath": "/cloudsql"}))
+    );
+    // Instance-based: cpuIdle false is the proto default, so it is omitted.
+    assert!(c["resources"].get("cpuIdle").is_none_or(|v| v == false));
+    assert_eq!(c["resources"]["startupCpuBoost"], true);
 }
 
 /// A revision as Cloud Run reports it, created from `spec`'s template.

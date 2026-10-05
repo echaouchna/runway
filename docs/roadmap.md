@@ -7,9 +7,9 @@ upvote an issue if something matters to you.
 
 ## Next (0.2)
 
-- **Service options needed by larger apps**: custom audiences, always-on CPU
-  (instance-based billing), execution environment, VPC access (Direct VPC
-  egress, connectors), Cloud SQL connections.
+- **More service options**: Serverless VPC Access connectors (Direct VPC
+  egress, custom audiences, billing, execution environment and Cloud SQL
+  connections are done), GPUs, NFS and in-memory volumes, session affinity.
 - **Several services per file** (for example an API and a web front end),
   sharing build, identity and secrets.
 - **Docker Compose**: deploy the `compose.yaml` you already run locally.

@@ -164,6 +164,34 @@ pub struct RawService {
     pub iap: Option<RawIap>,
     /// Runtime service account management. A stage block replaces the inherited one.
     pub identity: Option<RawIdentity>,
+    /// `request-based` (default: CPU only while handling requests) or
+    /// `instance-based` (CPU always allocated, billed for the instance's
+    /// whole lifetime).
+    pub billing: Option<String>,
+    /// Extra CPU while instances start (and for 10 seconds after).
+    pub startup_cpu_boost: Option<bool>,
+    /// `gen1` or `gen2`. Default: Cloud Run chooses from the features used.
+    pub execution_environment: Option<String>,
+    /// Direct VPC egress. A stage block replaces the inherited one.
+    pub vpc: Option<RawVpc>,
+    /// Cloud SQL instances (`PROJECT:REGION:INSTANCE`, or an instance name in
+    /// the deployment project and region), reachable under `/cloudsql`.
+    pub cloud_sql: Option<Vec<String>>,
+    /// Extra audiences accepted in ID tokens (besides the `run.app` URL).
+    pub custom_audiences: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawVpc {
+    /// Network name, or `projects/HOST/global/networks/NAME` (Shared VPC).
+    pub network: String,
+    /// Subnet name, or `projects/HOST/regions/REGION/subnetworks/NAME`.
+    pub subnet: String,
+    /// `private-ranges-only` (default) or `all-traffic`.
+    pub egress: Option<String>,
+    /// Network tags on the revision, for firewall rules.
+    pub network_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

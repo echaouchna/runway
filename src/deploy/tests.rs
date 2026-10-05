@@ -174,6 +174,7 @@ impl google_cloud_run_v2::stub::Services for FakeRun {
                 "client" => next.client = incoming.client.clone(),
                 "client_version" => next.client_version = incoming.client_version.clone(),
                 "iap_enabled" => next.iap_enabled = incoming.iap_enabled,
+                "custom_audiences" => next.custom_audiences = incoming.custom_audiences.clone(),
                 other => panic!("unexpected mask path {other}"),
             }
         }
@@ -258,6 +259,12 @@ fn spec(image: &str) -> ServiceSpec {
         labels: naming::ownership_labels("hello", "dev"),
         volumes: BTreeMap::new(),
         iap_enabled: false,
+        billing: crate::config::BILLING_REQUEST.into(),
+        startup_cpu_boost: false,
+        execution_environment: None,
+        vpc: None,
+        cloud_sql: Vec::new(),
+        custom_audiences: Vec::new(),
         annotations: BTreeMap::new(),
         revision_annotations: BTreeMap::new(),
         traffic: Default::default(),

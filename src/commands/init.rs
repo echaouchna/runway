@@ -15,20 +15,41 @@ pub const EXAMPLE_DOCKERFILE: &str = include_str!("../../examples/hello-python/D
 
 pub const EXAMPLE_DOCKERIGNORE: &str = include_str!("../../examples/hello-python/.dockerignore");
 
+/// Commented options under `service:`, the same for both templates. Each
+/// example is valid as is once uncommented (checked by a test).
+const OPTIONAL_SERVICE: &str = r#"
+  # Optional (uncomment what you need):
+  # health_check: {path: /healthz}            # startup and liveness probes
+  # ingress: internal                         # all (default), internal, internal-and-cloud-load-balancing
+  # billing: instance-based                   # CPU always allocated (default: request-based)
+  # startup_cpu_boost: true                   # more CPU while instances start
+  # execution_environment: gen2               # gen1 or gen2 (default: Cloud Run chooses)
+  # identity:                                 # create the runtime account and grant it roles
+  #   create: true
+  #   roles:
+  #     - {role: roles/storage.objectViewer, bucket: my-bucket}
+  # vpc: {network: default, subnet: default}  # Direct VPC egress (private ranges by default)
+  # cloud_sql: [my-instance]                  # socket at /cloudsql/PROJECT:REGION:INSTANCE
+  # iap: {enabled: true, members: [group:team@example.com]}   # sign-in with Google
+  # custom_audiences: [https://api.example.com]               # extra ID token audiences
+"#;
+
 fn source_config(app: &str, project: &str, region: &str) -> String {
     format!(
         r#"# runway.yaml - every option: https://runway.echaouchna.dev/docs/configuration/
 version: 1
 app: {app}
 
-# Infrastructure you provide (see README "Prerequisites"). runway never
-# creates or deletes these resources.
+# Build resources below are yours, or created by runway with
+# `create_build_resources: true`. runway never deletes them.
 provider:
   project: {project}
   region: {region}
   artifact_repository: runway
   source_bucket: {project}-runway-sources
   build_service_account: runway-build@{project}.iam.gserviceaccount.com
+  # create_build_resources: true   # create the repository, bucket and build account
+  # enable_apis: true              # enable missing APIs on the project
 
 # The Cloud Run service runway manages: one per stage, named <app>-<stage>.
 service:
@@ -50,7 +71,7 @@ service:
   #   DATABASE_URL:
   #     secret: database-url
   #     version: "1"
-
+{OPTIONAL_SERVICE}
 # Stage overrides take precedence over the blocks above.
 stages:
   dev:
@@ -82,7 +103,7 @@ service:
   service_account: runway-runtime@{project}.iam.gserviceaccount.com
   env:
     LOG_LEVEL: info
-
+{OPTIONAL_SERVICE}
 stages:
   dev:
     service:
@@ -279,6 +300,58 @@ mod tests {
             for stage in ["dev", "prod"] {
                 crate::config::resolve(&cfg, stage, &Default::default())
                     .unwrap_or_else(|d| panic!("{:#?}", d.errors));
+            }
+        }
+    }
+
+    /// Option lines (`# key: ...`, `#   nested`, `# - item`) uncommented;
+    /// explanations (`# Capitalized text`) stay comments.
+    fn uncomment_options(yaml: &str) -> String {
+        yaml.lines()
+            .map(|l| {
+                let indent = l.len() - l.trim_start().len();
+                match l.trim_start().strip_prefix("# ") {
+                    Some(rest)
+                        if indent > 0
+                            && rest.starts_with(|c: char| {
+                                c.is_ascii_lowercase() || c == ' ' || c == '-'
+                            }) =>
+                    {
+                        format!("{}{rest}", &l[..indent])
+                    }
+                    _ => l.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn commented_options_are_valid_once_uncommented() {
+        for (yaml, needs_dockerfile) in [
+            (
+                source_config("hello", "my-gcp-project", "europe-west1"),
+                true,
+            ),
+            (
+                image_config("hello", "my-gcp-project", "europe-west1", "nginx:1.27"),
+                false,
+            ),
+        ] {
+            let full = uncomment_options(&yaml);
+            assert!(full.contains("\n  cloud_sql: [my-instance]"), "{full}");
+            let dir = tempfile::tempdir().unwrap();
+            if needs_dockerfile {
+                std::fs::write(dir.path().join("Dockerfile"), EXAMPLE_DOCKERFILE).unwrap();
+            }
+            let path = dir.path().join("runway.yaml");
+            std::fs::write(&path, &full).unwrap();
+            let cfg = crate::config::load(&path).unwrap_or_else(|e| panic!("{e}\n{full}"));
+            for stage in ["dev", "prod"] {
+                let r = crate::config::resolve(&cfg, stage, &Default::default())
+                    .unwrap_or_else(|d| panic!("{:#?}\n{full}", d.errors));
+                let s = r.deployment.service;
+                assert!(s.vpc.is_some() && s.iap.enabled && s.identity.create);
             }
         }
     }

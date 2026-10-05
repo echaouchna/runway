@@ -8,11 +8,11 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
 **Scope**
 
 - One Cloud Run HTTP service per configuration (one copy per stage). No
-  Cloud Run jobs or worker pools, no VPC access, no custom domains or load
-  balancers, no built-in Cloud SQL connections (a Cloud SQL Auth Proxy
-  sidecar works). See the [roadmap](roadmap.md).
-- Not supported yet on the service: custom audiences, always-on CPU
-  (instance-based billing), execution environment selection.
+  Cloud Run jobs or worker pools, no custom domains or load balancers, no
+  Serverless VPC Access connectors (Direct VPC egress only). See the
+  [roadmap](roadmap.md).
+- Not supported yet on the service: GPUs, NFS and in-memory volumes, session
+  affinity, manual scaling.
 - runway owns the revision template: settings added outside runway
   (extra containers, volumes, VPC settings, template labels or annotations)
   are removed by the next deploy. The same applies to a service taken over
@@ -82,7 +82,9 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
 - Plain `env` values are shown in plans and output; anything sensitive belongs
   in `secrets`.
 - Developed and tested on Linux and macOS (builds). Windows is untested.
-- The binary is about 35 MB because it links several Google Cloud SDK crates.
+- Release binaries and the container image's binary are about 12 MB (size
+  optimized, with link-time optimization); a local `cargo build --release` is
+  about 41 MB. Most of it is the Google Cloud SDK crates.
 
 ## What has been verified against Google Cloud
 
@@ -108,14 +110,24 @@ account.
   `bootstrap` first deploy accepted by a `constraints/run.allowedIngress`
   policy that reads a tag bound to the service only.
 - `undeploy`, `info`, `plan`, `doctor`, impersonation.
+- Previews (`deploy --preview`: tag URL, no traffic) from GitLab CI, repeated
+  on the same branch: a preview with nothing changed reuses its revision
+  ("no configuration changes"), and a base image update upstream triggers a
+  rebuild of unchanged source.
+- A source build running alongside the rest of provisioning.
+- GitLab CI on GKE runners with Workload Identity and impersonation, using
+  the container image.
 
 **Implemented and tested offline, not yet verified live**
 
-- Previews, canaries and `runway traffic` (tag URLs, pinning, promote).
+- Canaries and `runway traffic` (pinning, promote), `preview prune` and
+  `preview delete`.
 - Removing access: revocation of recorded grants, removal of access and tags
-  `runway.yaml` does not list, and their timing (main deploys only). Also
-  reusing a revision that already serves the same image and configuration
-  instead of creating one, and steps running in parallel.
+  `runway.yaml` does not list, and their timing (main deploys only).
+- Direct VPC egress, Cloud SQL connections, custom audiences, billing
+  (`billing`, `startup_cpu_boost`) and `execution_environment`.
+- Reusing a matching revision on main deploys and canaries (seen live for
+  previews only), and provisioning waves running in parallel.
 - Secrets: creation, adders, the stop-until-a-value step, version pinning,
   secret files; grants implied by secrets and volumes.
 - Generic sidecars (`service.sidecars`), including Cloud Run's handling of
@@ -125,8 +137,8 @@ account.
 - Cloud Storage volume mounts, image deletion (`undeploy --delete-images`),
   release tags (`--tag`, `--tag-rc`).
 - Docker Hub digest resolution (anonymous token flow), Workload Identity
-  Federation credentials (standard ADC `external_account` handling), the CI
-  snippets in these docs.
+  Federation credentials (standard ADC `external_account` handling), the
+  GitHub Actions snippets in these docs.
 - Local CPU/memory validation rules; Cloud Run's server-side validation is
   authoritative (rejections surface as exit code 6).
 - `doctor` permission names and the principal lookup through `tokeninfo`

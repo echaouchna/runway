@@ -12,6 +12,21 @@ migration notes.
 
 ### Added
 
+- Service options:
+  - `billing` (`request-based` or `instance-based`) and `startup_cpu_boost`;
+  - `execution_environment` (`gen1`, `gen2`);
+  - Direct VPC egress with `vpc` (network, subnet, egress, network tags;
+    Shared VPC with full resource names);
+  - Cloud SQL connections with `cloud_sql` (socket at `/cloudsql/...`; the
+    runtime account gets `roles/cloudsql.client`, the Cloud SQL Admin API is
+    enabled);
+  - `custom_audiences`, a service setting that creates no revision.
+
+  Validation follows Cloud Run's rules (memory and CPU minimums, gen1 and
+  gen2 constraints). Below 1 CPU now requires `concurrency: 1`, as Cloud Run
+  does. `describe` shows the VPC and Cloud SQL connections.
+- `runway init` writes the common optional settings as commented one-line
+  examples, each valid once uncommented.
 - Demo (under a minute): `runway.yaml`, the `describe` diagram, a first
   deploy, an exact plan, a preview URL, a canary promoted and merged previews
   pruned. A high-resolution GIF in the README, and an interactive asciinema
@@ -84,6 +99,16 @@ migration notes.
   (documentation at `/docs/`); links in the CLI (`--help`, error hints,
   `runway init`), the Homebrew formula and the README point there. The old
   `echaouchna.github.io/runway` addresses redirect.
+
+### Fixed
+
+- **Billing:** services were deployed with instance-based billing (CPU always
+  allocated, billed for the instance's whole life) instead of Cloud Run's
+  request-based default: with resource limits set, Cloud Run needs `cpuIdle`
+  explicitly, which runway never sent. runway now always sends it; the next
+  plan shows `~ billing: instance-based -> request-based` for existing
+  services and the next deploy creates a revision. Set `billing:
+  instance-based` to keep the previous behaviour.
 
 ## [0.1.1] - 2026-10-04
 

@@ -4,22 +4,23 @@ use crate::config::SecretRef;
 use crate::naming;
 use crate::plan::{ServiceSpec, normalize_cpu, normalize_memory, secret_display};
 use google_cloud_run_v2::model::{
-    Condition, Container, ContainerPort, EnvVar, EnvVarSource, GCSVolumeSource, HTTPGetAction,
-    IngressTraffic, Probe, ResourceRequirements, RevisionScaling, RevisionTemplate,
-    SecretKeySelector, SecretVolumeSource, Service, TCPSocketAction, TrafficTarget,
-    TrafficTargetAllocationType, VersionToPath, Volume, VolumeMount, condition, env_var, probe,
-    volume,
+    CloudSqlInstance, Condition, Container, ContainerPort, EnvVar, EnvVarSource,
+    ExecutionEnvironment, GCSVolumeSource, HTTPGetAction, IngressTraffic, Probe,
+    ResourceRequirements, RevisionScaling, RevisionTemplate, SecretKeySelector, SecretVolumeSource,
+    Service, TCPSocketAction, TrafficTarget, TrafficTargetAllocationType, VersionToPath, Volume,
+    VolumeMount, VpcAccess, condition, env_var, probe, volume, vpc_access,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// Fields runway owns on the Service resource. Everything else (for example
-/// `description`, `binary_authorization`, `custom_audiences`) is left untouched.
+/// `description`, `binary_authorization`) is left untouched.
 pub const UPDATE_MASK: &[&str] = &[
     "labels",
     "annotations",
     "client",
     "client_version",
+    "custom_audiences",
     "ingress",
     "invoker_iam_disabled",
     "iap_enabled",
@@ -109,6 +110,11 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
                     })
                     .chain(secret_files(spec).map(|(vol, dir, _, _)| {
                         VolumeMount::new().set_name(vol).set_mount_path(dir)
+                    }))
+                    .chain((!spec.cloud_sql.is_empty()).then(|| {
+                        VolumeMount::new()
+                            .set_name(crate::config::CLOUD_SQL_VOLUME)
+                            .set_mount_path(crate::config::CLOUD_SQL_MOUNT)
                     })),
             );
     let container = match &spec.health_check {
@@ -147,6 +153,13 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
                     .set_items([VersionToPath::new().set_path(file).set_version(&s.version)]),
             )
         }))
+        .chain((!spec.cloud_sql.is_empty()).then(|| {
+            Volume::new()
+                .set_name(crate::config::CLOUD_SQL_VOLUME)
+                .set_cloud_sql_instance(
+                    CloudSqlInstance::new().set_instances(spec.cloud_sql.clone()),
+                )
+        }))
         .collect();
 
     // Same template as the live one, or a revision behind the mode's URL that
@@ -176,6 +189,7 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
         })
         .set_invoker_iam_disabled(false)
         .set_iap_enabled(spec.iap_enabled)
+        .set_custom_audiences(spec.custom_audiences.clone())
         .set_template(template)
         .set_traffic(traffic_targets(&spec.traffic.entries));
     if let Some(e) = existing {
@@ -189,7 +203,7 @@ fn build_template(
     volumes: Vec<Volume>,
     container: Container,
 ) -> RevisionTemplate {
-    RevisionTemplate::new()
+    let template = RevisionTemplate::new()
         .set_labels(spec.labels.clone())
         .set_annotations(spec.revision_annotations.clone())
         .set_scaling(
@@ -205,6 +219,25 @@ fn build_template(
         .set_max_instance_request_concurrency(spec.concurrency as i32)
         .set_volumes(volumes)
         .set_containers(containers(spec, container))
+        .set_execution_environment(match spec.execution_environment.as_deref() {
+            Some("gen1") => ExecutionEnvironment::Gen1,
+            Some("gen2") => ExecutionEnvironment::Gen2,
+            _ => ExecutionEnvironment::Unspecified,
+        });
+    match &spec.vpc {
+        None => template,
+        Some(v) => template.set_vpc_access(
+            VpcAccess::new()
+                .set_egress(match v.egress.as_str() {
+                    "all-traffic" => vpc_access::VpcEgress::AllTraffic,
+                    _ => vpc_access::VpcEgress::PrivateRangesOnly,
+                })
+                .set_network_interfaces([vpc_access::NetworkInterface::new()
+                    .set_network(&v.network)
+                    .set_subnetwork(&v.subnet)
+                    .set_tags(v.network_tags.clone())]),
+        ),
+    }
 }
 
 /// Env var carrying the collector configuration (read with `--config=env:`).
@@ -228,11 +261,23 @@ fn containers(spec: &ServiceSpec, app: Container) -> Vec<Container> {
             before_app.push(name.clone());
         }
     }
-    if sidecars.is_empty() {
-        return vec![app];
+    let mut out = if sidecars.is_empty() {
+        vec![app]
+    } else {
+        let mut out = vec![app.set_name(APP_CONTAINER).set_depends_on(before_app)];
+        out.extend(sidecars);
+        out
+    };
+    // Explicit on every container: with `resources` set, an absent `cpu_idle`
+    // means CPU always allocated (instance-based billing).
+    let cpu_idle = spec.billing != crate::config::BILLING_INSTANCE;
+    for c in &mut out {
+        let r = c.resources.take().unwrap_or_default();
+        c.resources = Some(
+            r.set_cpu_idle(cpu_idle)
+                .set_startup_cpu_boost(spec.startup_cpu_boost),
+        );
     }
-    let mut out = vec![app.set_name(APP_CONTAINER).set_depends_on(before_app)];
-    out.extend(sidecars);
     out
 }
 
@@ -532,6 +577,13 @@ pub fn revision_matches(
     let template = RevisionTemplate::new()
         .set_containers(rev.containers.clone())
         .set_volumes(rev.volumes.clone())
+        .set_or_clear_vpc_access(rev.vpc_access.clone())
+        // A revision reports the environment it runs on; unconfigured, Cloud
+        // Run chose it, and any choice matches.
+        .set_execution_environment(match spec.execution_environment {
+            Some(_) => rev.execution_environment.clone(),
+            None => ExecutionEnvironment::Unspecified,
+        })
         .set_service_account(&rev.service_account)
         .set_max_instance_request_concurrency(rev.max_instance_request_concurrency)
         .set_or_clear_timeout(rev.timeout)
@@ -548,8 +600,10 @@ pub fn revision_matches(
 
 /// Fields that live on the Service, not on the revision template.
 pub fn is_service_level(field: &str) -> bool {
-    matches!(field, "ingress" | "iap" | "invoker_iam_disabled")
-        || field == "traffic"
+    matches!(
+        field,
+        "ingress" | "iap" | "invoker_iam_disabled" | "custom_audiences"
+    ) || field == "traffic"
         || field.starts_with("traffic.")
         || field.starts_with("annotations.")
 }
@@ -631,6 +685,53 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
     }
     if svc.iap_enabled {
         m.insert("iap".into(), "enabled".into());
+    }
+    if !svc.custom_audiences.is_empty() {
+        m.insert(
+            "custom_audiences".into(),
+            crate::plan::list_display(&svc.custom_audiences),
+        );
+    }
+    match template.execution_environment {
+        ExecutionEnvironment::Gen1 => {
+            m.insert("execution_environment".into(), "gen1".into());
+        }
+        ExecutionEnvironment::Gen2 => {
+            m.insert("execution_environment".into(), "gen2".into());
+        }
+        _ => {}
+    }
+    if let Some(va) = &template.vpc_access {
+        let ni = va.network_interfaces.first().cloned().unwrap_or_default();
+        if !ni.network.is_empty() || !ni.subnetwork.is_empty() || !va.connector.is_empty() {
+            // Names alone (set outside runway) are in the service's project.
+            let mut parts = svc.name.split('/').skip(1).step_by(2);
+            let (project, region) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            let full = |name: &str, f: &dyn Fn(&str) -> String| match name.is_empty()
+                || project.is_empty()
+            {
+                true => name.to_string(),
+                false => f(name),
+            };
+            let value = if !va.connector.is_empty() {
+                format!("connector {}", va.connector)
+            } else {
+                crate::plan::vpc_display(&crate::config::VpcConfig {
+                    network: full(&ni.network, &|n| {
+                        crate::config::validate::full_network(n, project)
+                    }),
+                    subnet: full(&ni.subnetwork, &|n| {
+                        crate::config::validate::full_subnet(n, project, region)
+                    }),
+                    egress: match va.egress {
+                        vpc_access::VpcEgress::AllTraffic => "all-traffic".into(),
+                        _ => "private-ranges-only".into(),
+                    },
+                    network_tags: ni.tags.clone(),
+                })
+            };
+            m.insert("vpc".into(), value);
+        }
     }
     for (k, v) in &svc.labels {
         m.insert(format!("labels.{k}"), v.clone());
@@ -725,6 +826,15 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
         .or(template.containers.first());
     if let Some(c) = ingress {
         for vol in &template.volumes {
+            if let Some(volume::VolumeType::CloudSqlInstance(sql)) = &vol.volume_type {
+                if !sql.instances.is_empty() {
+                    m.insert(
+                        "cloud_sql".into(),
+                        crate::plan::list_display(&sql.instances),
+                    );
+                }
+                continue;
+            }
             // Secret files are compared by file path.
             if let Some(volume::VolumeType::Secret(sv)) = &vol.volume_type {
                 let dir = c
@@ -798,6 +908,20 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
             .as_ref()
             .map(|r| r.limits.clone())
             .unwrap_or_default();
+        // Without `resources`, CPU is only allocated during requests.
+        let instance_based = c.resources.as_ref().is_some_and(|r| !r.cpu_idle);
+        m.insert(
+            "billing".into(),
+            if instance_based {
+                crate::config::BILLING_INSTANCE
+            } else {
+                crate::config::BILLING_REQUEST
+            }
+            .into(),
+        );
+        if c.resources.as_ref().is_some_and(|r| r.startup_cpu_boost) {
+            m.insert("startup_cpu_boost".into(), "enabled".into());
+        }
         m.insert(
             "cpu".into(),
             normalize_cpu(limits.get("cpu").map(String::as_str).unwrap_or("1")),
@@ -1074,6 +1198,12 @@ mod tests {
                 },
             )]),
             iap_enabled: true,
+            billing: crate::config::BILLING_REQUEST.into(),
+            startup_cpu_boost: false,
+            execution_environment: None,
+            vpc: None,
+            cloud_sql: Vec::new(),
+            custom_audiences: Vec::new(),
             annotations: BTreeMap::from([(
                 naming::ANNOTATION_IMAGE_REF.to_string(),
                 "europe-west1-docker.pkg.dev/p/apps/hello:src-1".to_string(),
@@ -1255,6 +1385,8 @@ mod tests {
         google_cloud_run_v2::model::Revision::new()
             .set_containers(t.containers.clone())
             .set_volumes(t.volumes.clone())
+            .set_or_clear_vpc_access(t.vpc_access.clone())
+            .set_execution_environment(t.execution_environment.clone())
             .set_service_account(&t.service_account)
             .set_max_instance_request_concurrency(t.max_instance_request_concurrency)
             .set_or_clear_timeout(t.timeout)
@@ -1693,11 +1825,177 @@ mod tests {
         // The API reports equivalent values in different spellings.
         if let Some(t) = svc.template.as_mut() {
             t.containers[0].resources = Some(
-                ResourceRequirements::new().set_limits([("cpu", "2000m"), ("memory", "1024Mi")]),
+                ResourceRequirements::new()
+                    .set_limits([("cpu", "2000m"), ("memory", "1024Mi")])
+                    .set_cpu_idle(true),
             );
         }
         let observed = observed_flat(&svc);
         let changes = crate::plan::diff(&observed, &s.flatten());
+        assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    fn networked_spec() -> ServiceSpec {
+        let mut s = spec();
+        s.billing = crate::config::BILLING_INSTANCE.into();
+        s.startup_cpu_boost = true;
+        s.execution_environment = Some("gen2".into());
+        // Full names, as configuration resolution produces them.
+        s.vpc = Some(crate::config::VpcConfig {
+            network: "projects/p/global/networks/default".into(),
+            subnet: "projects/p/regions/europe-west1/subnetworks/run".into(),
+            egress: "all-traffic".into(),
+            network_tags: vec!["b".into(), "a".into()],
+        });
+        s.cloud_sql = vec!["p:europe-west1:db".into()];
+        s.custom_audiences = vec!["https://api.example.com".into()];
+        s.sidecars.insert(
+            "proxy".into(),
+            crate::config::SidecarConfig {
+                image: "nginx".into(),
+                cpu: "1".into(),
+                memory: "512Mi".into(),
+                command: vec![],
+                args: vec![],
+                env: Default::default(),
+                secrets: Default::default(),
+                health_check: None,
+                start_before_app: false,
+                volumes: Default::default(),
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn networking_billing_and_cloud_sql_reach_the_request() {
+        let s = networked_spec();
+        let svc = desired_service(&s, "n", None);
+        assert_eq!(svc.custom_audiences, ["https://api.example.com"]);
+        let t = svc.template.clone().unwrap();
+        assert_eq!(t.execution_environment, ExecutionEnvironment::Gen2);
+        let va = t.vpc_access.clone().unwrap();
+        assert_eq!(va.egress, vpc_access::VpcEgress::AllTraffic);
+        assert_eq!(
+            va.network_interfaces[0].network,
+            "projects/p/global/networks/default"
+        );
+        assert_eq!(
+            va.network_interfaces[0].subnetwork,
+            "projects/p/regions/europe-west1/subnetworks/run"
+        );
+        // Every container: billing is per revision, set on each of them.
+        for c in &t.containers {
+            let r = c.resources.as_ref().unwrap();
+            assert!(!r.cpu_idle, "instance-based: {}", c.name);
+            assert!(r.startup_cpu_boost, "{}", c.name);
+        }
+        let sql = t
+            .volumes
+            .iter()
+            .find(|v| v.name == crate::config::CLOUD_SQL_VOLUME)
+            .unwrap();
+        assert!(matches!(&sql.volume_type,
+            Some(volume::VolumeType::CloudSqlInstance(c)) if c.instances == ["p:europe-west1:db"]));
+        let app = t.containers.iter().find(|c| !c.ports.is_empty()).unwrap();
+        assert!(
+            app.volume_mounts
+                .iter()
+                .any(|m| m.name == "cloudsql" && m.mount_path == "/cloudsql")
+        );
+
+        // What runway sent reads back as the same configuration.
+        let changes = crate::plan::diff(&observed_flat(&svc), &s.flatten());
+        assert!(changes.is_empty(), "{changes:?}");
+
+        // Request-based billing is sent explicitly (cpu_idle), not left out.
+        let plain = desired_service(&spec(), "n", None);
+        assert!(
+            plain.template.unwrap().containers[0]
+                .resources
+                .as_ref()
+                .unwrap()
+                .cpu_idle
+        );
+    }
+
+    #[test]
+    fn services_without_cpu_idle_show_instance_based_billing() {
+        // Deployed by runway before billing was managed: resources without
+        // cpu_idle, which Cloud Run reads as CPU always allocated.
+        let s = spec();
+        let mut svc = desired_service(&s, "n", None);
+        if let Some(t) = svc.template.as_mut() {
+            t.containers[0].resources =
+                Some(ResourceRequirements::new().set_limits([("cpu", "2"), ("memory", "1Gi")]));
+        }
+        let changes = crate::plan::diff(&observed_flat(&svc), &s.flatten());
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].field, "billing");
+        assert_eq!(changes[0].before.as_deref(), Some("instance-based"));
+        assert_eq!(changes[0].after.as_deref(), Some("request-based"));
+    }
+
+    #[test]
+    fn audiences_alone_never_create_a_revision() {
+        let s = networked_spec();
+        let live = desired_service(&s, "n", None);
+        let mut changed = s.clone();
+        changed.custom_audiences = vec!["https://other.example.com".into()];
+        let changes = crate::plan::diff(&observed_flat(&live), &changed.flatten());
+        assert_eq!(changes.len(), 1);
+        assert!(is_service_level(&changes[0].field));
+        let req = desired_service(&changed, "n", Some(&live));
+        assert_eq!(req.template, live.template, "template sent back untouched");
+        assert_eq!(req.custom_audiences, ["https://other.example.com"]);
+    }
+
+    #[test]
+    fn moving_to_another_shared_vpc_host_is_a_change() {
+        let mut a = networked_spec();
+        let mut b = networked_spec();
+        let vpc = |host: &str| crate::config::VpcConfig {
+            network: format!("projects/{host}/global/networks/shared"),
+            subnet: format!("projects/{host}/regions/europe-west1/subnetworks/run"),
+            egress: "private-ranges-only".into(),
+            network_tags: vec![],
+        };
+        a.vpc = Some(vpc("host-a"));
+        b.vpc = Some(vpc("host-b"));
+        let live = desired_service(&a, "projects/p/locations/europe-west1/services/n", None);
+        let changes = crate::plan::diff(&observed_flat(&live), &b.flatten());
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].field, "vpc");
+    }
+
+    #[test]
+    fn a_revision_on_the_environment_cloud_run_chose_is_kept() {
+        let s = spec();
+        assert_eq!(s.execution_environment, None, "Cloud Run chooses");
+        let live = desired_service(&s, "n", None);
+        // A revision reports the environment it runs on.
+        let rev = revision_of(live.template.as_ref().unwrap())
+            .set_execution_environment(ExecutionEnvironment::Gen2);
+        assert!(revision_matches(&live, &rev, &s));
+
+        let mut gen1 = s.clone();
+        gen1.execution_environment = Some("gen1".into());
+        assert!(
+            !revision_matches(&live, &rev, &gen1),
+            "a configured environment counts"
+        );
+    }
+
+    #[test]
+    fn a_short_name_set_outside_runway_is_in_the_services_project() {
+        let s = networked_spec();
+        let mut svc = desired_service(&s, "n", None);
+        svc.name = "projects/p/locations/europe-west1/services/n".into();
+        if let Some(va) = svc.template.as_mut().and_then(|t| t.vpc_access.as_mut()) {
+            va.network_interfaces[0].network = "default".into();
+            va.network_interfaces[0].subnetwork = "run".into();
+        }
+        let changes = crate::plan::diff(&observed_flat(&svc), &s.flatten());
         assert!(changes.is_empty(), "{changes:?}");
     }
 
