@@ -77,6 +77,15 @@ fn runtime_edges(d: &Deployment) -> Vec<(String, String)> {
             format!("gs://{}", v.bucket),
         ));
     }
+    for c in &s.cloud_sql {
+        out.push((format!("socket /cloudsql/{c}"), format!("Cloud SQL {c}")));
+    }
+    if let Some(v) = &s.vpc {
+        out.push((
+            format!("egress {}", v.egress),
+            format!("VPC {} / {}", v.network, v.subnet),
+        ));
+    }
     out
 }
 
@@ -580,6 +589,42 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
         out.push(Section {
             title: "Storage".into(),
             items: storage,
+        });
+    }
+
+    let mut network = Vec::new();
+    if let Some(v) = &s.vpc {
+        network.push(format!(
+            "Direct VPC egress through `{}` (subnet `{}`): {}{}.",
+            v.network,
+            v.subnet,
+            if v.egress == "all-traffic" {
+                "all outbound traffic goes through the VPC"
+            } else {
+                "traffic to private ranges goes through the VPC, the rest to the internet"
+            },
+            if v.network_tags.is_empty() {
+                String::new()
+            } else {
+                format!(", network tags {}", v.network_tags.join(", "))
+            }
+        ));
+    }
+    for c in &s.cloud_sql {
+        network.push(format!(
+            "Cloud SQL `{c}`: a socket at `/cloudsql/{c}`; the runtime account gets `roles/cloudsql.client` in the instance's project."
+        ));
+    }
+    if !s.custom_audiences.is_empty() {
+        network.push(format!(
+            "ID tokens for {} are accepted besides the `run.app` URL.",
+            s.custom_audiences.join(", ")
+        ));
+    }
+    if !network.is_empty() {
+        out.push(Section {
+            title: "Networking".into(),
+            items: network,
         });
     }
 

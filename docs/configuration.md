@@ -50,7 +50,7 @@ service:
   rebuild: on-change          # default: rebuild when the source or a base image changes; `always` = every deploy
   # image: europe-west1-docker.pkg.dev/my-gcp-project/applications/hello:1.2.3   # instead of source
   port: 8080                  # default 8080; injected as $PORT
-  cpu: "1"                    # 1, 2, 4, 6, 8 or 0.08-1 (also "500m"); default 1
+  cpu: "1"                    # 1, 2, 4, 6, 8 or 0.08-1 (also "500m"; below 1 needs concurrency 1); default 1
   memory: 512Mi               # 128Mi-32Gi; default 512Mi
   timeout_seconds: 60         # 1-3600; default 300
   concurrency: 80             # 1-1000; default 80
@@ -58,6 +58,9 @@ service:
   max_instances: 10           # default 10
   public: false               # default false (private)
   ingress: all                # all (default) | internal | internal-and-cloud-load-balancing
+  billing: request-based      # request-based (default) | instance-based (CPU always allocated)
+  startup_cpu_boost: false    # default false: more CPU while instances start
+  # execution_environment: gen2   # gen1 | gen2; default: Cloud Run chooses
   bootstrap: {}               # first deploy only: restricted ingress until `tags` are effective
     # ingress: internal       # default: ingress used until the tags are effective
     # image: us-docker.pkg.dev/cloudrun/container/hello   # optional placeholder instead of the real app
@@ -124,6 +127,16 @@ service:
     enabled: true             # default true when the block is present
     members: [group:finops@example.com]   # get roles/iap.httpsResourceAccessor
 
+  vpc:                        # Direct VPC egress (no connector)
+    network: default          # or projects/HOST_PROJECT/global/networks/NAME (Shared VPC)
+    subnet: default           # or projects/HOST_PROJECT/regions/REGION/subnetworks/NAME
+    egress: private-ranges-only   # default; or all-traffic
+    network_tags: [run-egress]    # optional, for firewall rules
+
+  cloud_sql: [db]             # PROJECT:REGION:INSTANCE, or an instance in this project and region;
+                              # socket at /cloudsql/PROJECT:REGION:INSTANCE
+  custom_audiences: [https://api.example.com]   # extra ID token audiences (service-level)
+
 retry:                        # per-step retries for deploy (top level only)
   attempts: 3                 # total attempts per step, 1-20; default 3
   delay: 5s                   # initial delay, doubles each attempt; default 5s
@@ -167,6 +180,49 @@ authentication or TLS proxy, a log forwarder.
 
 CPU is allocated per container: with request-based billing, sidecars only get
 CPU while requests are being served.
+
+## CPU, networking and Cloud SQL
+
+**Billing.** `billing: request-based` (the default) allocates CPU only while
+requests are handled; `instance-based` allocates it for the instance's whole
+life (background work, OpenTelemetry exporters) and is billed that way. It
+needs at least 1 CPU and 512Mi. runway sets it on every container.
+`startup_cpu_boost: true` gives more CPU while instances start and for 10
+seconds after (billed). Less than 1 CPU needs `concurrency: 1`,
+request-based billing and gen1.
+
+**Execution environment.** Without `execution_environment`, Cloud Run
+chooses. `gen2` (full Linux compatibility, faster CPU and network, slower cold
+starts) needs at least 512Mi; `gen1` (faster cold starts) cannot mount Cloud
+Storage volumes.
+
+**Direct VPC egress.** `vpc` connects the service to a VPC network without a
+connector. runway needs both `network` and `subnet`. A name alone is in the
+deployment project; in a Shared VPC, use full resource names in the host
+project. runway sends and compares full names, so moving to another host
+project is a change, even with the same network name. The
+subnet must be in the service region and is `/26` or larger in practice
+(Cloud Run uses about two addresses per instance). runway enables
+`compute.googleapis.com`. In a Shared VPC, the Cloud Run service agent
+(`service-PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com`)
+needs `roles/compute.networkUser` on the host project or subnet; runway does
+not grant it. `egress: all-traffic` sends everything through the VPC (a Cloud
+NAT is then needed for the internet).
+
+**Cloud SQL.** Each instance in `cloud_sql` is reachable through a Unix socket
+at `/cloudsql/PROJECT:REGION:INSTANCE` (the Cloud SQL Auth Proxy built into
+Cloud Run, public IP path). runway grants the runtime account
+`roles/cloudsql.client` in each instance's project (it allows connecting to
+every instance of that project) and enables `sqladmin.googleapis.com` in the
+deployment project; for an instance in another project, the Cloud SQL Admin
+API must be enabled there too. On gen1, only instances using the per-instance
+CA work. For private IP, use `vpc` and connect to the instance's address
+instead.
+
+**Custom audiences.** ID tokens whose audience is one of `custom_audiences`
+are accepted, besides the `run.app` URL (for a custom domain or a load
+balancer). This is a service setting: changing it creates no revision.
+runway owns it: audiences set outside runway are removed.
 
 ## Removing access
 

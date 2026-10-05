@@ -327,7 +327,34 @@ pub struct ServiceConfig {
     pub volumes: BTreeMap<String, VolumeConfig>,
     pub iap: IapConfig,
     pub identity: IdentityConfig,
+    /// `request-based` or `instance-based`.
+    pub billing: String,
+    pub startup_cpu_boost: bool,
+    /// `gen1` or `gen2`; `None`: Cloud Run chooses.
+    pub execution_environment: Option<String>,
+    pub vpc: Option<VpcConfig>,
+    /// Cloud SQL connection names (`PROJECT:REGION:INSTANCE`).
+    pub cloud_sql: Vec<String>,
+    pub custom_audiences: Vec<String>,
 }
+
+/// Direct VPC egress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VpcConfig {
+    pub network: String,
+    pub subnet: String,
+    /// `private-ranges-only` or `all-traffic`.
+    pub egress: String,
+    pub network_tags: Vec<String>,
+}
+
+pub const CLOUD_SQL_CLIENT_ROLE: &str = "roles/cloudsql.client";
+pub const BILLING_REQUEST: &str = "request-based";
+pub const BILLING_INSTANCE: &str = "instance-based";
+/// Where Cloud SQL sockets appear in the container (`/cloudsql/CONNECTION_NAME`).
+pub const CLOUD_SQL_MOUNT: &str = "/cloudsql";
+/// Volume name of the Cloud SQL connections.
+pub const CLOUD_SQL_VOLUME: &str = "cloudsql";
 
 /// A placeholder image that listens on $PORT, for `bootstrap.image`.
 pub const HELLO_IMAGE: &str = "us-docker.pkg.dev/cloudrun/container/hello";
@@ -1175,6 +1202,193 @@ pub fn resolve(
         );
     }
 
+    // ---- billing, execution environment, VPC, Cloud SQL, audiences ----
+    let memory_bytes = validate::parse_memory_bytes(&memory).unwrap_or(512 * 1024 * 1024);
+    let small_memory = memory_bytes < 512 * 1024 * 1024;
+    let fractional_cpu = cpu_millis < 1000;
+    if fractional_cpu && concurrency != 1 {
+        d.error(
+            "service.concurrency",
+            format!(
+                "with less than 1 CPU, Cloud Run requires `concurrency: 1` (got {concurrency})"
+            ),
+        );
+    }
+    let billing = match s!(billing) {
+        None => BILLING_REQUEST.to_string(),
+        Some((v, path)) => {
+            if v == BILLING_INSTANCE {
+                if small_memory {
+                    d.error(
+                        path.clone(),
+                        "instance-based billing needs at least 512Mi of memory",
+                    );
+                }
+                if fractional_cpu {
+                    d.error(path.clone(), "instance-based billing needs at least 1 CPU");
+                }
+            } else if v != BILLING_REQUEST {
+                d.error(
+                    path.clone(),
+                    format!("`{v}` must be `{BILLING_REQUEST}` or `{BILLING_INSTANCE}`"),
+                );
+            }
+            v
+        }
+    };
+    let startup_cpu_boost = s!(startup_cpu_boost).map(|(v, _)| v).unwrap_or(false);
+    let cloud_sql_v = s!(cloud_sql);
+    let execution_environment = match s!(execution_environment) {
+        None => {
+            // Cloud Storage volumes run on gen2, which Cloud Run picks for them.
+            if !volumes_out.is_empty() && fractional_cpu {
+                d.error(
+                    "service.cpu",
+                    "Cloud Storage volumes need the gen2 execution environment, which needs at least 1 CPU",
+                );
+            } else if !volumes_out.is_empty() && small_memory {
+                d.error(
+                    "service.memory",
+                    "Cloud Storage volumes need the gen2 execution environment, which needs at least 512Mi of memory",
+                );
+            }
+            None
+        }
+        Some((v, path)) => {
+            match v.as_str() {
+                "gen2" => {
+                    if small_memory {
+                        d.error(path.clone(), "gen2 needs at least 512Mi of memory");
+                    }
+                    if fractional_cpu {
+                        d.error(path.clone(), "less than 1 CPU needs gen1");
+                    }
+                }
+                "gen1" => {
+                    if !volumes_out.is_empty() {
+                        d.error(path.clone(), "Cloud Storage volumes need gen2");
+                    }
+                    if cloud_sql_v.as_ref().is_some_and(|(l, _)| !l.is_empty()) {
+                        d.warn(
+                            path.clone(),
+                            "on gen1, Cloud SQL connections only work with instances that use the per-instance CA (GOOGLE_MANAGED_INTERNAL_CA)",
+                        );
+                    }
+                }
+                _ => d.error(path.clone(), format!("`{v}` must be `gen1` or `gen2`")),
+            }
+            Some(v)
+        }
+    };
+    let vpc = s!(vpc).map(|(raw, path)| {
+        let network = ixs(&mut d, &raw.network, &format!("{path}.network"));
+        if let Err(e) = validate::vpc_network(&network) {
+            d.error(format!("{path}.network"), e);
+        }
+        let subnet = ixs(&mut d, &raw.subnet, &format!("{path}.subnet"));
+        if let Err(e) = validate::vpc_subnet(&subnet, &region) {
+            d.error(format!("{path}.subnet"), e);
+        }
+        let egress = raw.egress.unwrap_or_else(|| "private-ranges-only".into());
+        if !["private-ranges-only", "all-traffic"].contains(&egress.as_str()) {
+            d.error(
+                format!("{path}.egress"),
+                format!("`{egress}` must be `private-ranges-only` or `all-traffic`"),
+            );
+        }
+        let mut network_tags: Vec<String> = Vec::new();
+        for t in raw.network_tags.unwrap_or_default() {
+            if let Err(e) = validate::network_tag(&t) {
+                d.error(format!("{path}.network_tags"), e);
+            } else if network_tags.contains(&t) {
+                d.warn(
+                    format!("{path}.network_tags"),
+                    format!("`{t}` is listed twice"),
+                );
+            } else {
+                network_tags.push(t);
+            }
+        }
+        // Full names: a name alone is in the deployment project.
+        VpcConfig {
+            network: validate::full_network(&network, &project),
+            subnet: validate::full_subnet(&subnet, &project, &region),
+            egress,
+            network_tags,
+        }
+    });
+    let mut cloud_sql: Vec<String> = Vec::new();
+    let mut cloud_sql_projects: Vec<String> = Vec::new();
+    if let Some((list, path)) = cloud_sql_v {
+        for raw_name in list {
+            let n = ixs(&mut d, &raw_name, &path);
+            // An instance name alone: this project and region (like gcloud).
+            let n = if n.contains(':') {
+                n
+            } else {
+                format!("{project}:{region}:{n}")
+            };
+            match validate::cloud_sql_instance(&n) {
+                Err(e) => d.error(path.clone(), e),
+                Ok(_) if cloud_sql.contains(&n) => {
+                    d.warn(path.clone(), format!("`{n}` is listed twice"));
+                }
+                Ok(p) => {
+                    if !cloud_sql_projects.iter().any(|x| x == p) {
+                        cloud_sql_projects.push(p.to_string());
+                    }
+                    cloud_sql.push(n);
+                }
+            }
+        }
+    }
+    if !cloud_sql.is_empty() {
+        if let Some(name) = volumes_out.keys().find(|k| *k == CLOUD_SQL_VOLUME) {
+            d.error(
+                format!("service.volumes.{name}"),
+                format!("`{CLOUD_SQL_VOLUME}` is reserved for the Cloud SQL connections"),
+            );
+        }
+        let at_cloudsql = |p: &str| p == CLOUD_SQL_MOUNT || p.starts_with("/cloudsql/");
+        if let Some((name, _)) = volumes_out.iter().find(|(_, v)| at_cloudsql(&v.mount_path)) {
+            d.error(
+                format!("service.volumes.{name}.mount_path"),
+                format!("`{CLOUD_SQL_MOUNT}` is where the Cloud SQL connections are mounted"),
+            );
+        }
+        if let Some((key, _)) = secrets_out
+            .iter()
+            .find(|(_, s)| s.path.as_deref().is_some_and(at_cloudsql))
+        {
+            d.error(
+                format!("service.secrets.{key}.path"),
+                format!("`{CLOUD_SQL_MOUNT}` is where the Cloud SQL connections are mounted"),
+            );
+        }
+    }
+    let mut custom_audiences: Vec<String> = Vec::new();
+    if let Some((list, path)) = s!(custom_audiences) {
+        for a in list {
+            let a = ixs(&mut d, &a, &path);
+            if a.is_empty() || a.chars().any(char::is_whitespace) {
+                d.error(
+                    path.clone(),
+                    format!("audience `{a}` must be non-empty, without spaces"),
+                );
+            } else if custom_audiences.contains(&a) {
+                d.warn(path.clone(), format!("`{a}` is listed twice"));
+            } else {
+                custom_audiences.push(a);
+            }
+        }
+        if serde_json::to_string(&custom_audiences).map_or(0, |j| j.len()) > 32_768 {
+            d.error(
+                path,
+                "the audiences exceed Cloud Run's limit (32,768 characters as JSON)",
+            );
+        }
+    }
+
     // ---- sidecars ----
     let app_port = port;
     let mut sidecars_out = BTreeMap::new();
@@ -1462,6 +1676,16 @@ pub fn resolve(
 
     // The collector's exporters need these roles on the deployment project.
     let mut identity = identity;
+    // Cloud SQL connections need the client role in each instance's project.
+    for p in &cloud_sql_projects {
+        let b = RoleBinding {
+            role: CLOUD_SQL_CLIENT_ROLE.to_string(),
+            target: RoleTarget::Project { project: p.clone() },
+        };
+        if !identity.roles.contains(&b) {
+            identity.roles.push(b);
+        }
+    }
     if otel_collector.is_some() {
         for role in OTEL_COLLECTOR_ROLES {
             let b = RoleBinding {
@@ -1529,6 +1753,12 @@ pub fn resolve(
                 volumes: volumes_out,
                 iap,
                 identity,
+                billing,
+                startup_cpu_boost,
+                execution_environment,
+                vpc,
+                cloud_sql,
+                custom_audiences,
             },
             retry,
             apis: ApisConfig {

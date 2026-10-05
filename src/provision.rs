@@ -466,6 +466,12 @@ pub fn required_apis(d: &Deployment) -> Vec<String> {
         add("iap.googleapis.com");
         add("cloudresourcemanager.googleapis.com");
     }
+    if d.service.vpc.is_some() {
+        add("compute.googleapis.com");
+    }
+    if !d.service.cloud_sql.is_empty() {
+        add("sqladmin.googleapis.com");
+    }
     if d.service.otel_collector.is_some() {
         add("cloudtrace.googleapis.com");
         add("monitoring.googleapis.com");
@@ -3420,6 +3426,25 @@ stages: { prod: {} }
             assert!(apis.contains(&a.to_string()), "{a} missing from {apis:?}");
         }
         assert!(!apis.contains(&"secretmanager.googleapis.com".to_string()));
+        assert!(!apis.contains(&"compute.googleapis.com".to_string()));
+        assert!(!apis.contains(&"sqladmin.googleapis.com".to_string()));
+        let (_dir, mut networked) = deployment(FULL);
+        networked.service.vpc = Some(crate::config::VpcConfig {
+            network: "default".into(),
+            subnet: "default".into(),
+            egress: "private-ranges-only".into(),
+            network_tags: vec![],
+        });
+        networked.service.cloud_sql = vec!["p:europe-west1:db".into()];
+        let apis = required_apis(&networked);
+        assert!(
+            apis.contains(&"compute.googleapis.com".to_string()),
+            "Direct VPC"
+        );
+        assert!(
+            apis.contains(&"sqladmin.googleapis.com".to_string()),
+            "Cloud SQL"
+        );
         let (_dir, mut off) = deployment(FULL);
         off.apis.enable = false;
         assert!(api_step(&off).is_none(), "nothing is enabled unless asked");

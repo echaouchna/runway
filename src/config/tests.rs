@@ -1112,3 +1112,209 @@ fn sidecars_resolve_validate_and_override() {
         .collect();
     err(&many, "service.sidecars", "at most 10");
 }
+
+/// FULL with extra `service:` lines (indented under `service:`).
+fn full_with(service_extra: &str) -> String {
+    FULL.replacen(
+        "  service_account: runtime@my-gcp-project.iam.gserviceaccount.com\n",
+        &format!(
+            "  service_account: runtime@my-gcp-project.iam.gserviceaccount.com\n{service_extra}"
+        ),
+        1,
+    )
+}
+
+#[test]
+fn networking_billing_and_cloud_sql_resolve() {
+    let (_d, cfg) = load_str(&full_with(
+        r#"  billing: instance-based
+  startup_cpu_boost: true
+  execution_environment: gen2
+  vpc:
+    network: projects/host-project/global/networks/shared
+    subnet: projects/host-project/regions/europe-west1/subnetworks/run
+    egress: all-traffic
+    network_tags: [run-egress]
+  cloud_sql: [db, other-project:europe-west4:reports]
+  custom_audiences: [https://api.example.com]
+"#,
+    ));
+    let s = resolve_ok(&cfg, "dev").deployment.service;
+    assert_eq!(s.billing, "instance-based");
+    assert!(s.startup_cpu_boost);
+    assert_eq!(s.execution_environment.as_deref(), Some("gen2"));
+    let vpc = s.vpc.unwrap();
+    assert_eq!(vpc.egress, "all-traffic");
+    assert_eq!(vpc.network_tags, ["run-egress"]);
+    assert_eq!(
+        s.cloud_sql,
+        [
+            "my-gcp-project:europe-west1:db",
+            "other-project:europe-west4:reports"
+        ],
+        "an instance name alone is in the deployment project and region"
+    );
+    assert_eq!(s.custom_audiences, ["https://api.example.com"]);
+    let client = |p: &str| RoleBinding {
+        role: CLOUD_SQL_CLIENT_ROLE.into(),
+        target: RoleTarget::Project { project: p.into() },
+    };
+    assert!(s.identity.roles.contains(&client("my-gcp-project")));
+    assert!(s.identity.roles.contains(&client("other-project")));
+}
+
+#[test]
+fn networking_defaults_leave_cloud_run_defaults() {
+    let (_d, cfg) = load_str(FULL);
+    let s = resolve_ok(&cfg, "dev").deployment.service;
+    assert_eq!(s.billing, "request-based");
+    assert!(!s.startup_cpu_boost);
+    assert_eq!(s.execution_environment, None);
+    assert!(s.vpc.is_none() && s.cloud_sql.is_empty() && s.custom_audiences.is_empty());
+}
+
+#[test]
+fn billing_and_execution_environment_follow_cloud_run_rules() {
+    let (_d, cfg) = load_str(
+        &full_with("  billing: instance-based\n  memory: 256Mi\n").replace("  memory: 512Mi\n", ""),
+    );
+    let e = resolve_err(&cfg, "dev");
+    assert!(has_error(&e, "service.billing", "512Mi"), "{e:#?}");
+
+    let (_d, cfg) = load_str(
+        &FULL
+            .replace("  cpu: \"1\"\n", "  cpu: \"0.5\"\n")
+            .replace("  memory: 512Mi\n", "  memory: 256Mi\n")
+            .replace(
+                "  service_account: runtime@",
+                "  execution_environment: gen2\n  billing: instance-based\n  service_account: runtime@",
+            ),
+    );
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "service.concurrency", "concurrency: 1"),
+        "{e:#?}"
+    );
+    assert!(has_error(&e, "service.billing", "at least 1 CPU"), "{e:#?}");
+    assert!(
+        has_error(&e, "service.execution_environment", "gen1"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.execution_environment", "512Mi"),
+        "{e:#?}"
+    );
+
+    let (_d, cfg) = load_str(&full_with(
+        "  execution_environment: gen1\n  volumes:\n    data:\n      bucket: my-bucket\n      mount_path: /data\n",
+    ));
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "service.execution_environment", "gen2"),
+        "{e:#?}"
+    );
+
+    let (_d, cfg) = load_str(&full_with(
+        "  execution_environment: gen3\n  billing: always\n",
+    ));
+    let e = resolve_err(&cfg, "dev");
+    assert!(has_error(
+        &e,
+        "service.execution_environment",
+        "`gen1` or `gen2`"
+    ));
+    assert!(has_error(
+        &e,
+        "service.billing",
+        "`request-based` or `instance-based`"
+    ));
+}
+
+#[test]
+fn vpc_cloud_sql_and_audiences_are_validated() {
+    let (_d, cfg) = load_str(&full_with(
+        r#"  vpc:
+    network: Bad_Name
+    subnet: projects/host-project/regions/us-central1/subnetworks/run
+    egress: everything
+    network_tags: [Not-Valid]
+  cloud_sql: ["my-gcp-project:db"]
+  custom_audiences: ["has space"]
+  volumes:
+    cloudsql:
+      bucket: my-bucket
+      mount_path: /cloudsql
+"#,
+    ));
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "service.vpc.network", "not a valid network name"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.vpc.subnet", "service region `europe-west1`"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.vpc.egress", "private-ranges-only"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.vpc.network_tags", "network tag"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.cloud_sql", "PROJECT:REGION:INSTANCE"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.custom_audiences", "without spaces"),
+        "{e:#?}"
+    );
+
+    // A valid connection with a clashing volume name and mount path.
+    let (_d, cfg) = load_str(&full_with(
+        "  cloud_sql: [db]\n  volumes:\n    cloudsql:\n      bucket: my-bucket\n      mount_path: /cloudsql\n",
+    ));
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "service.volumes.cloudsql", "reserved"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.volumes.cloudsql.mount_path", "Cloud SQL"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn a_stage_vpc_block_replaces_the_inherited_one() {
+    let yaml = full_with(
+        "  vpc:\n    network: default\n    subnet: default\n    network_tags: [a]\n",
+    )
+    .replace(
+        "  prod:\n    service:\n      min_instances: 1\n",
+        "  prod:\n    service:\n      min_instances: 1\n      vpc:\n        network: prod-net\n        subnet: prod-subnet\n",
+    );
+    let (_d, cfg) = load_str(&yaml);
+    let dev = resolve_ok(&cfg, "dev").deployment.service.vpc.unwrap();
+    assert_eq!(
+        (dev.network.as_str(), dev.network_tags.len()),
+        ("projects/my-gcp-project/global/networks/default", 1),
+        "a name alone is in the deployment project"
+    );
+    assert_eq!(
+        dev.subnet,
+        "projects/my-gcp-project/regions/europe-west1/subnetworks/default"
+    );
+    let prod = resolve_ok(&cfg, "prod").deployment.service.vpc.unwrap();
+    assert_eq!(
+        prod.network,
+        "projects/my-gcp-project/global/networks/prod-net"
+    );
+    assert!(
+        prod.network_tags.is_empty(),
+        "the stage block replaces, not merges"
+    );
+    assert_eq!(prod.egress, "private-ranges-only");
+}

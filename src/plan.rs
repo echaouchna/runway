@@ -36,6 +36,16 @@ pub struct ServiceSpec {
     pub volumes: BTreeMap<String, crate::config::VolumeConfig>,
     /// Identity-Aware Proxy on the service.
     pub iap_enabled: bool,
+    /// `request-based` or `instance-based`.
+    pub billing: String,
+    pub startup_cpu_boost: bool,
+    /// `gen1` or `gen2`; `None`: Cloud Run chooses.
+    pub execution_environment: Option<String>,
+    pub vpc: Option<crate::config::VpcConfig>,
+    /// Cloud SQL connection names.
+    pub cloud_sql: Vec<String>,
+    /// Service-level: extra accepted ID token audiences.
+    pub custom_audiences: Vec<String>,
     /// Service-level annotations (not diffed).
     pub annotations: BTreeMap<String, String>,
     /// Revision-template annotations (not diffed); used to force a new revision.
@@ -91,6 +101,12 @@ impl ServiceSpec {
             labels: d.labels(),
             volumes: s.volumes.clone(),
             iap_enabled: s.iap.enabled,
+            billing: s.billing.clone(),
+            startup_cpu_boost: s.startup_cpu_boost,
+            execution_environment: s.execution_environment.clone(),
+            vpc: s.vpc.clone(),
+            cloud_sql: s.cloud_sql.clone(),
+            custom_audiences: s.custom_audiences.clone(),
             annotations,
             revision_annotations: BTreeMap::new(),
             traffic: TrafficSpec::default(),
@@ -169,6 +185,25 @@ impl ServiceSpec {
         if self.iap_enabled {
             m.insert("iap".into(), "enabled".into());
         }
+        m.insert("billing".into(), self.billing.clone());
+        if self.startup_cpu_boost {
+            m.insert("startup_cpu_boost".into(), "enabled".into());
+        }
+        if let Some(e) = &self.execution_environment {
+            m.insert("execution_environment".into(), e.clone());
+        }
+        if let Some(v) = &self.vpc {
+            m.insert("vpc".into(), vpc_display(v));
+        }
+        if !self.cloud_sql.is_empty() {
+            m.insert("cloud_sql".into(), list_display(&self.cloud_sql));
+        }
+        if !self.custom_audiences.is_empty() {
+            m.insert(
+                "custom_audiences".into(),
+                list_display(&self.custom_audiences),
+            );
+        }
         if let Some(hc) = &self.health_check {
             m.insert(
                 "health_check.startup".into(),
@@ -180,6 +215,36 @@ impl ServiceSpec {
         }
         m
     }
+}
+
+/// `network N, subnet S, egress E[, tags a b]` (desired and observed), with
+/// full resource names: in a Shared VPC, the host project is part of what
+/// is compared.
+pub fn vpc_display(v: &crate::config::VpcConfig) -> String {
+    let name = |p: &str| {
+        p.strip_prefix("https://www.googleapis.com/compute/v1/")
+            .unwrap_or(p)
+            .to_string()
+    };
+    let mut out = format!(
+        "network {}, subnet {}, egress {}",
+        name(&v.network),
+        name(&v.subnet),
+        v.egress
+    );
+    if !v.network_tags.is_empty() {
+        let mut tags = v.network_tags.clone();
+        tags.sort();
+        out.push_str(&format!(", tags {}", tags.join(" ")));
+    }
+    out
+}
+
+/// Sorted, comma-separated: the order of these lists carries no meaning.
+pub fn list_display(items: &[String]) -> String {
+    let mut v = items.to_vec();
+    v.sort();
+    v.join(", ")
 }
 
 /// `IMAGE, cpu C, memory M, config <hash>` for the collector sidecar (desired and observed).
@@ -804,6 +869,12 @@ mod tests {
                 volumes: BTreeMap::new(),
                 iap: Default::default(),
                 identity: Default::default(),
+                billing: crate::config::BILLING_REQUEST.into(),
+                startup_cpu_boost: false,
+                execution_environment: None,
+                vpc: None,
+                cloud_sql: Vec::new(),
+                custom_audiences: Vec::new(),
             },
             retry: Default::default(),
             apis: Default::default(),

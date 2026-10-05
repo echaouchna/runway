@@ -330,6 +330,124 @@ pub fn container_name(n: &str) -> Result<(), String> {
     }
 }
 
+/// A Compute Engine resource name (RFC 1035: networks, subnets, tags).
+fn rfc1035(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 63
+        && n.starts_with(|c: char| c.is_ascii_lowercase())
+        && !n.ends_with('-')
+        && n.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A VPC network: a name, or `projects/HOST/global/networks/NAME`.
+pub fn vpc_network(n: &str) -> Result<(), String> {
+    let name = match n.strip_prefix("projects/") {
+        None => n,
+        Some(rest) => match rest.split('/').collect::<Vec<_>>()[..] {
+            [p, "global", "networks", name] if !p.is_empty() => name,
+            _ => {
+                return Err(format!(
+                    "`{n}` must be a network name or projects/HOST_PROJECT/global/networks/NAME"
+                ));
+            }
+        },
+    };
+    if rfc1035(name) {
+        Ok(())
+    } else {
+        Err(format!("`{name}` is not a valid network name"))
+    }
+}
+
+/// A subnet: a name, or `projects/HOST/regions/REGION/subnetworks/NAME` in
+/// the service's region.
+pub fn vpc_subnet(n: &str, region: &str) -> Result<(), String> {
+    let name = match n.strip_prefix("projects/") {
+        None => n,
+        Some(rest) => match rest.split('/').collect::<Vec<_>>()[..] {
+            [p, "regions", r, "subnetworks", name] if !p.is_empty() => {
+                if r != region {
+                    return Err(format!(
+                        "the subnet is in `{r}`; Direct VPC needs a subnet in the service region `{region}`"
+                    ));
+                }
+                name
+            }
+            _ => {
+                return Err(format!(
+                    "`{n}` must be a subnet name or projects/HOST_PROJECT/regions/REGION/subnetworks/NAME"
+                ));
+            }
+        },
+    };
+    if rfc1035(name) {
+        Ok(())
+    } else {
+        Err(format!("`{name}` is not a valid subnet name"))
+    }
+}
+
+/// `projects/PROJECT/global/networks/NAME` for a network name in `project`;
+/// full names are kept (the project is part of a network's identity).
+pub fn full_network(n: &str, project: &str) -> String {
+    match n.starts_with("projects/") {
+        true => n.to_string(),
+        false => format!("projects/{project}/global/networks/{n}"),
+    }
+}
+
+/// `projects/PROJECT/regions/REGION/subnetworks/NAME` for a subnet name.
+pub fn full_subnet(n: &str, project: &str, region: &str) -> String {
+    match n.starts_with("projects/") {
+        true => n.to_string(),
+        false => format!("projects/{project}/regions/{region}/subnetworks/{n}"),
+    }
+}
+
+pub fn network_tag(t: &str) -> Result<(), String> {
+    if rfc1035(t) {
+        Ok(())
+    } else {
+        Err(format!(
+            "network tag `{t}` must start with a lowercase letter and contain only lowercase letters, digits and `-` (max 63)"
+        ))
+    }
+}
+
+/// A Cloud SQL connection name `PROJECT:REGION:INSTANCE`; the project may be
+/// domain-scoped (`example.com:my-project`). Returns the project.
+pub fn cloud_sql_instance(n: &str) -> Result<&str, String> {
+    let err = || {
+        format!(
+            "`{n}` must be PROJECT:REGION:INSTANCE (for example my-gcp-project:europe-west1:db)"
+        )
+    };
+    let mut parts = n.rsplitn(3, ':');
+    let (instance, region, project) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(i), Some(r), Some(p)) => (i, r, p),
+        _ => return Err(err()),
+    };
+    let region_ok = !region.is_empty()
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if project.is_empty() || !region_ok || !rfc1035_long(instance) {
+        return Err(err());
+    }
+    Ok(project)
+}
+
+/// Like [`rfc1035`], up to 98 characters (Cloud SQL instance IDs).
+fn rfc1035_long(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 98
+        && n.starts_with(|c: char| c.is_ascii_lowercase())
+        && !n.ends_with('-')
+        && n.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 pub fn volume_name(n: &str) -> Result<(), String> {
     let ok = !n.is_empty()
         && n.len() <= 63
