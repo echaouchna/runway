@@ -5,9 +5,10 @@ keys or custom credential store are involved.
 
 ## Container image
 
-The public image is `ghcr.io/echaouchna/runway:edge` (Debian with git, curl
-and CA certificates, non-root user, `runway` on `PATH`, no `ENTRYPOINT` so CI
-`script:` blocks work). It can be pulled without signing in:
+The public image is `ghcr.io/echaouchna/runway:edge` (Debian 13 slim with
+git, curl and CA certificates, non-root user, `runway` on `PATH`, no
+`ENTRYPOINT` so CI `script:` blocks work). It has no ssh client: clone over
+HTTPS (GitLab's `$CI_REPOSITORY_URL` is). It can be pulled without signing in:
 
 ```sh
 docker run --rm -v "$PWD:/workspace" \

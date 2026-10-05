@@ -31,6 +31,11 @@ migration notes.
 
 ### Changed
 
+- Smaller container image: `debian:trixie-slim` with only git, curl and CA
+  certificates, instead of `buildpack-deps:trixie-scm` (which also shipped
+  Mercurial, Subversion, wget, gnupg and an ssh client): about 230 MB instead
+  of 404 MB. Clone over HTTPS in jobs using the image. Building the arm64
+  image now uses QEMU emulation for the package install.
 - **Authoritative access on what runway owns.** After a main deploy that
   serves all traffic, runway removes what `runway.yaml` does not list, whoever
   added it: IAP members on the service's IAP resource, tags bound directly to
