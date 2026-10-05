@@ -28,8 +28,11 @@ of everything that determines the image:
 
 If an image with that tag already exists, the build is skipped (config-only
 changes and promotions to another stage reuse it). The base images are
-recorded on the release (`runway.dev/base-images`), and `plan` explains a
-rebuild caused by a base image update. `service.rebuild: always` (or
+recorded on the release (`runway.dev/base-images`), and `plan` and
+`deploy` say why a build runs, for example `source unchanged; base image
+gcr.io/buildpacks/builder:latest changed upstream (ee028b481db02743 ->
+1c5d6ecf8b0d4e65)`. The buildpacks builder `latest` is republished often, so
+expect such rebuilds even when your code did not change. `service.rebuild: always` (or
 `--force-build`) rebuilds on every deploy. Not detected: dependencies that are
 not pinned (no lockfile) and files excluded by `.runwayignore`.
 
@@ -117,9 +120,10 @@ what is missing, and is retried per the `retry` policy):
    requires for `allUsers` is in place first).
 11. IAP: make sure the IAP service agent exists and can invoke the service;
     grant `roles/iap.httpsResourceAccessor` to `iap.members`.
-12. Main deploys only, once one revision serves all traffic: revoke what
-    runway granted earlier but `runway.yaml` no longer lists (IAP members,
-    runtime roles, adders; see
+12. Main deploys only, once one revision serves all traffic: remove what
+    `runway.yaml` does not list on what runway owns (IAP members, tags bound
+    to the service, adders of its secrets, roles of its runtime account),
+    and revoke what runway granted earlier elsewhere (see
     [Removing access](configuration.md#removing-access)). Then record on the
     service what runway granted (also done right after provisioning, so a
     failed build or rollout loses nothing).

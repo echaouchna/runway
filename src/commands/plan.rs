@@ -22,8 +22,8 @@ use crate::plan::{
 };
 use crate::poll::PollConfig;
 use crate::provision::{
-    ANNOTATION_GRANTS, Provisioner, StepCheck, StepState, all_steps, managed_grants,
-    recorded_grants, revoke_steps,
+    ANNOTATION_GRANTS, Provisioner, Step, StepCheck, StepState, all_steps, managed_grants,
+    merge_removals, recorded_grants, revoke_steps,
 };
 use google_cloud_run_v2::client::{Revisions, Services};
 use std::collections::BTreeMap;
@@ -62,6 +62,19 @@ pub fn build_target(
     );
     let tagged = format!("{name}:{}", naming::build_image_tag(sha256));
     (name, tagged)
+}
+
+/// A removal found by [`Provisioner::unlisted`]: pending by construction.
+fn unlisted_check(step: &Step, d: &Deployment) -> StepCheck {
+    let detail = match step {
+        Step::Revoke(g) => format!("not in runway.yaml: revoke from {}", g.member),
+        _ => "not in service.tags: unbind".into(),
+    };
+    StepCheck {
+        step: step.describe(d),
+        state: StepState::PendingRemoval,
+        detail,
+    }
 }
 
 pub async fn decide_image(
@@ -476,7 +489,12 @@ pub async fn compute(
     let service_exists = matches!(live_exists, Some(true));
     let steps: Vec<StepCheck> = match provisioner {
         Some(prov) => {
-            let (late, revoked) = tokio::join!(
+            // Access and tags runway.yaml does not list are removed by a main
+            // deploy, on a service runway owns.
+            let authoritative = service_exists
+                && *mode == crate::traffic::Mode::Full
+                && action != ServiceAction::Conflict;
+            let (late, revoked, unlisted) = tokio::join!(
                 futures::future::join_all(
                     all_steps
                         .iter()
@@ -484,7 +502,37 @@ pub async fn compute(
                         .map(|s| prov.check(s, service_exists)),
                 ),
                 futures::future::join_all(revokes.iter().map(|s| prov.check(s, service_exists))),
+                async {
+                    match authoritative {
+                        true => Some(prov.unlisted(&recorded).await),
+                        false => None,
+                    }
+                },
             );
+            let unlisted: Vec<StepCheck> = match unlisted {
+                None => Vec::new(),
+                Some(found) => {
+                    let mut checks: Vec<StepCheck> = merge_removals(revokes.clone(), found.steps)
+                        .into_iter()
+                        .skip(revokes.len())
+                        .map(|s| unlisted_check(&s, d))
+                        .collect();
+                    for what in found.unchecked {
+                        notes.push(format!(
+                            "could not check for access runway.yaml does not list ({what})"
+                        ));
+                        checks.push(StepCheck {
+                            step: format!(
+                                "remove {} runway.yaml does not list",
+                                what.split(':').next().unwrap_or("access")
+                            ),
+                            state: StepState::Unknown,
+                            detail: "not checked".into(),
+                        });
+                    }
+                    checks
+                }
+            };
             let (mut early, mut late) = (early_checks.into_iter(), late.into_iter());
             all_steps
                 .iter()
@@ -496,6 +544,7 @@ pub async fn compute(
                     }
                 })
                 .chain(revoked)
+                .chain(unlisted)
                 .collect()
         }
         None => all_steps

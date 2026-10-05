@@ -19,7 +19,7 @@ use crate::plan::{ImagePlan, ServiceSpec, diff};
 use crate::poll::PollConfig;
 use crate::provision::{
     ANNOTATION_GRANTS, Provisioner, StepOutcome, StepResult, api_step, encode_grants, grant_record,
-    managed_grants, post_steps, pre_steps, recorded_grants, revoke_steps,
+    managed_grants, merge_removals, post_steps, pre_steps, recorded_grants, revoke_steps,
 };
 use crate::retry::{RetryConfig, with_retry};
 use futures::TryFutureExt;
@@ -319,6 +319,24 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
             source.files,
             naming::short_hash(&source.sha256)
         ));
+        if args.force_build {
+            p.info("rebuilding: --force-build");
+        } else if cfg.rebuild_always {
+            p.info("rebuilding: `rebuild: always`");
+        } else {
+            let deployed = |key: &str| {
+                existing
+                    .as_ref()
+                    .and_then(|svc| svc.annotations.get(key))
+                    .map(String::as_str)
+            };
+            p.info(crate::build::inputs::rebuild_reason(
+                deployed(naming::ANNOTATION_SOURCE_HASH),
+                deployed(naming::ANNOTATION_BASE_IMAGES),
+                &source.sha256,
+                &source.bases,
+            ));
+        }
         let builder = Builder {
             cloudbuild: &cloudbuild,
             uploader: &storage,
@@ -524,10 +542,20 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
             revokes.len()
         ));
     }
+    // Plus access and tags runway.yaml does not list, on what runway owns.
+    let removals = if revoke_now {
+        let unlisted = provisioner.unlisted(&recorded).await;
+        for what in &unlisted.unchecked {
+            p.warn(format!("could not check for {what}; nothing removed there"));
+        }
+        merge_removals(revokes.clone(), unlisted.steps)
+    } else {
+        Vec::new()
+    };
     let remaining: Vec<_> = post_steps(d)
         .into_iter()
         .filter(|s| !done_tags.contains(&s.describe(d)))
-        .chain(revokes.iter().filter(|_| revoke_now).cloned())
+        .chain(removals)
         .collect();
     match provisioner.apply_all(&remaining, &retry, p, &report).await {
         Ok(done) => steps.extend(done),
