@@ -8,8 +8,10 @@
 # Colors need a terminal: `docker run -t` (or RUNWAY_COLOR=always).
 #
 # The build stage always runs on the build machine's own platform and
-# cross-compiles for the target, so a multi-platform build needs no emulation
-# (and no arm64 runner). The final stage runs no commands either.
+# cross-compiles for the target. Only the final stage's package install runs
+# on the target platform: a multi-platform build needs QEMU for it (a minute or
+# two), set up with `docker run --privileged --rm tonistiigi/binfmt --install all`
+# locally or docker/setup-qemu-action in CI.
 #
 # The image has no ENTRYPOINT so CI systems (GitLab `image:`, GitHub `container:`)
 # can run shell scripts in it; `runway` is on PATH.
@@ -30,8 +32,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends $packages; \
-    rm -rf /var/lib/apt/lists/*; \
-    useradd --create-home --uid 10001 runway
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
@@ -55,12 +56,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --profile dist --locked --bin runway --target "$target"; \
     cp "target/$target/dist/runway" /usr/local/bin/runway
 
-# git (for `runway preview prune`), curl and the CA bundle come from this
-# official Debian image. No RUN here: a cross-platform build needs no
-# emulation. The user entry and its home directory come from the build stage.
-FROM buildpack-deps:trixie-scm
-COPY --from=build /etc/passwd /etc/group /etc/
-COPY --from=build --chown=10001:10001 /home/runway /home/runway
+# Debian slim with what runway and CI scripts need: git (for `runway preview
+# prune`), curl and the CA bundle. No recommended packages (no Perl extras,
+# no ssh: CI clones over HTTPS).
+FROM debian:trixie-slim
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl git; \
+    rm -rf /var/lib/apt/lists/*; \
+    useradd --create-home --uid 10001 runway
 COPY --from=build /usr/local/bin/runway /usr/local/bin/runway
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 USER runway
