@@ -627,6 +627,14 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
             items: network,
         });
     }
+    if s.sandbox {
+        out.push(Section {
+            title: "Sandboxes".into(),
+            items: vec![
+                "The app can run untrusted code with `/usr/local/gcp/bin/sandbox` (Cloud Run sandboxes, preview). Sandboxes share the app container's CPU and memory, cannot read its environment variables, secrets or the metadata server, and have no network access unless started with `--allow-egress`.".into(),
+            ],
+        });
+    }
 
     let apis = required_apis(d);
     out.push(Section {

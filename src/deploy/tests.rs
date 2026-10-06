@@ -175,6 +175,7 @@ impl google_cloud_run_v2::stub::Services for FakeRun {
                 "client_version" => next.client_version = incoming.client_version.clone(),
                 "iap_enabled" => next.iap_enabled = incoming.iap_enabled,
                 "custom_audiences" => next.custom_audiences = incoming.custom_audiences.clone(),
+                "launch_stage" => next.launch_stage = incoming.launch_stage.clone(),
                 other => panic!("unexpected mask path {other}"),
             }
         }
@@ -262,6 +263,7 @@ fn spec(image: &str) -> ServiceSpec {
         billing: crate::config::BILLING_REQUEST.into(),
         startup_cpu_boost: false,
         execution_environment: None,
+        sandbox: false,
         vpc: None,
         cloud_sql: Vec::new(),
         custom_audiences: Vec::new(),

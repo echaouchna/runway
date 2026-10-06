@@ -204,6 +204,7 @@ fn spec() -> ServiceSpec {
         billing: runway::config::BILLING_REQUEST.into(),
         startup_cpu_boost: false,
         execution_environment: None,
+        sandbox: false,
         vpc: None,
         cloud_sql: Vec::new(),
         custom_audiences: Vec::new(),
@@ -239,7 +240,7 @@ async fn cloud_run_update_sends_mask_etag_and_template() {
         .and(path(svc_path.clone()))
         .and(query_param(
             "updateMask",
-            "labels,annotations,client,clientVersion,customAudiences,ingress,invokerIamDisabled,iapEnabled,template,traffic",
+            "labels,annotations,client,clientVersion,customAudiences,ingress,invokerIamDisabled,iapEnabled,launchStage,template,traffic",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "name": "projects/p/locations/europe-west1/operations/op-1"
@@ -382,6 +383,7 @@ async fn cloud_run_create_uses_service_id_and_parent() {
     });
     spec.cloud_sql = vec!["p:europe-west1:db".into()];
     spec.custom_audiences = vec!["https://api.example.com".into()];
+    spec.sandbox = true;
     let applied = rec
         .apply(
             &Target {
@@ -439,6 +441,12 @@ async fn cloud_run_create_uses_service_id_and_parent() {
     // Instance-based: cpuIdle false is the proto default, so it is omitted.
     assert!(c["resources"].get("cpuIdle").is_none_or(|v| v == false));
     assert_eq!(c["resources"]["startupCpuBoost"], true);
+    // Not in the SDK yet: sent through its unknown-field passthrough.
+    assert_eq!(c["sandboxLauncher"], true);
+    assert_eq!(
+        b["launchStage"],
+        json!(google_cloud_api::model::LaunchStage::Beta.value().unwrap())
+    );
 }
 
 /// A revision as Cloud Run reports it, created from `spec`'s template.

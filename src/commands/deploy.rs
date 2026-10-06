@@ -786,6 +786,7 @@ pub fn bootstrap_spec(
         billing: crate::config::BILLING_REQUEST.into(),
         startup_cpu_boost: false,
         execution_environment: None,
+        sandbox: false,
         vpc: None,
         cloud_sql: Vec::new(),
         custom_audiences: Vec::new(),

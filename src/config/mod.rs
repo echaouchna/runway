@@ -332,6 +332,8 @@ pub struct ServiceConfig {
     pub startup_cpu_boost: bool,
     /// `gen1` or `gen2`; `None`: Cloud Run chooses.
     pub execution_environment: Option<String>,
+    /// The app container may launch Cloud Run sandboxes.
+    pub sandbox: bool,
     pub vpc: Option<VpcConfig>,
     /// Cloud SQL connection names (`PROJECT:REGION:INSTANCE`).
     pub cloud_sql: Vec<String>,
@@ -1238,7 +1240,25 @@ pub fn resolve(
     };
     let startup_cpu_boost = s!(startup_cpu_boost).map(|(v, _)| v).unwrap_or(false);
     let cloud_sql_v = s!(cloud_sql);
+    let sandbox_v = s!(sandbox).filter(|(on, _)| *on);
     let execution_environment = match s!(execution_environment) {
+        // Sandboxes run on gen2: set it, so the plan says so.
+        None if sandbox_v.is_some() => {
+            let (_, path) = sandbox_v.as_ref().unwrap();
+            if small_memory {
+                d.error(
+                    path.clone(),
+                    "sandboxes run on gen2, which needs at least 512Mi of memory",
+                );
+            }
+            if fractional_cpu {
+                d.error(
+                    path.clone(),
+                    "sandboxes run on gen2, which needs at least 1 CPU",
+                );
+            }
+            Some("gen2".to_string())
+        }
         None => {
             // Cloud Storage volumes run on gen2, which Cloud Run picks for them.
             if !volumes_out.is_empty() && fractional_cpu {
@@ -1265,6 +1285,9 @@ pub fn resolve(
                     }
                 }
                 "gen1" => {
+                    if sandbox_v.is_some() {
+                        d.error(path.clone(), "sandboxes need gen2");
+                    }
                     if !volumes_out.is_empty() {
                         d.error(path.clone(), "Cloud Storage volumes need gen2");
                     }
@@ -1756,6 +1779,7 @@ pub fn resolve(
                 billing,
                 startup_cpu_boost,
                 execution_environment,
+                sandbox: sandbox_v.is_some(),
                 vpc,
                 cloud_sql,
                 custom_audiences,
