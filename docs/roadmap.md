@@ -7,9 +7,9 @@ upvote an issue if something matters to you.
 
 ## Next (0.2)
 
-- **More service options**: Serverless VPC Access connectors (Direct VPC
-  egress, custom audiences, billing, execution environment and Cloud SQL
-  connections are done), GPUs, NFS and in-memory volumes, session affinity.
+- **More service options**: Serverless VPC Access connectors, GPUs, NFS and
+  in-memory volumes, session affinity, manual scaling, and `cloudsql.client`
+  limited to the listed instances (IAM conditions).
 - **Several services per file** (for example an API and a web front end),
   sharing build, identity and secrets.
 - **Docker Compose**: deploy the `compose.yaml` you already run locally.
@@ -53,13 +53,27 @@ upvote an issue if something matters to you.
 
 ## Done since 0.1
 
+- Service options: Direct VPC egress (including Shared VPC), Cloud SQL
+  connections, custom audiences, `billing` and `startup_cpu_boost`,
+  `execution_environment`, and Cloud Run sandboxes (preview) for running
+  untrusted code.
 - Faster `deploy` and `plan`: independent steps run in waves, and a source
   build overlaps the provisioning it does not depend on.
 - No new revision or traffic change unless the URL a deploy targets really
   serves something different.
-- Grants removed from `runway.yaml` (IAP members, runtime roles, secret
-  adders) are revoked, limited to what runway recorded granting.
-- Colored `describe` output.
+- Access removed from `runway.yaml` is revoked after a main deploy that
+  serves all traffic. On what runway owns (IAP members, the service's tags,
+  adders of secrets it created, roles of a runtime account it created),
+  anything not listed is removed. Elsewhere, only what runway recorded
+  granting.
+- Billing fix: services now get request-based billing by default; they were
+  deployed with CPU always allocated.
+- `deploy` says why it builds (source change, base image updated upstream,
+  missing image).
+- `runway init` includes the common options as commented examples.
+- Smaller container image (`debian:trixie-slim`, about 230 MB).
+- Colored `describe` output; documentation at
+  [runway.echaouchna.dev](https://runway.echaouchna.dev/docs/).
 
 ## Done in 0.1
 

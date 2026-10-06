@@ -125,7 +125,9 @@ account.
 - Removing access: revocation of recorded grants, removal of access and tags
   `runway.yaml` does not list, and their timing (main deploys only).
 - Direct VPC egress, Cloud SQL connections, custom audiences, billing
-  (`billing`, `startup_cpu_boost`) and `execution_environment`.
+  (`billing`, `startup_cpu_boost`), `execution_environment` and `sandbox`
+  (including whether Cloud Run accepts `sandboxLauncher` sent through the v2
+  API with the `BETA` launch stage).
 - Reusing a matching revision on main deploys and canaries (seen live for
   previews only), and provisioning waves running in parallel.
 - Secrets: creation, adders, the stop-until-a-value step, version pinning,

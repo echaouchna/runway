@@ -61,6 +61,7 @@ service:
   billing: request-based      # request-based (default) | instance-based (CPU always allocated)
   startup_cpu_boost: false    # default false: more CPU while instances start
   # execution_environment: gen2   # gen1 | gen2; default: Cloud Run chooses
+  sandbox: false              # default false: Cloud Run sandboxes for untrusted code (preview, gen2)
   bootstrap: {}               # first deploy only: restricted ingress until `tags` are effective
     # ingress: internal       # default: ingress used until the tags are effective
     # image: us-docker.pkg.dev/cloudrun/container/hello   # optional placeholder instead of the real app
@@ -181,7 +182,7 @@ authentication or TLS proxy, a log forwarder.
 CPU is allocated per container: with request-based billing, sidecars only get
 CPU while requests are being served.
 
-## CPU, networking and Cloud SQL
+## CPU, sandboxes, networking and Cloud SQL
 
 **Billing.** `billing: request-based` (the default) allocates CPU only while
 requests are handled; `instance-based` allocates it for the instance's whole
@@ -195,6 +196,31 @@ request-based billing and gen1.
 chooses. `gen2` (full Linux compatibility, faster CPU and network, slower cold
 starts) needs at least 512Mi; `gen1` (faster cold starts) cannot mount Cloud
 Storage volumes.
+
+**Sandboxes (preview).** `sandbox: true` lets the app run untrusted code (code
+written by an AI agent, user scripts, a headless browser) in isolated
+sandboxes started with the `sandbox` command
+(`/usr/local/gcp/bin/sandbox`), for example
+`sandbox do -- /usr/bin/python3 script.py`. It is a single switch on the app
+container; everything else is chosen per sandbox, in the app's code:
+
+- network: none by default, `--allow-egress` to allow outbound traffic;
+- files: a read-only view of the container, `--write` for a temporary
+  overlay, `--mount type=bind,source=…,destination=…[,readonly]` to share a
+  directory, `--import-tar`, `--export-tar` and `--sync-tar` to keep files
+  between runs;
+- environment: nothing is inherited (no env vars, secrets or metadata
+  server); `--env NAME=value` passes variables;
+- lifetime: `sandbox do` runs one command; `sandbox run NAME --detach`,
+  `sandbox exec NAME`, `sandbox tar NAME` and `sandbox delete NAME` manage a
+  long-lived one.
+
+Sandboxes share the container's CPU and memory (size them for both; no extra
+charge) and run on gen2: runway sets `execution_environment: gen2` unless you
+set it, rejects `gen1`, and so needs at least 1 CPU and 512Mi. Since the
+feature is in preview, runway sets the service's launch stage to `BETA` while
+it is enabled. See [Code execution in Cloud
+Run](https://docs.cloud.google.com/run/docs/code-execution).
 
 **Direct VPC egress.** `vpc` connects the service to a VPC network without a
 connector. runway needs both `network` and `subnet`. A name alone is in the

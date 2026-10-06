@@ -1318,3 +1318,38 @@ fn a_stage_vpc_block_replaces_the_inherited_one() {
     );
     assert_eq!(prod.egress, "private-ranges-only");
 }
+
+#[test]
+fn sandboxes_run_on_gen2() {
+    let (_d, cfg) = load_str(&full_with("  sandbox: true\n"));
+    let s = resolve_ok(&cfg, "dev").deployment.service;
+    assert!(s.sandbox);
+    assert_eq!(
+        s.execution_environment.as_deref(),
+        Some("gen2"),
+        "set, so the plan shows it"
+    );
+
+    let (_d, cfg) = load_str(&full_with("  sandbox: false\n"));
+    let s = resolve_ok(&cfg, "dev").deployment.service;
+    assert!(!s.sandbox && s.execution_environment.is_none());
+
+    let (_d, cfg) = load_str(&full_with(
+        "  sandbox: true\n  execution_environment: gen1\n",
+    ));
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "service.execution_environment", "sandboxes need gen2"),
+        "{e:#?}"
+    );
+
+    let (_d, cfg) = load_str(
+        &full_with("  sandbox: true\n")
+            .replace("  cpu: \"1\"\n", "  cpu: \"0.5\"\n  concurrency: 1\n")
+            .replace("  concurrency: 80\n", "")
+            .replace("  memory: 512Mi\n", "  memory: 256Mi\n"),
+    );
+    let e = resolve_err(&cfg, "dev");
+    assert!(has_error(&e, "service.sandbox", "512Mi"), "{e:#?}");
+    assert!(has_error(&e, "service.sandbox", "at least 1 CPU"), "{e:#?}");
+}

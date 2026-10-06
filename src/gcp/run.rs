@@ -3,6 +3,7 @@
 use crate::config::SecretRef;
 use crate::naming;
 use crate::plan::{ServiceSpec, normalize_cpu, normalize_memory, secret_display};
+use google_cloud_api::model::LaunchStage;
 use google_cloud_run_v2::model::{
     CloudSqlInstance, Condition, Container, ContainerPort, EnvVar, EnvVarSource,
     ExecutionEnvironment, GCSVolumeSource, HTTPGetAction, IngressTraffic, Probe,
@@ -24,6 +25,7 @@ pub const UPDATE_MASK: &[&str] = &[
     "ingress",
     "invoker_iam_disabled",
     "iap_enabled",
+    "launch_stage",
     "template",
     "traffic",
 ];
@@ -190,12 +192,39 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
         .set_invoker_iam_disabled(false)
         .set_iap_enabled(spec.iap_enabled)
         .set_custom_audiences(spec.custom_audiences.clone())
+        .set_launch_stage(launch_stage(spec, existing))
         .set_template(template)
         .set_traffic(traffic_targets(&spec.traffic.entries));
     if let Some(e) = existing {
         svc = svc.set_name(name).set_etag(&e.etag);
     }
     svc
+}
+
+/// Sandboxes are a preview feature: the service must opt in to BETA.
+/// Otherwise the live value is kept (it may allow features set outside runway).
+fn launch_stage(spec: &ServiceSpec, existing: Option<&Service>) -> LaunchStage {
+    match (spec.sandbox, existing) {
+        (true, _) => LaunchStage::Beta,
+        (false, Some(e)) => e.launch_stage.clone(),
+        (false, None) => LaunchStage::default(),
+    }
+}
+
+/// `Container.sandboxLauncher` is in the Cloud Run v2 API but not yet in
+/// google-cloud-run-v2 (1.15). The SDK keeps fields it doesn't know and
+/// sends them back, so a JSON round trip sets it.
+fn with_sandbox_launcher(c: Container) -> Container {
+    let mut v = serde_json::to_value(&c).expect("a container serializes");
+    v["sandboxLauncher"] = true.into();
+    serde_json::from_value(v).expect("a container deserializes")
+}
+
+fn sandbox_launcher(c: &Container) -> bool {
+    serde_json::to_value(c)
+        .ok()
+        .and_then(|v| v.get("sandboxLauncher")?.as_bool())
+        .unwrap_or(false)
 }
 
 fn build_template(
@@ -277,6 +306,9 @@ fn containers(spec: &ServiceSpec, app: Container) -> Vec<Container> {
             r.set_cpu_idle(cpu_idle)
                 .set_startup_cpu_boost(spec.startup_cpu_boost),
         );
+    }
+    if spec.sandbox {
+        out[0] = with_sandbox_launcher(std::mem::take(&mut out[0]));
     }
     out
 }
@@ -922,6 +954,9 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
         if c.resources.as_ref().is_some_and(|r| r.startup_cpu_boost) {
             m.insert("startup_cpu_boost".into(), "enabled".into());
         }
+        if sandbox_launcher(c) {
+            m.insert("sandbox".into(), "enabled".into());
+        }
         m.insert(
             "cpu".into(),
             normalize_cpu(limits.get("cpu").map(String::as_str).unwrap_or("1")),
@@ -1201,6 +1236,7 @@ mod tests {
             billing: crate::config::BILLING_REQUEST.into(),
             startup_cpu_boost: false,
             execution_environment: None,
+            sandbox: false,
             vpc: None,
             cloud_sql: Vec::new(),
             custom_audiences: Vec::new(),
@@ -1997,6 +2033,61 @@ mod tests {
         }
         let changes = crate::plan::diff(&observed_flat(&svc), &s.flatten());
         assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    #[test]
+    fn sandboxes_are_enabled_on_the_app_container_only() {
+        let mut s = networked_spec();
+        s.sandbox = true;
+        let svc = desired_service(&s, "n", None);
+        assert_eq!(svc.launch_stage, LaunchStage::Beta, "a preview feature");
+        let t = svc.template.clone().unwrap();
+        let json = |c: &Container| serde_json::to_value(c).unwrap();
+        assert_eq!(json(&t.containers[0])["sandboxLauncher"], true);
+        assert_eq!(t.containers[0].name, APP_CONTAINER);
+        assert!(
+            t.containers[1..]
+                .iter()
+                .all(|c| json(c).get("sandboxLauncher").is_none())
+        );
+
+        let changes = crate::plan::diff(&observed_flat(&svc), &s.flatten());
+        assert!(changes.is_empty(), "{changes:?}");
+        let rev = revision_of(&t);
+        assert!(
+            revision_matches(&svc, &rev, &s),
+            "the field survives a revision read"
+        );
+
+        let mut off = s.clone();
+        off.sandbox = false;
+        let changes = crate::plan::diff(&observed_flat(&svc), &off.flatten());
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].field, "sandbox");
+        assert!(!revision_matches(&svc, &rev, &off));
+        // Turned off, the live launch stage is kept.
+        assert_eq!(
+            desired_service(&off, "n", Some(&svc)).launch_stage,
+            LaunchStage::Beta
+        );
+        assert_eq!(
+            desired_service(&off, "n", None).launch_stage,
+            LaunchStage::default()
+        );
+    }
+
+    #[test]
+    fn a_sandbox_launcher_reported_by_cloud_run_is_read() {
+        let svc: Service = serde_json::from_value(serde_json::json!({
+            "launchStage": "BETA",
+            "template": {"containers": [{
+                "image": "europe-west1-docker.pkg.dev/p/apps/hello@sha256:abc",
+                "sandboxLauncher": true
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(observed_flat(&svc)["sandbox"], "enabled");
+        assert_eq!(svc.launch_stage, LaunchStage::Beta);
     }
 
     #[test]

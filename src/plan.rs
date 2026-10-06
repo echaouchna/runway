@@ -41,6 +41,8 @@ pub struct ServiceSpec {
     pub startup_cpu_boost: bool,
     /// `gen1` or `gen2`; `None`: Cloud Run chooses.
     pub execution_environment: Option<String>,
+    /// The app container may launch Cloud Run sandboxes.
+    pub sandbox: bool,
     pub vpc: Option<crate::config::VpcConfig>,
     /// Cloud SQL connection names.
     pub cloud_sql: Vec<String>,
@@ -104,6 +106,7 @@ impl ServiceSpec {
             billing: s.billing.clone(),
             startup_cpu_boost: s.startup_cpu_boost,
             execution_environment: s.execution_environment.clone(),
+            sandbox: s.sandbox,
             vpc: s.vpc.clone(),
             cloud_sql: s.cloud_sql.clone(),
             custom_audiences: s.custom_audiences.clone(),
@@ -188,6 +191,9 @@ impl ServiceSpec {
         m.insert("billing".into(), self.billing.clone());
         if self.startup_cpu_boost {
             m.insert("startup_cpu_boost".into(), "enabled".into());
+        }
+        if self.sandbox {
+            m.insert("sandbox".into(), "enabled".into());
         }
         if let Some(e) = &self.execution_environment {
             m.insert("execution_environment".into(), e.clone());
@@ -872,6 +878,7 @@ mod tests {
                 billing: crate::config::BILLING_REQUEST.into(),
                 startup_cpu_boost: false,
                 execution_environment: None,
+                sandbox: false,
                 vpc: None,
                 cloud_sql: Vec::new(),
                 custom_audiences: Vec::new(),

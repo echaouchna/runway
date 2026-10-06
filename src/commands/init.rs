@@ -24,6 +24,7 @@ const OPTIONAL_SERVICE: &str = r#"
   # billing: instance-based                   # CPU always allocated (default: request-based)
   # startup_cpu_boost: true                   # more CPU while instances start
   # execution_environment: gen2               # gen1 or gen2 (default: Cloud Run chooses)
+  # sandbox: true                             # run untrusted code with `sandbox do` (preview, gen2)
   # identity:                                 # create the runtime account and grant it roles
   #   create: true
   #   roles:

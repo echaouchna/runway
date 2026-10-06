@@ -20,7 +20,10 @@ migration notes.
   - Cloud SQL connections with `cloud_sql` (socket at `/cloudsql/...`; the
     runtime account gets `roles/cloudsql.client`, the Cloud SQL Admin API is
     enabled);
-  - `custom_audiences`, a service setting that creates no revision.
+  - `custom_audiences`, a service setting that creates no revision;
+  - `sandbox` (Cloud Run sandboxes, preview): the app can run untrusted code
+    with the `sandbox` command. It implies gen2 and sets the service's launch
+    stage to `BETA`.
 
   Validation follows Cloud Run's rules (memory and CPU minimums, gen1 and
   gen2 constraints). Below 1 CPU now requires `concurrency: 1`, as Cloud Run

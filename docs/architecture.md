@@ -55,7 +55,11 @@ deploy:
   BigQuery and IAP use the official `google-cloud-*` Rust crates. Small REST
   adapters exist only where no SDK call exists: the OCI registry v2 protocol
   (digest lookup, tag listing) and Service Usage `v1beta1
-  generateServiceIdentity`.
+  generateServiceIdentity`. One field is newer than the Cloud Run crate
+  (1.15): `Container.sandboxLauncher`. It is set and read through the SDK's
+  unknown-field passthrough (a JSON round trip of the `Container`, in
+  `gcp/run.rs`), not a separate client; switch to the typed field once the
+  crate has it.
 - **No state file.** Ownership is encoded in labels (`managed-by=runway`,
   `runway-app`, `runway-stage`) and in a marker in the description of service
   accounts runway creates. runway refuses to modify what it does not own.

@@ -172,6 +172,9 @@ pub struct RawService {
     pub startup_cpu_boost: Option<bool>,
     /// `gen1` or `gen2`. Default: Cloud Run chooses from the features used.
     pub execution_environment: Option<String>,
+    /// Cloud Run sandboxes (preview): the app can run untrusted code with the
+    /// `sandbox` command. Implies gen2.
+    pub sandbox: Option<bool>,
     /// Direct VPC egress. A stage block replaces the inherited one.
     pub vpc: Option<RawVpc>,
     /// Cloud SQL instances (`PROJECT:REGION:INSTANCE`, or an instance name in
