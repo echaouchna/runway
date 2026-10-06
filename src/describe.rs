@@ -531,6 +531,7 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
             RoleTarget::Project { .. } => "project-level",
             RoleTarget::Secret { .. } => "single secret",
             RoleTarget::Repository { .. } => "repository-level",
+            RoleTarget::RunService { .. } | RoleTarget::RunJob { .. } => "one service or job",
         };
         identity.push(format!("`{}` on {} ({why}).", r.role, r.target));
     }
@@ -741,6 +742,100 @@ fn code_spans(p: Painter, s: &str) -> String {
         .collect()
 }
 
+/// What a job runs, how, and what schedules run it.
+pub fn explain_job(d: &Deployment, r: &crate::config::Resolved) -> Vec<Section> {
+    let crate::config::WorkloadKind::Job(j) = &d.kind else {
+        return Vec::new();
+    };
+    let s = &d.service;
+    let mut items = vec![
+        format!(
+            "Cloud Run job `{}` in {}/{}: {} task(s) per execution{}, up to {} retries each, {}s per task.",
+            d.service_id,
+            d.project,
+            d.region,
+            j.tasks,
+            match j.parallelism {
+                0 => String::new(),
+                n => format!(", {n} at a time"),
+            },
+            j.max_retries,
+            s.timeout_seconds
+        ),
+        match &d.artifact {
+            crate::config::Artifact::Image { reference, .. } => format!("Image `{reference}`."),
+            crate::config::Artifact::Build(b) => {
+                format!("Built from `{}` ({}).", b.context_dir.display(), b.strategy)
+            }
+        },
+        format!("Runs as `{}`.", s.service_account),
+    ];
+    if !s.command.is_empty() || !s.args.is_empty() {
+        items.push(format!(
+            "Command: `{}`.",
+            crate::plan::args_display(&[s.command.clone(), s.args.clone()].concat())
+        ));
+    }
+    for sch in r
+        .schedules
+        .iter()
+        .filter(|x| x.target.resource_id() == d.service_id)
+    {
+        items.push(format!(
+            "Run by schedule `{}`: `{}` ({}).",
+            sch.key, sch.schedule, sch.time_zone
+        ));
+    }
+    let mut out = vec![Section {
+        title: format!("Job {}", d.name()),
+        items,
+    }];
+    out.extend(explain(d).into_iter().filter(|sec| {
+        ["Identity", "Secrets", "Storage", "Networking", "Sandboxes"].contains(&sec.title.as_str())
+    }));
+    out
+}
+
+/// The schedules of the stage and the account they call targets with.
+pub fn explain_schedules(r: &crate::config::Resolved) -> Vec<Section> {
+    let Some(sc) = &r.scheduler else {
+        return Vec::new();
+    };
+    let mut items: Vec<String> = r
+        .schedules
+        .iter()
+        .map(|s| {
+            let what = match &s.target {
+                crate::config::ScheduleTarget::Job { name, .. } => format!("runs job `{name}`"),
+                crate::config::ScheduleTarget::Service {
+                    name, method, path, ..
+                } => format!("calls `{method} {path}` on service `{name}` with an ID token"),
+            };
+            format!(
+                "`{}` ({}, {}{}) {what}.",
+                s.key,
+                s.schedule,
+                s.time_zone,
+                if s.paused { ", paused" } else { "" }
+            )
+        })
+        .collect();
+    items.push(format!(
+        "Cloud Scheduler ({}) calls as `{}`{}, which gets `roles/run.invoker` on each target only.",
+        sc.region,
+        sc.service_account,
+        if sc.create {
+            " (created by runway)"
+        } else {
+            ""
+        }
+    ));
+    vec![Section {
+        title: "Schedules".into(),
+        items,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,7 +877,8 @@ stages: { prod: {} }
         let d = crate::config::load_and_resolve(&p, "prod", &Default::default())
             .unwrap()
             .1
-            .deployment;
+            .deployments[0]
+            .clone();
         (dir, d)
     }
 

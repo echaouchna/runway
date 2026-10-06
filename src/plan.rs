@@ -43,6 +43,9 @@ pub struct ServiceSpec {
     pub execution_environment: Option<String>,
     /// The app container may launch Cloud Run sandboxes.
     pub sandbox: bool,
+    /// Entrypoint and arguments of the app container; empty: the image's.
+    pub command: Vec<String>,
+    pub args: Vec<String>,
     pub vpc: Option<crate::config::VpcConfig>,
     /// Cloud SQL connection names.
     pub cloud_sql: Vec<String>,
@@ -107,6 +110,8 @@ impl ServiceSpec {
             startup_cpu_boost: s.startup_cpu_boost,
             execution_environment: s.execution_environment.clone(),
             sandbox: s.sandbox,
+            command: s.command.clone(),
+            args: s.args.clone(),
             vpc: s.vpc.clone(),
             cloud_sql: s.cloud_sql.clone(),
             custom_audiences: s.custom_audiences.clone(),
@@ -195,6 +200,12 @@ impl ServiceSpec {
         if self.sandbox {
             m.insert("sandbox".into(), "enabled".into());
         }
+        if !self.command.is_empty() {
+            m.insert("command".into(), args_display(&self.command));
+        }
+        if !self.args.is_empty() {
+            m.insert("args".into(), args_display(&self.args));
+        }
         if let Some(e) = &self.execution_environment {
             m.insert("execution_environment".into(), e.clone());
         }
@@ -221,6 +232,18 @@ impl ServiceSpec {
         }
         m
     }
+}
+
+/// Command-line words in order, quoted when they contain spaces.
+pub fn args_display(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| match w.contains(char::is_whitespace) || w.is_empty() {
+            true => format!("{w:?}"),
+            false => w.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `network N, subnet S, egress E[, tags a b]` (desired and observed), with
@@ -630,6 +653,160 @@ fn diff_line(
     }
 }
 
+/// The plan of a stage with several services, jobs or schedules. A stage
+/// with one service is planned as a [`Plan`] (same output as before).
+#[derive(Debug, Clone, Serialize)]
+pub struct StackPlan {
+    pub app: String,
+    pub stage: String,
+    pub project: String,
+    pub region: String,
+    /// True only when every value of every part is known.
+    pub exact: bool,
+    pub remote_inspected: bool,
+    pub services: Vec<Plan>,
+    pub jobs: Vec<JobPlan>,
+    /// Stage-wide steps: APIs, shared resources and grants, schedules, and
+    /// removals.
+    pub steps: Vec<crate::provision::StepCheck>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobPlan {
+    pub job: String,
+    pub name: String,
+    pub action: ServiceAction,
+    pub changes: Vec<FieldChange>,
+    pub image: ImagePlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildPlan>,
+    pub notes: Vec<String>,
+}
+
+/// Changes of a job, with a pending image shown as in [`compute_changes`].
+pub fn job_changes(
+    observed: Option<&BTreeMap<String, String>>,
+    desired: BTreeMap<String, String>,
+    image: &ImagePlan,
+) -> (ServiceAction, Vec<FieldChange>) {
+    let mut flat = desired;
+    let mut obs = observed.cloned();
+    if let ImagePlan::PendingBuild { .. } = image {
+        flat.remove("image");
+        if let Some(o) = obs.as_mut() {
+            o.remove("image");
+        }
+    }
+    let mut changes = diff(&obs.clone().unwrap_or_default(), &flat);
+    if let ImagePlan::PendingBuild { target, .. } = image {
+        changes.insert(
+            0,
+            FieldChange {
+                field: "image".into(),
+                before: obs
+                    .as_ref()
+                    .and_then(|_| observed.and_then(|o| o.get("image").cloned())),
+                after: Some(format!("{target} (digest known after build)")),
+            },
+        );
+    }
+    let action = match (observed, changes.is_empty()) {
+        (None, _) => ServiceAction::Create,
+        (Some(_), true) => ServiceAction::NoChange,
+        (Some(_), false) => ServiceAction::Update,
+    };
+    (action, changes)
+}
+
+fn step_lines(c: &crate::style::Painter, steps: &[crate::provision::StepCheck]) -> String {
+    let mut s = String::new();
+    for st in steps {
+        let mark = match st.state {
+            crate::provision::StepState::InSync => "=",
+            crate::provision::StepState::Pending => "+",
+            crate::provision::StepState::Unknown => "?",
+            crate::provision::StepState::PendingRemoval => "-",
+        };
+        s.push_str(&diff_line(c, "  ", mark, &st.step, Some(&st.detail)));
+    }
+    s
+}
+
+/// Human-readable plan of a stage: each service as [`render_text`], then
+/// jobs, stage-wide steps and one verdict.
+pub fn render_stack_text(p: &StackPlan) -> String {
+    let c = crate::style::out();
+    let header = |t: &str| format!("\n{}\n", c.bold(t));
+    let mut s = format!(
+        "{} {} {} in {}/{}\n",
+        c.bold("Plan for"),
+        c.bold_cyan(&p.app),
+        c.dim(&format!("(stage {})", p.stage)),
+        p.project,
+        p.region
+    );
+    for svc in &p.services {
+        let text = render_text(svc);
+        let body = text.split("\nThis plan is").next().unwrap_or(&text);
+        s.push('\n');
+        s.push_str(body.trim_end());
+        s.push('\n');
+    }
+    for j in &p.jobs {
+        s.push_str(&format!("\n{} {}\n", c.bold("Job"), c.bold_cyan(&j.job)));
+        if let Some(b) = &j.build {
+            let what = match b.will_build {
+                Some(true) => format!("+ build {}", b.image),
+                Some(false) => format!("= image {} already exists; build skipped", b.image),
+                None => format!("? build {} (unless already built)", b.image),
+            };
+            s.push_str(&format!("  {what}\n"));
+        }
+        let verb = match j.action {
+            ServiceAction::Create => "create",
+            ServiceAction::Update => "update",
+            ServiceAction::NoChange => "no change",
+            ServiceAction::Conflict => "refused (not managed by runway for this app and stage)",
+            ServiceAction::Unknown => "unknown (not inspected)",
+        };
+        s.push_str(&format!("  {}\n", c.bold(verb)));
+        for ch in &j.changes {
+            let (mark, text) = match (&ch.before, &ch.after) {
+                (Some(b), Some(a)) => ("~", format!("{}: {b} -> {a}", ch.field)),
+                (None, Some(a)) => ("+", format!("{}: {a}", ch.field)),
+                (Some(b), None) => ("-", format!("{}: {b}", ch.field)),
+                (None, None) => ("~", ch.field.clone()),
+            };
+            s.push_str(&diff_line(&c, "    ", mark, &text, None));
+        }
+        for n in &j.notes {
+            s.push_str(&format!("  - {n}\n"));
+        }
+    }
+    if !p.steps.is_empty() {
+        s.push_str(&header("Stage provisioning:"));
+        s.push_str(&step_lines(&c, &p.steps));
+    }
+    if !p.notes.is_empty() {
+        s.push_str(&header("Notes:"));
+        for n in &p.notes {
+            s.push_str(&format!("  - {n}\n"));
+        }
+    }
+    s.push_str(&format!(
+        "\nThis plan is {}.\n",
+        if p.exact {
+            c.bold_green("exact: it shows the configuration deploy will apply")
+        } else {
+            c.bold_yellow(
+                "NOT an exact preview: some values are only known during deploy (see above)",
+            )
+        }
+    ));
+    s
+}
+
 /// Human-readable plan. Colors (diff markers, headers, verdict) only appear
 /// when stdout is a terminal; see [`crate::style`].
 pub fn render_text(p: &Plan) -> String {
@@ -843,6 +1020,8 @@ mod tests {
             project: "my-gcp-project".into(),
             region: "europe-west1".into(),
             service_id: "hello-dev".into(),
+            key: None,
+            kind: crate::config::WorkloadKind::Service,
             artifact: Artifact::Image {
                 reference: "nginx:1".into(),
                 parsed: ImageRef::parse("nginx:1").unwrap(),
@@ -879,6 +1058,8 @@ mod tests {
                 startup_cpu_boost: false,
                 execution_environment: None,
                 sandbox: false,
+                command: Vec::new(),
+                args: Vec::new(),
                 vpc: None,
                 cloud_sql: Vec::new(),
                 custom_audiences: Vec::new(),
@@ -886,6 +1067,7 @@ mod tests {
             retry: Default::default(),
             apis: Default::default(),
             impersonate: None,
+            scheduler_region: "europe-west1".into(),
             project_tags: Default::default(),
             buckets: Default::default(),
             secrets: Default::default(),

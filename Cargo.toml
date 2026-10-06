@@ -58,6 +58,7 @@ google-cloud-iap-v1 = "1.13"
 google-cloud-bigquery-v2 = "1.0"
 clap_complete = "4.6"
 clap_complete_nushell = "4"
+google-cloud-scheduler-v1 = "1.13"
 
 [dev-dependencies]
 flate2 = "1.1"

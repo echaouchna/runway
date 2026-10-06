@@ -8,7 +8,7 @@ use crate::build::package::{self, SourceManifest};
 use crate::build_client;
 use crate::cli::{Context, PlanArgs};
 use crate::commands::{load, registry_client, resolve_existing_image};
-use crate::config::{Artifact, Deployment, Overrides};
+use crate::config::{Artifact, Deployment, Overrides, Resolved, WorkloadKind};
 use crate::deploy::Reconciler;
 use crate::error::Result;
 use crate::gcp::registry::DigestResolver;
@@ -17,15 +17,15 @@ use crate::image_ref::ImageRef;
 use crate::naming;
 use crate::output::{OutputFormat, Progress, print_json};
 use crate::plan::{
-    AccessPlan, BuildPlan, ImagePlan, Plan, ServiceAction, ServiceSpec, compute_changes,
-    render_text,
+    AccessPlan, BuildPlan, ImagePlan, JobPlan, Plan, ServiceAction, ServiceSpec, StackPlan,
+    compute_changes, render_stack_text, render_text,
 };
 use crate::poll::PollConfig;
 use crate::provision::{
     ANNOTATION_GRANTS, Provisioner, Step, StepCheck, StepState, all_steps, managed_grants,
-    merge_removals, recorded_grants, revoke_steps,
+    merge_removals, post_steps, recorded_grants, revoke_steps,
 };
-use google_cloud_run_v2::client::{Revisions, Services};
+use google_cloud_run_v2::client::{Jobs, Revisions, Services};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -58,7 +58,7 @@ pub fn build_target(
         &b.artifact_location,
         &d.project,
         &b.artifact_repository,
-        &d.app,
+        &d.image_package(),
     );
     let tagged = format!("{name}:{}", naming::build_image_tag(sha256));
     (name, tagged)
@@ -198,7 +198,7 @@ pub async fn decide_image(
                 upload_to: format!(
                     "gs://{}/{}",
                     b.source_bucket,
-                    naming::source_object(&d.app, &archive.sha256)
+                    naming::source_object(&d.image_package(), &archive.sha256)
                 ),
                 image: tagged.clone(),
                 build_service_account: b.build_service_account.clone(),
@@ -289,22 +289,34 @@ async fn revision_aware_changes(
     (action, changes)
 }
 
-/// Computes a plan; `remote = None` means offline.
+/// Computes a plan; `remote = None` means offline. With `stack`, the service
+/// is one of several: only its own steps (tags, IAP) and removals are
+/// checked here, stage-wide ones by [`stack_plan`].
 pub async fn compute(
     d: &Deployment,
     remote: Option<Remote<'_>>,
     mode: &crate::traffic::Mode,
     progress: &Progress,
+    stack: Option<&Resolved>,
 ) -> Result<(Plan, ImageDecision)> {
     let mut notes = Vec::new();
     let name = d.service_name();
-    let all_steps = all_steps(d);
+    let all_steps = match stack {
+        None => all_steps(d),
+        Some(_) => post_steps(d),
+    };
+    // A build shared with other workloads is made for its owner.
+    let image_of = stack.map_or(d, |r| r.build_owner(d));
     let provisioner = remote.as_ref().and_then(|r| r.provisioner);
     // Packaging, registry lookup, service read, IAM read and the checks that
     // do not need the service are independent: they run concurrently, so a
     // plan costs about one round trip.
     let (decision, live, early_checks) = match &remote {
-        None => (decide_image(d, None, &mut notes).await?, None, Vec::new()),
+        None => (
+            decide_image(image_of, None, &mut notes).await?,
+            None,
+            Vec::new(),
+        ),
         Some(r) => {
             let rec = Reconciler {
                 run: r.run,
@@ -329,7 +341,7 @@ pub async fn compute(
             };
             let mut img_notes = Vec::new();
             let (decision, svc, public, early) = tokio::join!(
-                decide_image(d, Some(r.resolver), &mut img_notes),
+                decide_image(image_of, Some(r.resolver), &mut img_notes),
                 rec.get(&name),
                 rec.current_public(&name),
                 early,
@@ -387,7 +399,10 @@ pub async fn compute(
         .unwrap_or_default();
     // Only a main deploy revokes (once one revision serves all traffic): a
     // preview or canary leaves them for the next main deploy.
-    let mut revokes = revoke_steps(&recorded, d);
+    let mut revokes = match stack {
+        None => revoke_steps(&recorded, d),
+        Some(_) => Vec::new(),
+    };
     if !revokes.is_empty() && *mode != crate::traffic::Mode::Full {
         notes.push(format!(
             "{} grant(s) removed from runway.yaml are revoked by the next main deploy, not by a preview or canary",
@@ -395,7 +410,8 @@ pub async fn compute(
         ));
         revokes.clear();
     }
-    if live_svc.is_some_and(|svc| !svc.annotations.contains_key(ANNOTATION_GRANTS))
+    if stack.is_none()
+        && live_svc.is_some_and(|svc| !svc.annotations.contains_key(ANNOTATION_GRANTS))
         && !managed_grants(d).is_empty()
     {
         notes.push(format!(
@@ -503,9 +519,10 @@ pub async fn compute(
                 ),
                 futures::future::join_all(revokes.iter().map(|s| prov.check(s, service_exists))),
                 async {
-                    match authoritative {
-                        true => Some(prov.unlisted(&recorded).await),
-                        false => None,
+                    match (authoritative, stack) {
+                        (true, None) => Some(prov.unlisted(&recorded).await),
+                        (true, Some(_)) => Some(prov.unlisted_service().await),
+                        (false, _) => None,
                     }
                 },
             );
@@ -533,6 +550,24 @@ pub async fn compute(
                     checks
                 }
             };
+            // A stage without schedules may have some left from runway.yaml:
+            // a full deploy deletes them. Without permission to list them
+            // (a stage that never had any), nothing is said.
+            let mut unlisted = unlisted;
+            if stack.is_none() && authoritative {
+                match prov.orphan_schedules().await {
+                    Ok(left) => {
+                        for s in left {
+                            unlisted.push(prov.check(&s, true).await);
+                        }
+                    }
+                    Err(e) if e.kind == crate::error::ErrorKind::Prerequisite => {}
+                    Err(e) => notes.push(format!(
+                        "could not check for schedules runway created ({})",
+                        e.message
+                    )),
+                }
+            }
             let (mut early, mut late) = (early_checks.into_iter(), late.into_iter());
             all_steps
                 .iter()
@@ -589,13 +624,45 @@ pub async fn compute(
     ))
 }
 
+/// `--image` applies to the one workload `--only` names.
+pub(crate) fn overrides(image: Option<String>, only: &[String]) -> Overrides {
+    Overrides {
+        image,
+        target: match only {
+            [one] => Some(one.clone()),
+            _ => None,
+        },
+    }
+}
+
+/// A stage planned as before named services and jobs existed: one service.
+pub(crate) fn is_single(r: &Resolved) -> bool {
+    r.deployments.len() == 1 && !r.first().is_job() && r.schedules.is_empty()
+}
+
 pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
-    let overrides = Overrides { image: args.image };
-    let resolved = load(ctx, &args.stage.stage, &overrides)?;
-    let d = &resolved.deployment;
-    let mode = crate::commands::traffic_mode(args.preview.as_deref(), args.traffic, &d.service_id)?;
+    let resolved = load(
+        ctx,
+        &args.stage.stage,
+        &overrides(args.image.clone(), &args.stage.only),
+    )?;
+    resolved.select(&args.stage.only)?;
+    let mode = crate::commands::traffic_mode(
+        args.preview.as_deref(),
+        args.traffic,
+        &crate::commands::preview_basis(&resolved),
+    )?;
+    if !is_single(&resolved) {
+        let plan = stack_plan(ctx, &resolved, &args.stage.only, &mode, args.offline).await?;
+        match ctx.output {
+            OutputFormat::Json => print_json(&plan),
+            OutputFormat::Text => print!("{}", render_stack_text(&plan)),
+        }
+        return Ok(());
+    }
+    let d = resolved.first();
     let (mut plan, _) = if args.offline {
-        let (mut plan, dec) = compute(d, None, &mode, &ctx.progress).await?;
+        let (mut plan, dec) = compute(d, None, &mode, &ctx.progress, None).await?;
         if d.service.otel_collector.as_ref().is_some_and(|o| !o.pinned) {
             plan.notes.push(
                 "offline: the newest otel_collector version was not looked up; deploy uses the latest release".into(),
@@ -625,6 +692,7 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
             }),
             &mode,
             &ctx.progress,
+            None,
         )
         .await?;
         plan.notes.extend(version_notes);
@@ -636,4 +704,306 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
         OutputFormat::Text => print!("{}", render_text(&plan)),
     }
     Ok(())
+}
+
+/// The job a deploy in `mode` changes: the job itself, or with `--preview`
+/// its preview copy (`{job}-{tag}`, labeled with the tag).
+pub(crate) fn job_for_mode(d: &Deployment, mode: &crate::traffic::Mode) -> Result<Deployment> {
+    let mut d = d.clone();
+    if let crate::traffic::Mode::Preview { tag } = mode {
+        d.service_id = crate::commands::preview_job_id(&d.service_id, tag)?;
+    }
+    Ok(d)
+}
+
+/// Labels of a job deployed in `mode` (a preview copy carries its tag).
+pub(crate) fn job_labels(d: &Deployment, mode: &crate::traffic::Mode) -> BTreeMap<String, String> {
+    let mut l = d.labels();
+    if let crate::traffic::Mode::Preview { tag } = mode {
+        l.insert(naming::LABEL_PREVIEW.into(), tag.clone());
+    }
+    l
+}
+
+/// What deploy changes on a job.
+async fn job_plan(
+    d: &Deployment,
+    owner: &Deployment,
+    remote: Option<(&Jobs, &dyn DigestResolver)>,
+    mode: &crate::traffic::Mode,
+    progress: &Progress,
+) -> Result<JobPlan> {
+    let WorkloadKind::Job(settings) = &d.kind else {
+        return Err(crate::error::Error::internal("not a job"));
+    };
+    let mut notes = Vec::new();
+    let target = job_for_mode(d, mode)?;
+    let decision = decide_image(owner, remote.map(|r| r.1), &mut notes).await?;
+    let mut spec = ServiceSpec::from_deployment(
+        &target,
+        decision.image.deploy_reference().unwrap_or(""),
+        decision.annotations.clone(),
+    );
+    spec.labels = job_labels(d, mode);
+    let desired = crate::gcp::jobs::desired_flat(&spec, settings);
+    if let crate::traffic::Mode::Canary { .. } = mode {
+        notes.push(
+            "a canary changes services only: jobs and schedules change with a full deploy".into(),
+        );
+        return Ok(JobPlan {
+            job: target.service_id.clone(),
+            name: d.name().to_string(),
+            action: ServiceAction::NoChange,
+            changes: Vec::new(),
+            image: decision.image,
+            build: decision.build,
+            notes,
+        });
+    }
+    let (action, changes) = match remote {
+        None => {
+            let (_, c) = crate::plan::job_changes(None, desired, &decision.image);
+            (ServiceAction::Unknown, c)
+        }
+        Some((jobs, _)) => {
+            let rec = crate::gcp::jobs::JobReconciler {
+                jobs,
+                progress,
+                poll: PollConfig::default(),
+                timeout: Duration::from_secs(30),
+            };
+            match rec.get(&target.service_name()).await? {
+                None => crate::plan::job_changes(None, desired, &decision.image),
+                Some(job) => match crate::gcp::jobs::check_job_ownership(&job, &d.app, &d.stage) {
+                    Err(e) => {
+                        notes.push(format!("{}; deploy will refuse", e.message));
+                        (ServiceAction::Conflict, Vec::new())
+                    }
+                    Ok(()) => crate::plan::job_changes(
+                        Some(&crate::gcp::jobs::observed_flat(&job)),
+                        desired,
+                        &decision.image,
+                    ),
+                },
+            }
+        }
+    };
+    Ok(JobPlan {
+        job: target.service_id.clone(),
+        name: d.name().to_string(),
+        action,
+        changes,
+        image: decision.image,
+        build: decision.build,
+        notes,
+    })
+}
+
+/// Grants recorded on the stage's holder (see [`Resolved::holder`]).
+pub async fn holder_record(
+    r: &Resolved,
+    run: &Services,
+    jobs: &Jobs,
+) -> Result<Vec<crate::provision::ManagedGrant>> {
+    let h = r.holder();
+    let (labels, annotations) = match h.is_job() {
+        false => match run.get_service().set_name(h.service_name()).send().await {
+            Ok(svc) => (svc.labels, svc.annotations),
+            Err(e) if crate::gcp::is_not_found(&e) => Default::default(),
+            Err(e) => return Err(crate::gcp::api_error(e, "reading the service")),
+        },
+        true => match jobs.get_job().set_name(h.service_name()).send().await {
+            Ok(j) => (j.labels, j.annotations),
+            Err(e) if crate::gcp::is_not_found(&e) => Default::default(),
+            Err(e) => return Err(crate::gcp::api_error(e, "reading the job")),
+        },
+    };
+    // Annotations on a resource runway does not own are not its record.
+    if run::ownership_of(&labels, &h.app, &h.stage) != Ownership::Owned {
+        return Ok(Vec::new());
+    }
+    Ok(recorded_grants(&annotations))
+}
+
+/// Stage-wide steps (once) and removals, then each selected service and
+/// job.
+async fn stack_plan(
+    ctx: &Context,
+    r: &Resolved,
+    only: &[String],
+    mode: &crate::traffic::Mode,
+    offline: bool,
+) -> Result<StackPlan> {
+    let selected = r.select(only)?;
+    let first = r.first();
+    let progress = &ctx.progress;
+    let mut notes = Vec::new();
+    let mut services = Vec::new();
+    let mut job_plans = Vec::new();
+    let full = *mode == crate::traffic::Mode::Full;
+    let stage_steps: Vec<Step> = crate::provision::stack_api_step(r)
+        .into_iter()
+        .chain(crate::provision::stack_pre_steps(r))
+        .collect();
+    // Schedules change with a full deploy, for the targets it deploys.
+    let schedule_steps: Vec<Step> = match full {
+        false => Vec::new(),
+        true => crate::provision::schedule_steps(r)
+            .into_iter()
+            .filter(|s| match s {
+                Step::Schedule(sc) => selected
+                    .iter()
+                    .any(|d| d.service_id == sc.target.resource_id()),
+                Step::Grant { binding, .. } => selected.iter().any(|d| {
+                    binding
+                        .target
+                        .to_string()
+                        .ends_with(&format!(" {}", d.service_id))
+                }),
+                _ => true,
+            })
+            .collect(),
+    };
+    if !full && !r.schedules.is_empty() {
+        notes.push("schedules change with a full deploy, not a preview or canary".into());
+    }
+    if offline {
+        for d in &selected {
+            match d.is_job() {
+                true => job_plans.push(job_plan(d, r.build_owner(d), None, mode, progress).await?),
+                false => services.push(compute(d, None, mode, progress, Some(r)).await?.0),
+            }
+        }
+        let steps = stage_steps
+            .iter()
+            .chain(schedule_steps.iter())
+            .map(|s| StepCheck {
+                step: s.describe(first),
+                state: StepState::Unknown,
+                detail: "offline".into(),
+            })
+            .collect();
+        return Ok(stack_result(r, false, services, job_plans, steps, notes));
+    }
+    let session = crate::commands::connect(ctx, first)
+        .await
+        .map_err(|e| e.hint("use `runway plan --offline` to plan without credentials"))?;
+    let run = build_client!(Services, session)?;
+    let revisions = build_client!(Revisions, session)?;
+    let jobs = build_client!(Jobs, session)?;
+    let registry = registry_client(&session).await?;
+    let prov = Provisioner::new(first, &session, &run).await?.with_stack(r);
+    let mut ready: Vec<Deployment> = Vec::new();
+    for d in &selected {
+        let d = crate::commands::resolve_runtime_versions(d, &registry, &mut notes).await;
+        ready.push(crate::commands::resolve_secret_versions(&d, &prov, &mut notes, false).await?);
+    }
+    for d in &ready {
+        if d.is_job() {
+            job_plans.push(
+                job_plan(
+                    d,
+                    r.build_owner(d),
+                    Some((&jobs, &registry)),
+                    mode,
+                    progress,
+                )
+                .await?,
+            );
+        } else {
+            let view = prov.for_service(d);
+            let (plan, _) = compute(
+                d,
+                Some(Remote {
+                    run: &run,
+                    revisions: Some(&revisions),
+                    resolver: &registry,
+                    provisioner: Some(&view),
+                }),
+                mode,
+                progress,
+                Some(r),
+            )
+            .await?;
+            services.push(plan);
+        }
+    }
+    let mut steps: Vec<StepCheck> =
+        futures::future::join_all(stage_steps.iter().map(|s| prov.check(s, false))).await;
+    steps.extend(
+        futures::future::join_all(schedule_steps.iter().map(|s| prov.check(s, true))).await,
+    );
+    // Removals: only a full deploy of every service and job makes them.
+    let recorded = holder_record(r, &run, &jobs).await?;
+    let revokes = crate::provision::stack_revoke_steps(&recorded, r);
+    if full && only.is_empty() {
+        steps.extend(futures::future::join_all(revokes.iter().map(|s| prov.check(s, true))).await);
+        let shared = prov.unlisted_shared(&recorded).await;
+        for s in merge_removals(revokes.clone(), shared.steps)
+            .into_iter()
+            .skip(revokes.len())
+        {
+            steps.push(unlisted_check(&s, first));
+        }
+        for what in shared.unchecked {
+            notes.push(format!(
+                "could not check for access runway.yaml does not list ({what})"
+            ));
+        }
+        match prov.orphan_schedules().await {
+            Ok(left) => {
+                for s in left {
+                    steps.push(prov.check(&s, true).await);
+                }
+            }
+            Err(e) => notes.push(format!(
+                "could not check for schedules runway created ({})",
+                e.message
+            )),
+        }
+        for o in crate::commands::undeploy::orphan_workloads(r, &run, &jobs).await? {
+            notes.push(format!(
+                "{} {} is no longer in runway.yaml; remove it with `runway undeploy --stage {} --orphans`",
+                if o.is_job() { "job" } else { "service" },
+                o.service_id,
+                first.stage
+            ));
+        }
+    } else if !revokes.is_empty() {
+        notes.push(format!(
+            "{} grant(s) removed from runway.yaml are revoked by a full deploy of every service and job",
+            revokes.len()
+        ));
+    }
+    Ok(stack_result(r, true, services, job_plans, steps, notes))
+}
+
+fn stack_result(
+    r: &Resolved,
+    remote: bool,
+    services: Vec<Plan>,
+    jobs: Vec<JobPlan>,
+    steps: Vec<StepCheck>,
+    mut notes: Vec<String>,
+) -> StackPlan {
+    let d = r.first();
+    notes.dedup();
+    let exact = remote
+        && services.iter().all(|p| p.exact)
+        && jobs
+            .iter()
+            .all(|j| j.image.is_exact() && j.action != ServiceAction::Conflict)
+        && steps.iter().all(|s| s.state != StepState::Unknown);
+    StackPlan {
+        app: d.app.clone(),
+        stage: d.stage.clone(),
+        project: d.project.clone(),
+        region: d.region.clone(),
+        exact,
+        remote_inspected: remote,
+        services,
+        jobs,
+        steps,
+        notes,
+    }
 }

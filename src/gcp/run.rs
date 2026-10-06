@@ -40,7 +40,7 @@ const RESERVED_PREFIXES: &[&str] = &[
     "autoscaling.knative.dev/",
 ];
 
-fn is_reserved_key(k: &str) -> bool {
+pub(crate) fn is_reserved_key(k: &str) -> bool {
     RESERVED_PREFIXES.iter().any(|p| k.starts_with(p))
 }
 
@@ -48,29 +48,9 @@ fn is_reserved_key(k: &str) -> bool {
 ///
 /// Labels and annotations set by others are preserved; runway's own labels
 /// are enforced and stale `runway.dev/*` annotations are dropped.
-pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service>) -> Service {
-    let mut labels: BTreeMap<String, String> = existing
-        .map(|s| {
-            s.labels
-                .iter()
-                .filter(|(k, _)| !is_reserved_key(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    labels.extend(spec.labels.clone());
-
-    let mut annotations: BTreeMap<String, String> = existing
-        .map(|s| {
-            s.annotations
-                .iter()
-                .filter(|(k, _)| !k.starts_with("runway.dev/") && !is_reserved_key(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    annotations.extend(spec.annotations.clone());
-
+/// The app container (image, command, limits, env, mounts) and its volumes:
+/// what services and jobs have in common.
+pub(crate) fn app_container_and_volumes(spec: &ServiceSpec) -> (Container, Vec<Volume>) {
     let mut env: Vec<EnvVar> = spec
         .env
         .iter()
@@ -94,9 +74,8 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
     let container =
         Container::new()
             .set_image(&spec.image)
-            .set_ports([ContainerPort::new()
-                .set_name("http1")
-                .set_container_port(spec.port as i32)])
+            .set_command(spec.command.clone())
+            .set_args(spec.args.clone())
             .set_resources(ResourceRequirements::new().set_limits([
                 ("cpu".to_string(), spec.cpu.clone()),
                 ("memory".to_string(), spec.memory.clone()),
@@ -119,24 +98,6 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
                             .set_mount_path(crate::config::CLOUD_SQL_MOUNT)
                     })),
             );
-    let container = match &spec.health_check {
-        None => container,
-        Some(hc) => {
-            let to_probe = |p: &crate::config::ProbeSettings| {
-                Probe::new()
-                    .set_http_get(HTTPGetAction::new().set_path(&hc.path))
-                    .set_initial_delay_seconds(p.initial_delay_seconds as i32)
-                    .set_period_seconds(p.period_seconds as i32)
-                    .set_timeout_seconds(p.timeout_seconds as i32)
-                    .set_failure_threshold(p.failure_threshold as i32)
-            };
-            let c = container.set_startup_probe(to_probe(&hc.startup));
-            match &hc.liveness {
-                Some(l) => c.set_liveness_probe(to_probe(l)),
-                None => c,
-            }
-        }
-    };
     let volumes: Vec<Volume> = spec
         .volumes
         .iter()
@@ -163,6 +124,54 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
                 )
         }))
         .collect();
+    (container, volumes)
+}
+
+pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service>) -> Service {
+    let mut labels: BTreeMap<String, String> = existing
+        .map(|s| {
+            s.labels
+                .iter()
+                .filter(|(k, _)| !is_reserved_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    labels.extend(spec.labels.clone());
+
+    let mut annotations: BTreeMap<String, String> = existing
+        .map(|s| {
+            s.annotations
+                .iter()
+                .filter(|(k, _)| !k.starts_with("runway.dev/") && !is_reserved_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    annotations.extend(spec.annotations.clone());
+
+    let (container, volumes) = app_container_and_volumes(spec);
+    let container = container.set_ports([ContainerPort::new()
+        .set_name("http1")
+        .set_container_port(spec.port as i32)]);
+    let container = match &spec.health_check {
+        None => container,
+        Some(hc) => {
+            let to_probe = |p: &crate::config::ProbeSettings| {
+                Probe::new()
+                    .set_http_get(HTTPGetAction::new().set_path(&hc.path))
+                    .set_initial_delay_seconds(p.initial_delay_seconds as i32)
+                    .set_period_seconds(p.period_seconds as i32)
+                    .set_timeout_seconds(p.timeout_seconds as i32)
+                    .set_failure_threshold(p.failure_threshold as i32)
+            };
+            let c = container.set_startup_probe(to_probe(&hc.startup));
+            match &hc.liveness {
+                Some(l) => c.set_liveness_probe(to_probe(l)),
+                None => c,
+            }
+        }
+    };
 
     // Same template as the live one, or a revision behind the mode's URL that
     // already runs this configuration: send the template back untouched, so
@@ -214,7 +223,7 @@ fn launch_stage(spec: &ServiceSpec, existing: Option<&Service>) -> LaunchStage {
 /// `Container.sandboxLauncher` is in the Cloud Run v2 API but not yet in
 /// google-cloud-run-v2 (1.15). The SDK keeps fields it doesn't know and
 /// sends them back, so a JSON round trip sets it.
-fn with_sandbox_launcher(c: Container) -> Container {
+pub(crate) fn with_sandbox_launcher(c: Container) -> Container {
     let mut v = serde_json::to_value(&c).expect("a container serializes");
     v["sandboxLauncher"] = true.into();
     serde_json::from_value(v).expect("a container deserializes")
@@ -248,25 +257,30 @@ fn build_template(
         .set_max_instance_request_concurrency(spec.concurrency as i32)
         .set_volumes(volumes)
         .set_containers(containers(spec, container))
-        .set_execution_environment(match spec.execution_environment.as_deref() {
-            Some("gen1") => ExecutionEnvironment::Gen1,
-            Some("gen2") => ExecutionEnvironment::Gen2,
-            _ => ExecutionEnvironment::Unspecified,
-        });
-    match &spec.vpc {
-        None => template,
-        Some(v) => template.set_vpc_access(
-            VpcAccess::new()
-                .set_egress(match v.egress.as_str() {
-                    "all-traffic" => vpc_access::VpcEgress::AllTraffic,
-                    _ => vpc_access::VpcEgress::PrivateRangesOnly,
-                })
-                .set_network_interfaces([vpc_access::NetworkInterface::new()
-                    .set_network(&v.network)
-                    .set_subnetwork(&v.subnet)
-                    .set_tags(v.network_tags.clone())]),
-        ),
+        .set_execution_environment(execution_environment(spec));
+    template.set_or_clear_vpc_access(vpc_access(spec))
+}
+
+pub(crate) fn execution_environment(spec: &ServiceSpec) -> ExecutionEnvironment {
+    match spec.execution_environment.as_deref() {
+        Some("gen1") => ExecutionEnvironment::Gen1,
+        Some("gen2") => ExecutionEnvironment::Gen2,
+        _ => ExecutionEnvironment::Unspecified,
     }
+}
+
+pub(crate) fn vpc_access(spec: &ServiceSpec) -> Option<VpcAccess> {
+    spec.vpc.as_ref().map(|v| {
+        VpcAccess::new()
+            .set_egress(match v.egress.as_str() {
+                "all-traffic" => vpc_access::VpcEgress::AllTraffic,
+                _ => vpc_access::VpcEgress::PrivateRangesOnly,
+            })
+            .set_network_interfaces([vpc_access::NetworkInterface::new()
+                .set_network(&v.network)
+                .set_subnetwork(&v.subnet)
+                .set_tags(v.network_tags.clone())])
+    })
 }
 
 /// Env var carrying the collector configuration (read with `--config=env:`).
@@ -957,6 +971,12 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
         if sandbox_launcher(c) {
             m.insert("sandbox".into(), "enabled".into());
         }
+        if !c.command.is_empty() {
+            m.insert("command".into(), crate::plan::args_display(&c.command));
+        }
+        if !c.args.is_empty() {
+            m.insert("args".into(), crate::plan::args_display(&c.args));
+        }
         m.insert(
             "cpu".into(),
             normalize_cpu(limits.get("cpu").map(String::as_str).unwrap_or("1")),
@@ -1007,18 +1027,19 @@ pub enum Ownership {
 }
 
 pub fn ownership(svc: &Service, app: &str, stage: &str) -> Ownership {
-    let managed = svc.labels.get(naming::LABEL_MANAGED_BY).map(String::as_str)
+    ownership_of(&svc.labels, app, stage)
+}
+
+/// [`ownership`] of any resource from its labels (services, jobs).
+pub fn ownership_of(
+    labels: &std::collections::HashMap<String, String>,
+    app: &str,
+    stage: &str,
+) -> Ownership {
+    let managed = labels.get(naming::LABEL_MANAGED_BY).map(String::as_str)
         == Some(naming::LABEL_MANAGED_BY_VALUE);
-    let a = svc
-        .labels
-        .get(naming::LABEL_APP)
-        .cloned()
-        .unwrap_or_default();
-    let s = svc
-        .labels
-        .get(naming::LABEL_STAGE)
-        .cloned()
-        .unwrap_or_default();
+    let a = labels.get(naming::LABEL_APP).cloned().unwrap_or_default();
+    let s = labels.get(naming::LABEL_STAGE).cloned().unwrap_or_default();
     if !managed && a.is_empty() && s.is_empty() {
         Ownership::Unmanaged
     } else if managed && a == app && s == stage {
@@ -1193,7 +1214,7 @@ pub fn status(svc: &Service, app: &str, stage: &str) -> ServiceStatus {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::SecretRef;
     use google_cloud_run_v2::model::Condition;
@@ -1237,6 +1258,8 @@ mod tests {
             startup_cpu_boost: false,
             execution_environment: None,
             sandbox: false,
+            command: Vec::new(),
+            args: Vec::new(),
             vpc: None,
             cloud_sql: Vec::new(),
             custom_audiences: Vec::new(),

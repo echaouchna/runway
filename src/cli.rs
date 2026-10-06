@@ -187,6 +187,11 @@ pub struct StageArg {
     /// Stage to operate on (must be defined under `stages`).
     #[arg(short, long, env = "RUNWAY_STAGE")]
     pub stage: String,
+    /// Only these services or jobs: names (the main service is named after
+    /// the app), or paths that select what is built inside them. Repeat or
+    /// separate with commas.
+    #[arg(long, value_delimiter = ',', env = "RUNWAY_ONLY")]
+    pub only: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,6 +219,8 @@ pub enum Command {
     Preview(PreviewAction),
     /// Remove the service (and the runtime identity runway created); keep data and APIs.
     Undeploy(UndeployArgs),
+    /// Run a Cloud Run job of the stage now (optionally wait for it to finish).
+    RunJob(RunJobArgs),
     /// Print a shell completion script (bash, zsh, fish, nushell, xonsh, elvish, powershell).
     Completions(CompletionsArgs),
 }
@@ -345,6 +352,10 @@ pub struct UndeployArgs {
     /// Also delete this app's container images from the repository.
     #[arg(long)]
     pub delete_images: bool,
+    /// Only delete the services and jobs runway deployed for this stage that
+    /// runway.yaml no longer lists.
+    #[arg(long, conflicts_with = "preview")]
+    pub orphans: bool,
     /// Maximum time to wait for the service deletion.
     #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
     pub timeout: std::time::Duration,
@@ -370,6 +381,11 @@ pub struct DescribeArgs {
     /// Print only the diagram (no explanation).
     #[arg(long)]
     pub diagram_only: bool,
+    /// Only these services or jobs: names (the main service is named after
+    /// the app), or paths that select what is built inside them. Repeat or
+    /// separate with commas.
+    #[arg(long, value_delimiter = ',', env = "RUNWAY_ONLY")]
+    pub only: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -389,6 +405,20 @@ pub struct InitArgs {
     /// Generate an image-based configuration instead of a source build.
     #[arg(long)]
     pub image: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RunJobArgs {
+    #[command(flatten)]
+    pub stage: StageArg,
+    /// The job (a key of `jobs`).
+    pub name: String,
+    /// Wait until the execution finishes, and fail if it fails.
+    #[arg(long)]
+    pub wait: bool,
+    /// How long to wait with `--wait`.
+    #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
+    pub timeout: std::time::Duration,
 }
 
 #[derive(Debug, Args)]
@@ -547,6 +577,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Plan(a) => commands::plan::run(&ctx, a).await,
         Command::Deploy(a) => commands::deploy::run(&ctx, a).await,
         Command::Info(a) => commands::info::run(&ctx, a).await,
+        Command::RunJob(a) => commands::run_job::run(&ctx, a).await,
         Command::Logs(a) => commands::logs::run(&ctx, a).await,
         Command::Describe(a) => commands::describe::run(&ctx, a),
         Command::Traffic(a) => commands::traffic::run(&ctx, a).await,

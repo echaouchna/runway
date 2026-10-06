@@ -75,7 +75,7 @@ fn has_error(errors: &[Issue], path: &str, needle: &str) -> bool {
 #[test]
 fn full_example_resolves_with_stage_overrides() {
     let (_d, cfg) = load_str(FULL);
-    let dev = resolve_ok(&cfg, "dev").deployment;
+    let dev = resolve_ok(&cfg, "dev").deployments[0].clone();
     assert_eq!(dev.service_id, "hello-api-dev");
     assert_eq!(dev.service.max_instances, 2);
     assert_eq!(dev.service.min_instances, 0);
@@ -108,8 +108,8 @@ fn full_example_resolves_with_stage_overrides() {
     }
 
     let prod = resolve_ok(&cfg, "prod");
-    assert_eq!(prod.deployment.service.min_instances, 1);
-    assert_eq!(prod.deployment.service.max_instances, 10);
+    assert_eq!(prod.deployments[0].clone().service.min_instances, 1);
+    assert_eq!(prod.deployments[0].clone().service.max_instances, 10);
     assert!(
         prod.warnings
             .iter()
@@ -130,7 +130,7 @@ service:
 stages: { dev: }
 "#,
     );
-    let s = resolve_ok(&cfg, "dev").deployment.service;
+    let s = resolve_ok(&cfg, "dev").deployments[0].clone().service;
     assert_eq!(s.port, DEFAULT_PORT);
     assert_eq!(s.cpu, "1");
     assert_eq!(s.memory, "512Mi");
@@ -166,7 +166,7 @@ stages:
       secrets: { S2: null }
 "#,
     );
-    let d = resolve_ok(&cfg, "prod").deployment;
+    let d = resolve_ok(&cfg, "prod").deployments[0].clone();
     assert_eq!(
         d.project, "my-prod-project",
         "stage provider overrides base provider"
@@ -293,17 +293,18 @@ fn stage_image_replaces_base_build_and_cli_image_wins() {
         )
         .as_str(),
     );
-    let prod = resolve_ok(&cfg, "prod").deployment;
+    let prod = resolve_ok(&cfg, "prod").deployments[0].clone();
     assert!(
         matches!(prod.artifact, Artifact::Image { ref reference, .. } if reference.ends_with("hello:1.0"))
     );
-    let dev = resolve_ok(&cfg, "dev").deployment;
+    let dev = resolve_ok(&cfg, "dev").deployments[0].clone();
     assert!(matches!(dev.artifact, Artifact::Build(_)));
 
     let o = Overrides {
         image: Some("nginx@sha256:".to_string() + &"b".repeat(64)),
+        target: None,
     };
-    let dev = resolve(&cfg, "dev", &o).unwrap().deployment;
+    let dev = resolve(&cfg, "dev", &o).unwrap().deployments[0].clone();
     assert!(matches!(dev.artifact, Artifact::Image { ref parsed, .. } if parsed.digest.is_some()));
 }
 
@@ -457,7 +458,7 @@ stages:
 #[test]
 fn infrastructure_fields_resolve_with_stage_overrides() {
     let (_d, cfg) = load_str(INFRA);
-    let dev = resolve_ok(&cfg, "dev").deployment;
+    let dev = resolve_ok(&cfg, "dev").deployments[0].clone();
     let s = &dev.service;
     assert!(s.identity.create);
     assert_eq!(s.identity.roles.len(), 2);
@@ -490,7 +491,7 @@ fn infrastructure_fields_resolve_with_stage_overrides() {
         "default kept"
     );
 
-    let prod = resolve_ok(&cfg, "prod").deployment;
+    let prod = resolve_ok(&cfg, "prod").deployments[0].clone();
     let s = &prod.service;
     assert_eq!(s.tags.len(), 1, "null removes an inherited tag");
     assert_eq!(s.tags["123456789012/env"], "prod");
@@ -511,7 +512,7 @@ fn infrastructure_fields_resolve_with_stage_overrides() {
 #[test]
 fn retry_defaults_without_block() {
     let (_d, cfg) = load_str(FULL);
-    let r = resolve_ok(&cfg, "dev").deployment.retry;
+    let r = resolve_ok(&cfg, "dev").deployments[0].clone().retry;
     assert_eq!(r, crate::retry::RetryConfig::default());
 }
 
@@ -567,7 +568,7 @@ stages:
 #[test]
 fn variables_interpolate_everywhere_and_stages_override_them() {
     let (_d, cfg) = load_str(VARS);
-    let prod = resolve_ok(&cfg, "prod").deployment;
+    let prod = resolve_ok(&cfg, "prod").deployments[0].clone();
     assert_eq!(
         prod.service.service_account,
         "gcptree-run@my-gcp-project.iam.gserviceaccount.com"
@@ -599,7 +600,7 @@ fn variables_interpolate_everywhere_and_stages_override_them() {
     assert!(prod.apis.enable);
     assert_eq!(prod.apis.extra, ["telemetry.googleapis.com"]);
 
-    let dev = resolve_ok(&cfg, "dev").deployment;
+    let dev = resolve_ok(&cfg, "dev").deployments[0].clone();
     assert_eq!(
         dev.service.identity.roles[0].target,
         RoleTarget::Project {
@@ -681,7 +682,7 @@ stages: { prod: {}, custom: { service: { builder: "gcr.io/buildpacks/builder:goo
 "#;
     std::fs::write(&path, yaml).unwrap();
     let cfg = load(&path).unwrap();
-    let d = resolve_ok(&cfg, "prod").deployment;
+    let d = resolve_ok(&cfg, "prod").deployments[0].clone();
     let Artifact::Build(b) = &d.artifact else {
         panic!("expected a build")
     };
@@ -699,7 +700,7 @@ stages: { prod: {}, custom: { service: { builder: "gcr.io/buildpacks/builder:goo
         "runway-build@my-gcp-project.iam.gserviceaccount.com"
     );
 
-    let custom = resolve_ok(&cfg, "custom").deployment;
+    let custom = resolve_ok(&cfg, "custom").deployments[0].clone();
     let Artifact::Build(b) = &custom.artifact else {
         panic!()
     };
@@ -712,7 +713,7 @@ stages: { prod: {}, custom: { service: { builder: "gcr.io/buildpacks/builder:goo
 
     // A Dockerfile in the context is picked up automatically.
     std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
-    let d = resolve_ok(&cfg, "prod").deployment;
+    let d = resolve_ok(&cfg, "prod").deployments[0].clone();
     let Artifact::Build(b) = &d.artifact else {
         panic!()
     };
@@ -753,12 +754,18 @@ fn ingress_is_configurable_and_validated() {
         "  public: false\n  ingress: internal-and-cloud-load-balancing\n",
     ));
     assert_eq!(
-        resolve_ok(&cfg, "dev").deployment.service.ingress,
+        resolve_ok(&cfg, "dev").deployments[0]
+            .clone()
+            .service
+            .ingress,
         "internal-and-cloud-load-balancing"
     );
     let (_d, cfg) = load_str(FULL);
     assert_eq!(
-        resolve_ok(&cfg, "dev").deployment.service.ingress,
+        resolve_ok(&cfg, "dev").deployments[0]
+            .clone()
+            .service
+            .ingress,
         "all",
         "default"
     );
@@ -777,8 +784,8 @@ fn ingress_is_configurable_and_validated() {
 fn health_check_defaults_overrides_and_limits() {
     let with = |hc: &str| FULL.replace("  public: false\n", &format!("  public: false\n{hc}"));
     let (_d, cfg) = load_str(&with("  health_check:\n    path: /healthz\n"));
-    let hc = resolve_ok(&cfg, "dev")
-        .deployment
+    let hc = resolve_ok(&cfg, "dev").deployments[0]
+        .clone()
         .service
         .health_check
         .unwrap();
@@ -793,8 +800,8 @@ fn health_check_defaults_overrides_and_limits() {
     let (_d, cfg) = load_str(&with(
         "  health_check:\n    path: /healthz\n    startup: { period_seconds: 5, failure_threshold: 24 }\n    liveness: false\n",
     ));
-    let hc = resolve_ok(&cfg, "dev")
-        .deployment
+    let hc = resolve_ok(&cfg, "dev").deployments[0]
+        .clone()
         .service
         .health_check
         .unwrap();
@@ -835,8 +842,8 @@ fn health_check_defaults_overrides_and_limits() {
 
     let (_d, cfg) = load_str(FULL);
     assert!(
-        resolve_ok(&cfg, "dev")
-            .deployment
+        resolve_ok(&cfg, "dev").deployments[0]
+            .clone()
             .service
             .health_check
             .is_none(),
@@ -850,7 +857,7 @@ fn project_tags_are_validated() {
         "  region: europe-west1\n",
         "  region: europe-west1\n  tags:\n    \"210987654321/allowIngressAllForCloudRun\": allow-ingress-all\n",
     ));
-    let d = resolve_ok(&cfg, "dev").deployment;
+    let d = resolve_ok(&cfg, "dev").deployments[0].clone();
     assert_eq!(
         d.project_tags["210987654321/allowIngressAllForCloudRun"],
         "allow-ingress-all"
@@ -874,7 +881,7 @@ fn bootstrap_and_otel_collector_settings() {
     let with =
         |extra: &str| FULL.replace("  public: false\n", &format!("  public: false\n{extra}"));
     let (_d, cfg) = load_str(&with("  bootstrap: {}\n  otel_collector: {}\n"));
-    let d = resolve_ok(&cfg, "dev").deployment;
+    let d = resolve_ok(&cfg, "dev").deployments[0].clone();
     let bs = d.service.bootstrap.unwrap();
     assert_eq!(
         (bs.image, bs.ingress.as_str()),
@@ -906,8 +913,8 @@ fn bootstrap_and_otel_collector_settings() {
     let (_d, cfg) = load_str(&with(
         "  otel_collector: { version: \"0.156.1\", cpu: \"2\", memory: 1Gi }\n",
     ));
-    let o = resolve_ok(&cfg, "dev")
-        .deployment
+    let o = resolve_ok(&cfg, "dev").deployments[0]
+        .clone()
         .service
         .otel_collector
         .unwrap();
@@ -917,8 +924,8 @@ fn bootstrap_and_otel_collector_settings() {
 
     let (_d, cfg) = load_str(&with("  otel_collector: { enabled: false }\n"));
     assert!(
-        resolve_ok(&cfg, "dev")
-            .deployment
+        resolve_ok(&cfg, "dev").deployments[0]
+            .clone()
             .service
             .otel_collector
             .is_none()
@@ -938,7 +945,7 @@ fn bootstrap_and_otel_collector_settings() {
     ));
     let r = resolve_ok(&cfg, "dev");
     assert_eq!(
-        r.deployment.service.env["OTEL_EXPORTER_OTLP_ENDPOINT"],
+        r.deployments[0].clone().service.env["OTEL_EXPORTER_OTLP_ENDPOINT"],
         "https://telemetry.googleapis.com"
     );
     assert!(
@@ -962,7 +969,7 @@ fn managed_secrets_and_secret_files() {
         "    TOKEN: { secret: \"${secrets.token}\" }\n    cert: { secret: \"${secrets.cert}\", path: /secrets/cert/tls.pem }\n",
     ));
     let r = resolve_ok(&cfg, "dev");
-    let d = r.deployment;
+    let d = r.deployments[0].clone();
     assert_eq!(d.secrets["token"].name, "token", "name defaults to the key");
     assert_eq!(d.secrets["token"].locations, ["europe-west1"]);
     assert_eq!(d.secrets["cert"].name, "hello-api-dev-cert");
@@ -1033,7 +1040,7 @@ fn sidecars_resolve_validate_and_override() {
         "    proxy:\n      image: \"envoyproxy/envoy:v1.31.0\"\n      cpu: 0.5\n      memory: 256Mi\n      args: [\"-c\", \"/etc/envoy/${stage}.yaml\"]\n      env: { LOG_LEVEL: debug }\n      secrets: { TOKEN: { secret: proxy-token } }\n      health_check: { port: 9901, path: /ready }\n      volumes: { cache: /cache }\n    sql:\n      image: \"gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.0\"\n      health_check: { port: 5432 }\n      start_before_app: false\n",
         "",
     ));
-    let d = resolve_ok(&cfg, "dev").deployment;
+    let d = resolve_ok(&cfg, "dev").deployments[0].clone();
     let p = &d.service.sidecars["proxy"];
     assert_eq!((p.cpu.as_str(), p.memory.as_str()), ("500m", "256Mi"));
     assert_eq!(p.args, ["-c", "/etc/envoy/dev.yaml"], "interpolated");
@@ -1063,14 +1070,18 @@ fn sidecars_resolve_validate_and_override() {
         "      sidecars: { sql: null }\n",
     ));
     assert!(
-        resolve_ok(&cfg, "dev")
-            .deployment
+        resolve_ok(&cfg, "dev").deployments[0]
+            .clone()
             .service
             .sidecars
             .is_empty()
     );
     assert_eq!(
-        resolve_ok(&cfg, "prod").deployment.service.sidecars.len(),
+        resolve_ok(&cfg, "prod").deployments[0]
+            .clone()
+            .service
+            .sidecars
+            .len(),
         1
     );
 
@@ -1139,7 +1150,7 @@ fn networking_billing_and_cloud_sql_resolve() {
   custom_audiences: [https://api.example.com]
 "#,
     ));
-    let s = resolve_ok(&cfg, "dev").deployment.service;
+    let s = resolve_ok(&cfg, "dev").deployments[0].clone().service;
     assert_eq!(s.billing, "instance-based");
     assert!(s.startup_cpu_boost);
     assert_eq!(s.execution_environment.as_deref(), Some("gen2"));
@@ -1166,7 +1177,7 @@ fn networking_billing_and_cloud_sql_resolve() {
 #[test]
 fn networking_defaults_leave_cloud_run_defaults() {
     let (_d, cfg) = load_str(FULL);
-    let s = resolve_ok(&cfg, "dev").deployment.service;
+    let s = resolve_ok(&cfg, "dev").deployments[0].clone().service;
     assert_eq!(s.billing, "request-based");
     assert!(!s.startup_cpu_boost);
     assert_eq!(s.execution_environment, None);
@@ -1297,7 +1308,11 @@ fn a_stage_vpc_block_replaces_the_inherited_one() {
         "  prod:\n    service:\n      min_instances: 1\n      vpc:\n        network: prod-net\n        subnet: prod-subnet\n",
     );
     let (_d, cfg) = load_str(&yaml);
-    let dev = resolve_ok(&cfg, "dev").deployment.service.vpc.unwrap();
+    let dev = resolve_ok(&cfg, "dev").deployments[0]
+        .clone()
+        .service
+        .vpc
+        .unwrap();
     assert_eq!(
         (dev.network.as_str(), dev.network_tags.len()),
         ("projects/my-gcp-project/global/networks/default", 1),
@@ -1307,7 +1322,11 @@ fn a_stage_vpc_block_replaces_the_inherited_one() {
         dev.subnet,
         "projects/my-gcp-project/regions/europe-west1/subnetworks/default"
     );
-    let prod = resolve_ok(&cfg, "prod").deployment.service.vpc.unwrap();
+    let prod = resolve_ok(&cfg, "prod").deployments[0]
+        .clone()
+        .service
+        .vpc
+        .unwrap();
     assert_eq!(
         prod.network,
         "projects/my-gcp-project/global/networks/prod-net"
@@ -1322,7 +1341,7 @@ fn a_stage_vpc_block_replaces_the_inherited_one() {
 #[test]
 fn sandboxes_run_on_gen2() {
     let (_d, cfg) = load_str(&full_with("  sandbox: true\n"));
-    let s = resolve_ok(&cfg, "dev").deployment.service;
+    let s = resolve_ok(&cfg, "dev").deployments[0].clone().service;
     assert!(s.sandbox);
     assert_eq!(
         s.execution_environment.as_deref(),
@@ -1331,7 +1350,7 @@ fn sandboxes_run_on_gen2() {
     );
 
     let (_d, cfg) = load_str(&full_with("  sandbox: false\n"));
-    let s = resolve_ok(&cfg, "dev").deployment.service;
+    let s = resolve_ok(&cfg, "dev").deployments[0].clone().service;
     assert!(!s.sandbox && s.execution_environment.is_none());
 
     let (_d, cfg) = load_str(&full_with(
@@ -1352,4 +1371,353 @@ fn sandboxes_run_on_gen2() {
     let e = resolve_err(&cfg, "dev");
     assert!(has_error(&e, "service.sandbox", "512Mi"), "{e:#?}");
     assert!(has_error(&e, "service.sandbox", "at least 1 CPU"), "{e:#?}");
+}
+
+const MULTI: &str = r#"
+version: 1
+app: shop
+provider:
+  project: my-gcp-project
+  region: europe-west1
+  artifact_repository: applications
+  source_bucket: my-gcp-build-sources
+  build_service_account: builds@my-gcp-project.iam.gserviceaccount.com
+defaults:
+  service_account: runtime@my-gcp-project.iam.gserviceaccount.com
+  memory: 1Gi
+  env:
+    LOG_LEVEL: info
+    SHARED: "1"
+service:
+  source: .
+services:
+  web:
+    source: web
+    env:
+      SHARED: null
+jobs:
+  migrate:
+    source: .
+    command: [python, manage.py, migrate]
+    max_retries: 1
+schedules:
+  nightly:
+    schedule: "0 3 * * *"
+    job: migrate
+  warm:
+    schedule: "*/10 * * * *"
+    service: web
+    path: /warm
+stages:
+  dev:
+    services:
+      web: null
+    schedules:
+      warm: null
+  prod:
+    defaults:
+      memory: 2Gi
+      env:
+        LOG_LEVEL: warning
+    services:
+      web:
+        min_instances: 1
+    jobs:
+      migrate:
+        tasks: 4
+"#;
+
+/// MULTI, with a `web` folder holding a Dockerfile.
+fn load_multi(yaml: &str) -> (tempfile::TempDir, LoadedConfig) {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+    fs::create_dir(dir.path().join("web")).unwrap();
+    fs::write(dir.path().join("web/Dockerfile"), "FROM scratch\n").unwrap();
+    let path = dir.path().join("runway.yaml");
+    fs::write(&path, yaml).unwrap();
+    let cfg = load(&path).unwrap();
+    (dir, cfg)
+}
+
+#[test]
+fn a_file_with_only_a_service_resolves_as_before() {
+    let (_d, cfg) = load_str(FULL);
+    let r = resolve_ok(&cfg, "dev");
+    assert_eq!(r.deployments.len(), 1);
+    assert!(r.schedules.is_empty() && r.scheduler.is_none());
+    let d = &r.deployments[0];
+    assert_eq!(
+        (d.key.as_deref(), d.service_id.as_str()),
+        (None, "hello-api-dev")
+    );
+    assert_eq!(d.kind, WorkloadKind::Service);
+    assert!(
+        !d.labels().contains_key(naming::LABEL_NAME),
+        "no new label: it would change the revision template of deployed services"
+    );
+    assert_eq!(
+        d.image_package(),
+        "hello-api",
+        "images stay where they were"
+    );
+    assert!(std::ptr::eq(r.holder(), d));
+}
+
+#[test]
+fn services_jobs_and_schedules_resolve_with_layers() {
+    let (_d, cfg) = load_multi(MULTI);
+    let r = resolve_ok(&cfg, "prod");
+    let ids: Vec<&str> = r
+        .deployments
+        .iter()
+        .map(|d| d.service_id.as_str())
+        .collect();
+    assert_eq!(ids, ["shop-prod", "shop-web-prod", "shop-migrate-prod"]);
+    let (main, web, job) = (&r.deployments[0], &r.deployments[1], &r.deployments[2]);
+    // defaults < stage defaults < the workload < its stage block
+    assert_eq!(main.service.memory, "2Gi");
+    assert_eq!(main.service.env["LOG_LEVEL"], "warning");
+    assert_eq!(
+        main.service.service_account,
+        "runtime@my-gcp-project.iam.gserviceaccount.com"
+    );
+    assert_eq!(web.service.min_instances, 1);
+    assert!(
+        !web.service.env.contains_key("SHARED"),
+        "null removes an inherited key"
+    );
+    assert_eq!(web.labels()[naming::LABEL_NAME], "web");
+    assert_eq!(web.image_package(), "shop-web");
+    assert_eq!(
+        job.kind,
+        WorkloadKind::Job(JobSettings {
+            tasks: 4,
+            parallelism: 0,
+            max_retries: 1
+        })
+    );
+    assert_eq!(job.service.timeout_seconds, DEFAULT_JOB_TIMEOUT_SECONDS);
+    assert_eq!(job.service.command, ["python", "manage.py", "migrate"]);
+    assert_eq!(
+        job.service.memory, "2Gi",
+        "jobs inherit the defaults they have"
+    );
+    // The job builds what the main service builds: one image, the service's.
+    assert!(std::ptr::eq(r.build_owner(job), main));
+    assert!(std::ptr::eq(r.build_owner(web), web));
+    assert!(std::ptr::eq(r.holder(), main));
+
+    assert_eq!(r.schedules.len(), 2);
+    let nightly = &r.schedules[0];
+    assert_eq!(nightly.id, "shop-nightly-prod");
+    assert_eq!(nightly.time_zone, "Etc/UTC");
+    assert_eq!(nightly.target.resource_id(), "shop-migrate-prod");
+    let ScheduleTarget::Service { path, method, .. } = &r.schedules[1].target else {
+        panic!("warm calls a service");
+    };
+    assert_eq!((path.as_str(), method.as_str()), ("/warm", "POST"));
+    let sc = r.scheduler.as_ref().unwrap();
+    assert_eq!(
+        sc.service_account,
+        "shop-prod-sched@my-gcp-project.iam.gserviceaccount.com"
+    );
+    assert!(sc.create, "runway creates the default account");
+    assert_eq!(sc.region, "europe-west1");
+}
+
+#[test]
+fn a_stage_can_drop_a_service_and_a_schedule() {
+    let (_d, cfg) = load_multi(MULTI);
+    let r = resolve_ok(&cfg, "dev");
+    let ids: Vec<&str> = r
+        .deployments
+        .iter()
+        .map(|d| d.service_id.as_str())
+        .collect();
+    assert_eq!(ids, ["shop-dev", "shop-migrate-dev"]);
+    assert_eq!(r.schedules.len(), 1);
+}
+
+#[test]
+fn jobs_take_only_job_settings_from_defaults() {
+    let yaml = MULTI.replace(
+        "  memory: 1Gi\n",
+        "  memory: 1Gi\n  public: true\n  timeout_seconds: 30\n  iap: {members: [group:team@example.com]}\n",
+    );
+    let (_d, cfg) = load_multi(&yaml);
+    let r = resolve_ok(&cfg, "prod");
+    let job = r.jobs().next().unwrap();
+    assert!(!job.service.public && !job.service.iap.enabled);
+    assert_eq!(
+        job.service.timeout_seconds, 600,
+        "a request timeout is not a task timeout"
+    );
+    assert!(
+        r.services()
+            .all(|s| s.service.public && s.service.iap.enabled)
+    );
+}
+
+#[test]
+fn names_and_schedules_are_validated() {
+    let yaml = MULTI
+        .replace(
+            "  web:\n    source: web\n",
+            "  Web_1:\n    source: web\n  shop:\n    source: web\n  migrate:\n    source: web\n",
+        )
+        .replace(
+            "    schedule: \"0 3 * * *\"\n    job: migrate\n",
+            "    schedule: \"every day\"\n    time_zone: Paris\n    job: missing\n",
+        )
+        .replace(
+            "    service: web\n    path: /warm\n",
+            "    service: web\n    job: migrate\n",
+        );
+    let (_d, cfg) = load_multi(&yaml);
+    let e = resolve_err(&cfg, "prod");
+    assert!(has_error(&e, "services.Web_1", "lowercase"), "{e:#?}");
+    assert!(has_error(&e, "services.shop", "app name"), "{e:#?}");
+    assert!(
+        has_error(&e, "jobs.migrate", "also a service name"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "schedules.nightly.schedule", "5 fields"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "schedules.nightly.time_zone", "IANA"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "schedules.nightly.job", "not a job"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "schedules.warm", "exactly one target"),
+        "{e:#?}"
+    );
+
+    let long = MULTI
+        .replace(
+            "  migrate:\n    source: .\n",
+            "  a-very-long-job-name-for-limits:\n    source: .\n",
+        )
+        .replace(
+            "    job: migrate\n",
+            "    job: a-very-long-job-name-for-limits\n",
+        )
+        .replace("      migrate:\n        tasks: 4\n", "");
+    let (_d, cfg) =
+        load_multi(&long.replace("app: shop", "app: shop-with-a-much-longer-application-name"));
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "jobs.a-very-long-job-name-for-limits", "63 characters"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn image_override_targets_one_workload() {
+    let (_d, cfg) = load_multi(MULTI);
+    let image = Some("europe-west1-docker.pkg.dev/my-gcp-project/applications/web:1".to_string());
+    let e = resolve(
+        &cfg,
+        "prod",
+        &Overrides {
+            image: image.clone(),
+            target: None,
+        },
+    )
+    .unwrap_err();
+    assert!(has_error(&e.errors, "--image", "--only"), "{:#?}", e.errors);
+    let r = resolve(
+        &cfg,
+        "prod",
+        &Overrides {
+            image,
+            target: Some("web".into()),
+        },
+    )
+    .unwrap();
+    let kinds: Vec<bool> = r
+        .deployments
+        .iter()
+        .map(|d| matches!(d.artifact, Artifact::Image { .. }))
+        .collect();
+    assert_eq!(kinds, [false, true, false]);
+}
+
+#[test]
+fn only_selects_by_name_or_build_folder() {
+    let (dir, cfg) = load_multi(MULTI);
+    let r = resolve_ok(&cfg, "prod");
+    let ids = |only: &[&str]| -> Vec<String> {
+        let only: Vec<String> = only.iter().map(|s| s.to_string()).collect();
+        r.select(&only)
+            .unwrap()
+            .iter()
+            .map(|d| d.service_id.clone())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["shop", "migrate"]),
+        ["shop-prod", "shop-migrate-prod"]
+    );
+    let root = dir.path().to_str().unwrap();
+    assert_eq!(
+        ids(&[&format!("{root}/web/src/app.py")]),
+        ["shop-web-prod"],
+        "not the root service too"
+    );
+    assert_eq!(
+        ids(&[&format!("{root}/lib/x.py")]),
+        ["shop-prod", "shop-migrate-prod"],
+        "a path outside every app folder: what builds from the root"
+    );
+    assert!(r.select(&["nope".into()]).is_err());
+}
+
+#[test]
+fn jobs_need_one_cpu_and_512mi() {
+    let yaml = MULTI.replace(
+        "    command: [python, manage.py, migrate]\n",
+        "    command: [python, manage.py, migrate]\n    cpu: \"0.5\"\n    memory: 256Mi\n",
+    );
+    let (_d, cfg) = load_multi(&yaml);
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "jobs.migrate.cpu", "at least 1 CPU"),
+        "{e:#?}"
+    );
+    assert!(has_error(&e, "jobs.migrate.memory", "512Mi"), "{e:#?}");
+}
+
+#[test]
+fn the_scheduler_region_outlives_the_schedules() {
+    let yaml = MULTI.replace(
+        "schedules:\n  nightly:",
+        "scheduler: {region: us-central1}\nschedules:\n  nightly:",
+    );
+    let (_d, cfg) = load_multi(&yaml);
+    let r = resolve_ok(&cfg, "prod");
+    assert_eq!(r.scheduler.as_ref().unwrap().region, "us-central1");
+    // dev drops `warm`; without any schedule the region is still known.
+    let none = yaml.replace(
+        "    schedules:\n      warm: null\n",
+        "    schedules:\n      warm: null\n      nightly: null\n",
+    );
+    let (_d, cfg) = load_multi(&none);
+    let r = resolve_ok(&cfg, "dev");
+    assert!(r.schedules.is_empty());
+    assert!(
+        r.deployments
+            .iter()
+            .all(|d| d.scheduler_region == "us-central1")
+    );
+    let (_d, cfg) = load_str(FULL);
+    assert_eq!(
+        resolve_ok(&cfg, "dev").first().scheduler_region,
+        "europe-west1"
+    );
 }

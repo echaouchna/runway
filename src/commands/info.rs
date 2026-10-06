@@ -45,7 +45,7 @@ pub(crate) fn print_traffic(lines: &[run::TrafficLine]) {
 
 pub async fn run(ctx: &Context, args: InfoArgs) -> Result<()> {
     let resolved = load(ctx, &args.stage.stage, &Overrides::default())?;
-    let d = &resolved.deployment;
+    let d = crate::commands::one(&resolved, &args.stage.only, false)?;
     let session = crate::commands::connect(ctx, d).await?;
     let client = build_client!(Services, session)?;
     let rec = Reconciler {

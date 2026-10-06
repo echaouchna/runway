@@ -10,7 +10,10 @@
 //! declare (without a state file it cannot know who added them).
 
 use crate::build_client_at;
-use crate::config::{Artifact, BucketConfig, Deployment, ManagedSecret, RoleBinding, RoleTarget};
+use crate::config::{
+    Artifact, BucketConfig, Deployment, ManagedSecret, Resolved, RoleBinding, RoleTarget,
+    ScheduleConfig, ScheduleTarget,
+};
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::bucket;
 use crate::gcp::{
@@ -35,6 +38,7 @@ use google_cloud_run_v2::client::Services;
 use google_cloud_secretmanager_v1::client::SecretManagerService;
 use google_cloud_storage::client::StorageControl;
 use serde::Serialize;
+use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 pub const IAP_ACCESSOR_ROLE: &str = "roles/iap.httpsResourceAccessor";
@@ -102,6 +106,13 @@ pub enum Step {
         /// `KEY/VALUE` (namespaced) for display.
         value: String,
     },
+    /// Create or update a Cloud Scheduler job (after its target exists).
+    Schedule(ScheduleConfig),
+    /// Delete a Cloud Scheduler job runway created that is no longer configured.
+    Unschedule {
+        /// Full name `projects/P/locations/R/jobs/ID`.
+        name: String,
+    },
 }
 
 /// Service annotation listing the grants runway manages for the service
@@ -122,6 +133,16 @@ pub struct ManagedGrant {
     /// service, since another service may share an account it was given.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub runtime: bool,
+    /// For an IAP grant (`target: None`), the service whose IAP resource
+    /// holds it; `None` is the main service (`<app>-<stage>`), as in records
+    /// written before named services existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+/// `service` of an IAP grant for this service (see [`ManagedGrant::service`]).
+fn iap_service(d: &Deployment) -> Option<String> {
+    d.key.as_ref().map(|_| d.service_id.clone())
 }
 
 impl ManagedGrant {
@@ -146,6 +167,7 @@ pub fn managed_grants(d: &Deployment) -> Vec<ManagedGrant> {
                     role: binding.role,
                     target: Some(binding.target),
                     runtime: true,
+                    service: None,
                 });
             }
             Step::GrantMembers { members, binding } => {
@@ -154,17 +176,19 @@ pub fn managed_grants(d: &Deployment) -> Vec<ManagedGrant> {
                     role: binding.role.clone(),
                     target: Some(binding.target.clone()),
                     runtime: false,
+                    service: None,
                 }));
             }
             _ => {}
         }
     }
-    if d.service.iap.enabled {
+    if d.service.iap.enabled && !d.is_job() {
         out.extend(d.service.iap.members.iter().map(|m| ManagedGrant {
             member: m.clone(),
             role: IAP_ACCESSOR_ROLE.into(),
             target: None,
             runtime: false,
+            service: iap_service(d),
         }));
     }
     let mut unique = Vec::new();
@@ -297,6 +321,15 @@ impl Step {
                 format!("revoke {} on {} from {who}", g.role, g.on())
             }
             Step::Untag { value, .. } => format!("unbind tag {value}"),
+            Step::Schedule(sc) => {
+                format!("schedule {} ({}, {})", sc.key, sc.schedule, sc.time_zone)
+            }
+            Step::Unschedule { name } => {
+                format!(
+                    "delete schedule {}",
+                    name.rsplit('/').next().unwrap_or(name)
+                )
+            }
         }
     }
 
@@ -322,9 +355,9 @@ impl Step {
             | Step::IapInvoker
             | Step::IapAccess => 1,
             Step::Grant { .. } | Step::GrantMembers { .. } => 2,
-            Step::SecretValues(_) => 3,
+            Step::SecretValues(_) | Step::Schedule(_) => 3,
             // After the rollout, once the new revision no longer needs it.
-            Step::Revoke(_) | Step::Untag { .. } => 4,
+            Step::Revoke(_) | Step::Untag { .. } | Step::Unschedule { .. } => 4,
         }
     }
 
@@ -659,6 +692,145 @@ pub fn post_steps(d: &Deployment) -> Vec<Step> {
     steps
 }
 
+/// `~ field: a -> b; + field: c` for a step's details.
+fn change_summary(changes: &[crate::plan::FieldChange]) -> String {
+    changes
+        .iter()
+        .map(|c| match (&c.before, &c.after) {
+            (Some(b), Some(a)) => format!("~ {}: {b} -> {a}", c.field),
+            (None, Some(a)) => format!("+ {}: {a}", c.field),
+            (Some(b), None) => format!("- {}: {b}", c.field),
+            (None, None) => c.field.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Role the scheduler invoker gets on each target (it includes running jobs).
+pub const INVOKER_ROLE: &str = "roles/run.invoker";
+
+/// APIs the stage needs: those of every service and job, plus Cloud
+/// Scheduler for schedules.
+pub fn stack_required_apis(r: &Resolved) -> Vec<String> {
+    let mut apis: Vec<String> = r.deployments.iter().flat_map(required_apis).collect();
+    if !r.schedules.is_empty() {
+        apis.push("cloudscheduler.googleapis.com".into());
+    }
+    apis.sort();
+    apis.dedup();
+    apis
+}
+
+pub fn stack_api_step(r: &Resolved) -> Option<Step> {
+    r.first()
+        .apis
+        .enable
+        .then(|| Step::EnableApis(stack_required_apis(r)))
+}
+
+/// The pre-deploy steps of every workload, each once (a service account
+/// shared by several workloads is created once), plus the scheduler invoker.
+pub fn stack_pre_steps(r: &Resolved) -> Vec<Step> {
+    let mut out: Vec<Step> = Vec::new();
+    let d = r.first();
+    let invoker =
+        r.scheduler
+            .as_ref()
+            .filter(|sc| sc.create)
+            .map(|sc| Step::CreateServiceAccount {
+                email: sc.service_account.clone(),
+                display_name: format!("runway scheduler ({} {})", d.app, d.stage),
+                description: sa_marker(&d.app, Some(&d.stage), "scheduler"),
+            });
+    for step in r.deployments.iter().flat_map(pre_steps).chain(invoker) {
+        let dup = out.iter().any(|x| match (x, &step) {
+            (
+                Step::CreateServiceAccount { email: a, .. },
+                Step::CreateServiceAccount { email: b, .. },
+            ) => a == b,
+            (a, b) => a == b,
+        });
+        if !dup {
+            out.push(step);
+        }
+    }
+    out
+}
+
+/// What the scheduler invoker is granted: `run.invoker` on every target.
+pub fn schedule_grant_steps(r: &Resolved) -> Vec<Step> {
+    let (Some(sc), Some(d)) = (r.scheduler.as_ref(), r.deployments.first()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Step> = Vec::new();
+    for s in &r.schedules {
+        let name = format!(
+            "{}/{}/{}",
+            d.parent(),
+            match s.target {
+                ScheduleTarget::Job { .. } => "jobs",
+                ScheduleTarget::Service { .. } => "services",
+            },
+            s.target.resource_id()
+        );
+        let target = match s.target {
+            ScheduleTarget::Job { .. } => RoleTarget::RunJob { name },
+            ScheduleTarget::Service { .. } => RoleTarget::RunService { name },
+        };
+        let step = Step::Grant {
+            email: sc.service_account.clone(),
+            binding: RoleBinding {
+                role: INVOKER_ROLE.into(),
+                target,
+            },
+        };
+        if !out.contains(&step) {
+            out.push(step);
+        }
+    }
+    out
+}
+
+/// After the services and jobs exist: invoker grants, then schedules.
+pub fn schedule_steps(r: &Resolved) -> Vec<Step> {
+    let mut out = schedule_grant_steps(r);
+    out.extend(r.schedules.iter().cloned().map(Step::Schedule));
+    out
+}
+
+/// What runway records and revokes for the whole stage: every workload's
+/// managed grants and the scheduler invoker's.
+pub fn stack_managed_grants(r: &Resolved) -> Vec<ManagedGrant> {
+    let mut out: Vec<ManagedGrant> = Vec::new();
+    let invoker = schedule_grant_steps(r).into_iter().filter_map(|s| match s {
+        Step::Grant { email, binding } => Some(ManagedGrant {
+            member: format!("serviceAccount:{email}"),
+            role: binding.role,
+            target: Some(binding.target),
+            runtime: false,
+            service: None,
+        }),
+        _ => None,
+    });
+    for g in r.deployments.iter().flat_map(managed_grants).chain(invoker) {
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    }
+    out
+}
+
+/// Revocations: recorded grants no workload of the stage wants any more.
+pub fn stack_revoke_steps(recorded: &[ManagedGrant], r: &Resolved) -> Vec<Step> {
+    let desired = stack_managed_grants(r);
+    recorded
+        .iter()
+        .filter(|g| !desired.contains(g))
+        .cloned()
+        .map(Step::Revoke)
+        .collect()
+}
+
 /// Every step in execution order (APIs, pre-deploy, post-deploy).
 pub fn all_steps(d: &Deployment) -> Vec<Step> {
     api_step(d)
@@ -709,6 +881,7 @@ enum PolicyTarget {
     Bucket(String),
     Secret(String),
     RunService(String),
+    RunJob(String),
     Iap(String),
     Repository(String),
 }
@@ -720,6 +893,7 @@ impl std::fmt::Display for PolicyTarget {
             PolicyTarget::Bucket(b) => write!(f, "bucket gs://{b}"),
             PolicyTarget::Secret(s) => write!(f, "secret {s}"),
             PolicyTarget::RunService(s) => write!(f, "service {}", naming_short(s)),
+            PolicyTarget::RunJob(s) => write!(f, "job {}", naming_short(s)),
             PolicyTarget::Iap(r) => write!(f, "IAP resource {r}"),
             PolicyTarget::Repository(r) => write!(f, "repository {r}"),
         }
@@ -744,6 +918,7 @@ fn needed_role_hint(t: &PolicyTarget) -> &'static str {
         PolicyTarget::RunService(_) => {
             "the deployer needs run.services.setIamPolicy (roles/run.admin)"
         }
+        PolicyTarget::RunJob(_) => "the deployer needs run.jobs.setIamPolicy (roles/run.admin)",
         PolicyTarget::Iap(_) => {
             "the deployer needs roles/iap.admin, and iap.googleapis.com must be enabled"
         }
@@ -796,7 +971,7 @@ pub fn iap_service_agent(project_number: &str) -> String {
 }
 
 /// Clients are created only for the step types a configuration uses.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Clients {
     iam: Option<Iam>,
     projects: Option<Projects>,
@@ -810,6 +985,8 @@ struct Clients {
     iap: Option<IdentityAwareProxyAdminService>,
     service_usage: Option<ServiceUsage>,
     artifact: Option<ArtifactRegistry>,
+    jobs: Option<google_cloud_run_v2::client::Jobs>,
+    scheduler: Option<google_cloud_scheduler_v1::client::CloudScheduler>,
 }
 
 /// Optional API endpoint overrides (tests, private endpoints).
@@ -826,22 +1003,30 @@ pub struct Endpoints {
     /// Base URL of the Service Usage REST API.
     pub service_usage: Option<String>,
     pub artifact_registry: Option<String>,
+    /// Cloud Run (jobs; services use the client given to the provisioner).
+    pub run: Option<String>,
+    pub scheduler: Option<String>,
 }
 
 pub struct Provisioner<'a> {
+    /// The service post-rollout steps (tags, IAP) apply to; stage-wide values
+    /// (project, region, secrets) come from it too.
     pub d: &'a Deployment,
+    /// Every service, job and schedule of the stage; `None`: just `d`.
+    pub stack: Option<&'a Resolved>,
     session: &'a Session,
     run: &'a Services,
     clients: Clients,
-    project_number: OnceCell<String>,
+    project_number: Arc<OnceCell<String>>,
     service_usage: String,
-    /// Managed grants this provisioner added (not those already present):
-    /// only what runway granted is recorded, hence ever revoked.
-    granted: std::sync::Mutex<Vec<ManagedGrant>>,
+    /// Managed grants added (not those already present), shared by the
+    /// views of [`Provisioner::for_service`]: only what runway granted is
+    /// recorded, hence ever revoked.
+    granted: Arc<Mutex<Vec<ManagedGrant>>>,
     /// Grant writes whose answer was lost (timeout, transport error, 5xx), as
     /// (policy, role, member): the next read decides. Present means runway's
     /// write committed, so the grant is runway's; missing means it did not.
-    uncertain: std::sync::Mutex<Vec<(String, String, String)>>,
+    uncertain: Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
 fn missing<T>(c: &Option<T>, what: &str) -> Result<T>
@@ -946,12 +1131,24 @@ impl<'a> Provisioner<'a> {
             session,
             ep.iap.clone()
         )?);
+        // Jobs and schedules (also to remove those no longer configured).
+        c.jobs = Some(build_client_at!(
+            google_cloud_run_v2::client::Jobs,
+            session,
+            ep.run.clone()
+        )?);
+        c.scheduler = Some(build_client_at!(
+            google_cloud_scheduler_v1::client::CloudScheduler,
+            session,
+            ep.scheduler.clone()
+        )?);
         Ok(Self {
             d,
+            stack: None,
             session,
             run,
             clients: c,
-            project_number: OnceCell::new(),
+            project_number: Default::default(),
             granted: Default::default(),
             uncertain: Default::default(),
             service_usage: ep
@@ -959,6 +1156,44 @@ impl<'a> Provisioner<'a> {
                 .clone()
                 .unwrap_or_else(|| "https://serviceusage.googleapis.com".into()),
         })
+    }
+
+    /// Every service, job and schedule of the stage: stage-wide steps and
+    /// removals then consider all of them.
+    pub fn with_stack(mut self, r: &'a Resolved) -> Self {
+        self.stack = Some(r);
+        self
+    }
+
+    /// The same provisioner (clients, what it granted) for the tags and IAP
+    /// of one service.
+    pub fn for_service(&self, d: &'a Deployment) -> Provisioner<'a> {
+        Provisioner {
+            d,
+            stack: self.stack,
+            session: self.session,
+            run: self.run,
+            clients: self.clients.clone(),
+            project_number: self.project_number.clone(),
+            service_usage: self.service_usage.clone(),
+            granted: self.granted.clone(),
+            uncertain: self.uncertain.clone(),
+        }
+    }
+
+    fn workloads(&self) -> Vec<&'a Deployment> {
+        match self.stack {
+            Some(r) => r.deployments.iter().collect(),
+            None => vec![self.d],
+        }
+    }
+
+    /// Grants every workload (and the scheduler) wants.
+    fn desired_grants(&self) -> Vec<ManagedGrant> {
+        match self.stack {
+            Some(r) => stack_managed_grants(r),
+            None => managed_grants(self.d),
+        }
     }
 
     /// Clients needed to tear down what `deploy` created (`undeploy`).
@@ -1026,6 +1261,14 @@ impl<'a> Provisioner<'a> {
                     .send()
                     .await
             }
+            PolicyTarget::RunJob(n) => {
+                missing_gax(&self.clients.jobs)?
+                    .get_iam_policy()
+                    .set_resource(n)
+                    .set_options(v3)
+                    .send()
+                    .await
+            }
             PolicyTarget::Iap(r) => {
                 missing_gax(&self.clients.iap)?
                     .get_iam_policy()
@@ -1077,6 +1320,14 @@ impl<'a> Provisioner<'a> {
             }
             PolicyTarget::RunService(n) => {
                 self.run
+                    .set_iam_policy()
+                    .set_resource(n)
+                    .set_policy(p)
+                    .send()
+                    .await
+            }
+            PolicyTarget::RunJob(n) => {
+                missing_gax(&self.clients.jobs)?
                     .set_iam_policy()
                     .set_resource(n)
                     .set_policy(p)
@@ -1272,6 +1523,8 @@ impl<'a> Provisioner<'a> {
             RoleTarget::Project { project } => Some(PolicyTarget::Project(project.clone())),
             RoleTarget::Bucket { bucket } => Some(PolicyTarget::Bucket(bucket.clone())),
             RoleTarget::Secret { name } => Some(PolicyTarget::Secret(name.clone())),
+            RoleTarget::RunService { name } => Some(PolicyTarget::RunService(name.clone())),
+            RoleTarget::RunJob { name } => Some(PolicyTarget::RunJob(name.clone())),
             RoleTarget::Dataset { .. } => None,
         }
     }
@@ -1504,7 +1757,148 @@ impl<'a> Provisioner<'a> {
                     (StepState::InSync, "already unbound".into())
                 }
             }
+            Step::Schedule(sc) => {
+                let (live, desired) = self.schedule_state(sc).await?;
+                match (live, desired) {
+                    (_, None) => (
+                        StepState::Pending,
+                        "after the service is created (its URL is the target)".into(),
+                    ),
+                    (None, Some(_)) => (StepState::Pending, "create".into()),
+                    (Some(live), Some(want)) => {
+                        let changes = crate::plan::diff(&live, &want);
+                        if changes.is_empty() {
+                            (StepState::InSync, "up to date".into())
+                        } else {
+                            (StepState::Pending, change_summary(&changes))
+                        }
+                    }
+                }
+            }
+            Step::Unschedule { name } => {
+                match crate::gcp::scheduler::get(&self.scheduler()?, name).await? {
+                    Some(_) => (
+                        StepState::PendingRemoval,
+                        "not in runway.yaml: delete".into(),
+                    ),
+                    None => (StepState::InSync, "already deleted".into()),
+                }
+            }
         })
+    }
+
+    fn scheduler(&self) -> Result<google_cloud_scheduler_v1::client::CloudScheduler> {
+        missing(&self.clients.scheduler, "CloudScheduler")
+    }
+
+    pub fn scheduler_client(&self) -> Result<google_cloud_scheduler_v1::client::CloudScheduler> {
+        self.scheduler()
+    }
+
+    fn scheduler_config(&self) -> Result<&'a crate::config::SchedulerConfig> {
+        self.stack
+            .and_then(|r| r.scheduler.as_ref())
+            .ok_or_else(|| Error::internal("schedules without a scheduler account"))
+    }
+
+    /// Full name of a schedule's scheduler job.
+    pub fn schedule_name(&self, sc: &ScheduleConfig) -> Result<String> {
+        Ok(crate::gcp::scheduler::job_name(
+            &self.d.project,
+            &self.scheduler_config()?.region,
+            &sc.id,
+        ))
+    }
+
+    /// The live scheduler job (compared fields) and what runway would send;
+    /// `None` desired while a target service has no URL yet. Fails on a
+    /// scheduler job runway does not own.
+    async fn schedule_state(
+        &self,
+        sc: &ScheduleConfig,
+    ) -> Result<(
+        Option<std::collections::BTreeMap<String, String>>,
+        Option<std::collections::BTreeMap<String, String>>,
+    )> {
+        let (live, desired) = self.schedule_request(sc).await?;
+        Ok((
+            live.as_ref().map(crate::gcp::scheduler::flat),
+            desired.map(|j| crate::gcp::scheduler::desired_flat(&j, sc.paused)),
+        ))
+    }
+
+    async fn schedule_request(
+        &self,
+        sc: &ScheduleConfig,
+    ) -> Result<(
+        Option<google_cloud_scheduler_v1::model::Job>,
+        Option<google_cloud_scheduler_v1::model::Job>,
+    )> {
+        let d = self.d;
+        let name = self.schedule_name(sc)?;
+        let live = crate::gcp::scheduler::get(&self.scheduler()?, &name).await?;
+        if let Some(j) = &live
+            && !crate::gcp::scheduler::owned(j, &d.app, &d.stage)
+        {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                format!("Cloud Scheduler job {} exists and was not created by runway for this app and stage", sc.id),
+            )
+            .permanent()
+            .hint("rename the schedule in runway.yaml, or delete the existing scheduler job"));
+        }
+        let service_url = match &sc.target {
+            ScheduleTarget::Service { service_id, .. } => {
+                let svc_name = format!("{}/services/{service_id}", d.parent());
+                match self.run.get_service().set_name(&svc_name).send().await {
+                    Ok(svc) if !svc.uri.is_empty() => Some(svc.uri),
+                    Ok(_) => None,
+                    Err(e) if is_not_found(&e) => None,
+                    Err(e) => return Err(api_error(e, &format!("reading service {service_id}"))),
+                }
+            }
+            ScheduleTarget::Job { .. } => None,
+        };
+        let Some(uri) =
+            crate::gcp::scheduler::target_uri(sc, &d.project, &d.region, service_url.as_deref())
+        else {
+            return Ok((live, None));
+        };
+        let invoker = &self.scheduler_config()?.service_account;
+        let desired = crate::gcp::scheduler::desired(
+            sc,
+            &name,
+            &d.app,
+            &d.stage,
+            invoker,
+            &uri,
+            service_url.as_deref(),
+        );
+        Ok((live, Some(desired)))
+    }
+
+    /// Scheduler jobs runway created for this stage that are not configured.
+    pub async fn orphan_schedules(&self) -> Result<Vec<Step>> {
+        // Without a stack (or schedules), every schedule runway created for
+        // this stage is left over.
+        let d = self.d;
+        let region = d.scheduler_region.clone();
+        let parent = crate::gcp::scheduler::parent(&d.project, &region);
+        let wanted: Vec<String> = self
+            .stack
+            .map(|r| r.schedules.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|s| crate::gcp::scheduler::job_name(&d.project, &region, &s.id))
+            .collect();
+        Ok(
+            crate::gcp::scheduler::list_owned(&self.scheduler()?, &parent, &d.app, &d.stage)
+                .await?
+                .into_iter()
+                .filter(|j| !wanted.contains(&j.name))
+                .map(|j| Step::Unschedule { name: j.name })
+                .collect(),
+        )
     }
 
     // ---------- applies (idempotent) ----------
@@ -1636,6 +2030,7 @@ impl<'a> Provisioner<'a> {
                     role: binding.role.clone(),
                     target: Some(binding.target.clone()),
                     runtime: false,
+                    service: None,
                 };
                 let added = self
                     .add_members(&t, &binding.role, members, Some(&grant))
@@ -1681,6 +2076,7 @@ impl<'a> Provisioner<'a> {
                     role: IAP_ACCESSOR_ROLE.into(),
                     target: None,
                     runtime: false,
+                    service: iap_service(self.d),
                 };
                 let added = self
                     .add_members(
@@ -1694,6 +2090,50 @@ impl<'a> Provisioner<'a> {
             }
             Step::Revoke(g) => self.revoke(g).await?,
             Step::Untag { binding, value } => self.unbind_tag(binding, value).await?,
+            Step::Schedule(sc) => {
+                let (live, desired) = self.schedule_request(sc).await?;
+                let Some(desired) = desired else {
+                    return Err(Error::new(
+                        ErrorKind::Deploy,
+                        format!("schedule {}: the target service has no URL yet", sc.key),
+                    ));
+                };
+                let want = crate::gcp::scheduler::desired_flat(&desired, sc.paused);
+                match &live {
+                    Some(l)
+                        if crate::plan::diff(&crate::gcp::scheduler::flat(l), &want).is_empty() =>
+                    {
+                        (StepOutcome::Unchanged, "up to date".into())
+                    }
+                    _ => {
+                        let parent = crate::gcp::scheduler::parent(
+                            &self.d.project,
+                            &self.scheduler_config()?.region,
+                        );
+                        crate::gcp::scheduler::apply(
+                            &self.scheduler()?,
+                            &parent,
+                            desired,
+                            live.is_some(),
+                            sc.paused,
+                        )
+                        .await?;
+                        (
+                            StepOutcome::Changed,
+                            if live.is_some() { "updated" } else { "created" }.into(),
+                        )
+                    }
+                }
+            }
+            Step::Unschedule { name } => {
+                let (app, stage) = (&self.d.app, &self.d.stage);
+                match crate::gcp::scheduler::delete_owned(&self.scheduler()?, name, app, stage)
+                    .await?
+                {
+                    true => (StepOutcome::Changed, "deleted".into()),
+                    false => (StepOutcome::Unchanged, "already deleted".into()),
+                }
+            }
         };
         Ok(StepResult {
             step: name,
@@ -1772,14 +2212,23 @@ impl<'a> Provisioner<'a> {
     }
 
     async fn ensure_grant(&self, email: &str, b: &RoleBinding) -> Result<(StepOutcome, String)> {
-        // Roles of the runtime account are runway's to record; the build
-        // account's are not managed (other apps share it).
-        let managed = email == self.d.service.service_account;
+        // Roles of runtime accounts and of the scheduler invoker are runway's
+        // to record; the build account's are not managed (other apps share it).
+        let runtime = self
+            .workloads()
+            .iter()
+            .any(|w| w.service.service_account == email);
+        let invoker = self
+            .stack
+            .and_then(|r| r.scheduler.as_ref())
+            .is_some_and(|sc| sc.service_account == email);
+        let managed = runtime || invoker;
         let grant = |m: &str| ManagedGrant {
             member: m.into(),
             role: b.role.clone(),
             target: Some(b.target.clone()),
-            runtime: true,
+            runtime,
+            service: None,
         };
         let grant: Option<&dyn Fn(&str) -> ManagedGrant> = managed.then_some(&grant);
         let member = Self::sa_member(email);
@@ -2338,19 +2787,41 @@ impl<'a> Provisioner<'a> {
     /// must exist. Each of the four is read on its own: one that cannot be
     /// read is reported in [`Unlisted::unchecked`], the others still count.
     pub async fn unlisted(&self, recorded: &[ManagedGrant]) -> Unlisted {
-        let (iap, adders, runtime, tags) = tokio::join!(
-            self.unlisted_iap(),
-            self.unlisted_adders(),
-            self.unlisted_roles(recorded),
-            self.unlisted_tags(),
-        );
-        let mut out = Unlisted::default();
-        for (what, found) in [
-            ("IAP access", iap),
+        let (mut shared, service) =
+            tokio::join!(self.unlisted_shared(recorded), self.unlisted_service());
+        shared.steps.extend(service.steps);
+        shared.unchecked.extend(service.unchecked);
+        shared
+    }
+
+    /// Stage-wide removals: secret adders and roles of runtime accounts,
+    /// against what every workload of the stage wants.
+    pub async fn unlisted_shared(&self, recorded: &[ManagedGrant]) -> Unlisted {
+        let (adders, runtime) = tokio::join!(self.unlisted_adders(), self.unlisted_roles(recorded));
+        Self::collect_unlisted([
             ("secret adders", adders),
             ("runtime account roles", runtime),
-            ("service tags", tags),
-        ] {
+        ])
+    }
+
+    /// Removals on this provisioner's service: IAP access and tags.
+    pub async fn unlisted_service(&self) -> Unlisted {
+        let (iap, tags) = tokio::join!(self.unlisted_iap(), self.unlisted_tags());
+        let mut out = Self::collect_unlisted([("IAP access", iap), ("service tags", tags)]);
+        // The IAP grants of a named service name it (see `ManagedGrant::service`).
+        for s in &mut out.steps {
+            if let Step::Revoke(g) = s
+                && g.target.is_none()
+            {
+                g.service = iap_service(self.d);
+            }
+        }
+        out
+    }
+
+    fn collect_unlisted<const N: usize>(found: [(&str, Result<Vec<Step>>); N]) -> Unlisted {
+        let mut out = Unlisted::default();
+        for (what, found) in found {
             match found {
                 Ok(steps) => out.steps.extend(steps),
                 Err(e) => out.unchecked.push(format!("{what}: {e}")),
@@ -2370,6 +2841,7 @@ impl<'a> Provisioner<'a> {
             role: role.into(),
             target,
             runtime,
+            service: None,
         })
     }
 
@@ -2441,11 +2913,24 @@ impl<'a> Provisioner<'a> {
         Ok(out)
     }
 
-    /// Roles of a runtime account runway created for this service.
+    /// Roles of the runtime accounts runway created for this stage.
     async fn unlisted_roles(&self, recorded: &[ManagedGrant]) -> Result<Vec<Step>> {
+        let mut accounts: Vec<&str> = Vec::new();
+        for w in self.workloads() {
+            if !accounts.contains(&w.service.service_account.as_str()) {
+                accounts.push(&w.service.service_account);
+            }
+        }
+        let mut out = Vec::new();
+        for email in accounts {
+            out.extend(self.unlisted_roles_of(email, recorded).await?);
+        }
+        Ok(out)
+    }
+
+    async fn unlisted_roles_of(&self, email: &str, recorded: &[ManagedGrant]) -> Result<Vec<Step>> {
         let d = self.d;
         let mut out = Vec::new();
-        let email = &d.service.service_account;
         let owned = match self.service_account_description(email).await? {
             Some(desc) => has_sa_marker(&desc, &d.app, Some(&d.stage), "runtime"),
             None => false,
@@ -2453,7 +2938,8 @@ impl<'a> Provisioner<'a> {
         if owned {
             let member = Self::sa_member(email);
             // Every configured grant to the account, also as a secret adder.
-            let configured: Vec<ManagedGrant> = managed_grants(d)
+            let configured: Vec<ManagedGrant> = self
+                .desired_grants()
                 .into_iter()
                 .filter(|g| iam::same_member(&g.member, &member))
                 .collect();
@@ -2462,7 +2948,11 @@ impl<'a> Provisioner<'a> {
             }];
             for t in configured
                 .iter()
-                .chain(recorded.iter().filter(|g| g.runtime))
+                .chain(
+                    recorded
+                        .iter()
+                        .filter(|g| g.runtime && iam::same_member(&g.member, &member)),
+                )
                 .filter_map(|g| g.target.clone())
             {
                 if !targets.contains(&t) {
@@ -2665,7 +3155,9 @@ impl<'a> Provisioner<'a> {
             None => Some(PolicyTarget::Iap(iap_resource(
                 &self.project_number().await?,
                 &self.d.region,
-                &self.d.service_id,
+                g.service
+                    .as_deref()
+                    .unwrap_or(&naming::service_id(&self.d.app, &self.d.stage)),
             ))),
         })
     }
@@ -3107,7 +3599,8 @@ mod tests {
         let d = crate::config::load_and_resolve(&p, "prod", &Default::default())
             .unwrap_or_else(|e| panic!("{e:?}"))
             .1
-            .deployment;
+            .deployments[0]
+            .clone();
         (dir, d)
     }
 
@@ -3296,6 +3789,7 @@ stages: { prod: {} }
             role: IAP_ACCESSOR_ROLE.into(),
             target: None,
             runtime: false,
+            service: None,
         };
         let mut recorded = managed.clone();
         recorded.push(old.clone());
@@ -3322,6 +3816,7 @@ stages: { prod: {} }
             role: IAP_ACCESSOR_ROLE.into(),
             target: None,
             runtime: false,
+            service: None,
         };
         let (earlier, added, manual, removed) =
             (g("group:a"), g("group:b"), g("group:c"), g("group:r"));
@@ -3448,6 +3943,143 @@ stages: { prod: {} }
         let (_dir, mut off) = deployment(FULL);
         off.apis.enable = false;
         assert!(api_step(&off).is_none(), "nothing is enabled unless asked");
+    }
+
+    const STACK: &str = r#"
+version: 1
+app: shop
+provider:
+  project: my-gcp-project
+  region: europe-west1
+  enable_apis: true
+  artifact_repository: applications
+  source_bucket: my-gcp-build-sources
+  build_service_account: builds@my-gcp-project.iam.gserviceaccount.com
+defaults:
+  source: .
+  service_account: shop-runtime@my-gcp-project.iam.gserviceaccount.com
+  identity:
+    create: true
+    roles: [{role: roles/storage.objectViewer, bucket: shop-data}]
+services:
+  web:
+    iap: {members: [group:team@example.com]}
+jobs:
+  report:
+    identity:
+      create: true
+      roles: [{role: roles/bigquery.jobUser, project: my-gcp-project}]
+schedules:
+  nightly: {schedule: "0 3 * * *", job: report}
+  warm: {schedule: "*/5 * * * *", service: web}
+stages: { prod: {} }
+"#;
+
+    fn stack(yaml: &str) -> (tempfile::TempDir, crate::config::Resolved) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let r = crate::config::load_and_resolve(&p, "prod", &Default::default())
+            .unwrap_or_else(|e| panic!("{e:?}"))
+            .1;
+        (dir, r)
+    }
+
+    #[test]
+    fn stage_steps_are_merged_across_workloads() {
+        let (_dir, r) = stack(STACK);
+        let steps = stack_pre_steps(&r);
+        let creates = |email: &str| {
+            steps
+                .iter()
+                .filter(|s| matches!(s, Step::CreateServiceAccount { email: e, .. } if e == email))
+                .count()
+        };
+        assert_eq!(
+            creates("shop-runtime@my-gcp-project.iam.gserviceaccount.com"),
+            1,
+            "shared: created once"
+        );
+        assert_eq!(
+            creates("shop-prod-sched@my-gcp-project.iam.gserviceaccount.com"),
+            1
+        );
+        // Both workloads' roles on the shared account.
+        let grants: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Grant { binding, .. } => Some(binding.role.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            grants.contains(&"roles/storage.objectViewer")
+                && grants.contains(&"roles/bigquery.jobUser")
+        );
+        assert!(stack_required_apis(&r).contains(&"cloudscheduler.googleapis.com".to_string()));
+        assert!(stack_required_apis(&r).contains(&"iap.googleapis.com".to_string()));
+    }
+
+    #[test]
+    fn the_scheduler_invoker_gets_run_invoker_on_targets_only() {
+        let (_dir, r) = stack(STACK);
+        let targets: Vec<String> = schedule_grant_steps(&r)
+            .iter()
+            .map(|s| match s {
+                Step::Grant { email, binding } => {
+                    assert_eq!(
+                        email,
+                        "shop-prod-sched@my-gcp-project.iam.gserviceaccount.com"
+                    );
+                    assert_eq!(binding.role, INVOKER_ROLE);
+                    binding.target.to_string()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(targets, ["job shop-report-prod", "service shop-web-prod"]);
+        let steps = schedule_steps(&r);
+        assert!(matches!(steps.last(), Some(Step::Schedule(s)) if s.key == "warm"));
+        // Recorded, so removing a schedule revokes its grant.
+        let managed = stack_managed_grants(&r);
+        assert!(managed.iter().any(|g| g.role == INVOKER_ROLE && !g.runtime));
+        // A grant only the job wanted is revoked once nobody wants it.
+        let mut recorded = managed.clone();
+        recorded.push(ManagedGrant {
+            member: "serviceAccount:shop-runtime@my-gcp-project.iam.gserviceaccount.com".into(),
+            role: "roles/old".into(),
+            target: Some(RoleTarget::Project {
+                project: "my-gcp-project".into(),
+            }),
+            runtime: true,
+            service: None,
+        });
+        let revokes = stack_revoke_steps(&recorded, &r);
+        assert_eq!(revokes.len(), 1);
+        assert!(matches!(&revokes[0], Step::Revoke(g) if g.role == "roles/old"));
+    }
+
+    #[test]
+    fn iap_grants_of_a_named_service_name_it_and_old_records_still_read() {
+        let (_dir, r) = stack(STACK);
+        let web = r
+            .services()
+            .find(|d| d.key.as_deref() == Some("web"))
+            .unwrap();
+        let iap: Vec<ManagedGrant> = managed_grants(web)
+            .into_iter()
+            .filter(|g| g.target.is_none())
+            .collect();
+        assert_eq!(iap.len(), 1);
+        assert_eq!(iap[0].service.as_deref(), Some("shop-web-prod"));
+        assert!(encode_grants(&iap).contains(r#""service":"shop-web-prod""#));
+        // Written before named services: no `service`, meaning the main one.
+        let old =
+            r#"[{"member":"group:team@example.com","role":"roles/iap.httpsResourceAccessor"}]"#;
+        let read = recorded_grants(&[(ANNOTATION_GRANTS.to_string(), old.to_string())].into());
+        assert_eq!(read[0].service, None);
+        assert_eq!(encode_grants(&read), old, "rewritten unchanged");
     }
 
     #[test]

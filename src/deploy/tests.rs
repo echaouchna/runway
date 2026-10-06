@@ -264,6 +264,8 @@ fn spec(image: &str) -> ServiceSpec {
         startup_cpu_boost: false,
         execution_environment: None,
         sandbox: false,
+        command: Vec::new(),
+        args: Vec::new(),
         vpc: None,
         cloud_sql: Vec::new(),
         custom_audiences: Vec::new(),

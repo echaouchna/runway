@@ -43,12 +43,32 @@ pub fn run(ctx: &Context, args: ValidateArgs) -> Result<()> {
                 valid: true,
                 service: Some(format!(
                     "{} ({}/{})",
-                    res.deployment.service_id, res.deployment.project, res.deployment.region
+                    res.deployments
+                        .iter()
+                        .map(|d| match d.is_job() {
+                            true => format!("job {}", d.service_id),
+                            false => d.service_id.clone(),
+                        })
+                        .chain(res.schedules.iter().map(|s| format!("schedule {}", s.key)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    res.first().project,
+                    res.first().region
                 )),
-                mode: Some(match res.deployment.artifact {
-                    Artifact::Image { .. } => "image",
-                    Artifact::Build(_) => "source build",
-                }),
+                mode: Some(
+                    match (
+                        res.deployments
+                            .iter()
+                            .any(|d| matches!(d.artifact, Artifact::Image { .. })),
+                        res.deployments
+                            .iter()
+                            .any(|d| matches!(d.artifact, Artifact::Build(_))),
+                    ) {
+                        (true, true) => "images and source builds",
+                        (true, false) => "image",
+                        _ => "source build",
+                    },
+                ),
                 errors: vec![],
                 warnings: res.warnings,
             },

@@ -42,10 +42,18 @@ and warnings to stderr, so JSON output stays parseable.
 | `runway traffic --stage S [--promote \| --set TARGET=PCT ... \| --remove-tag NAME ...]` | Without options: the split and the tagged URLs. `--promote`: 100% to the canary. `--set`: an explicit split (targets: `latest`, a tag, a revision). `--remove-tag`: drop a preview URL. Writes only the traffic (no new revision). |
 | `runway info --stage S` | URL, status, serving/latest revision, image, traffic, access. |
 | `runway logs --stage S [--since 10m] [--limit 200] [--follow] [--severity WARNING] [--include-requests]` | Application logs (request logs excluded by default; Google audit logs always excluded). |
+| `runway run-job NAME --stage S [--wait] [--timeout 1h]` | Run a job of the stage now. `--wait` follows the execution and fails if it fails (with the log URL). |
 | `runway completions bash\|zsh\|fish\|nushell\|xonsh\|elvish\|powershell` | Print a completion script; `runway completions --help` shows where to install it for each shell. |
 | `runway undeploy --stage S --preview NAME [--yes]` | Only removes a preview's URL (tag); nothing is deleted. |
+| `runway undeploy --stage S --orphans [--yes]` | Only the services and jobs runway deployed for this stage that runway.yaml no longer lists, and their schedules. |
 | `runway undeploy --stage S [--yes] [--delete-images] [--retries N]` | Without `--yes`: prints what would be deleted and what is kept (read-only). With `--yes`: deletes the Cloud Run service, revokes the grants of the runtime service account and deletes it **only if runway created it for this app and stage** and nothing else runs as it, then (opt-in) the app's images. Never deletes buckets, never disables APIs, keeps shared build infrastructure and everything that existed before, and lists it all. |
 | `runway describe [--stage S] [--format ascii\|mermaid] [--diagram-only]` | Offline: a diagram of the stack (pure ASCII, or Mermaid wrapped in a code block) and an explanation (build, access, identity, configuration, storage, APIs, deployment order, failure handling). `-o json` returns both. See [Stack diagrams](#stack-diagrams). |
+
+With several services and jobs (see [Configuration](configuration.md#several-services-jobs-and-schedules)),
+every command that takes `--stage` also takes `--only NAME|PATH` (repeat or
+separate with commas; `RUNWAY_ONLY` in CI). `info` and `logs` need it when
+there are several services (`logs` also reads a job's logs); `traffic --set`
+needs it to name one service.
 
 ## Stack diagrams
 

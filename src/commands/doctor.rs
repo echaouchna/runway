@@ -169,13 +169,13 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
     let stage = &args.stage.stage;
 
     // 1. Configuration.
-    let d = match config::load_and_resolve(&ctx.config, stage, &Overrides::default()) {
+    let resolved = match config::load_and_resolve(&ctx.config, stage, &Overrides::default()) {
         Ok((_, res)) => {
             r.pass(
                 "configuration",
                 format!("{} is valid for stage {stage}", ctx.config.display()),
             );
-            res.deployment
+            res
         }
         Err(e) => {
             r.fail(
@@ -187,6 +187,15 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
         }
     };
 
+    let selected = match resolved.select(&args.stage.only) {
+        Ok(s) => s,
+        Err(e) => {
+            r.fail("configuration", e.message, "fix --only");
+            return finish(ctx, r);
+        }
+    };
+    let d = selected[0].clone();
+    let apis = crate::provision::stack_required_apis(&resolved);
     // 2. Credentials.
     let session = match crate::commands::connect(ctx, &d).await {
         Ok(s) => s,
@@ -208,16 +217,31 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
         }
     };
     // 3-9. Independent read-only checks, run concurrently.
-    let (principal, project, apis, perms, accounts, repo, bucket, secrets, service) = tokio::join!(
+    let workload_checks = |w: &'_ Deployment| {
+        let session = &session;
+        let w = w.clone();
+        async move {
+            let (accounts, repo, bucket, secrets, service, foreign) = tokio::join!(
+                check_service_accounts(session, &w),
+                check_repository(session, &w),
+                check_bucket(session, &w),
+                check_secrets(session, &w),
+                check_service(session, &w),
+                check_foreign_grants(session, &w),
+            );
+            let mut out = Vec::new();
+            for part in [accounts, repo, bucket, secrets, service, foreign] {
+                out.extend(part?.checks);
+            }
+            Ok::<_, crate::error::Error>((w.name().to_string(), out))
+        }
+    };
+    let (principal, project, apis, perms, per_workload) = tokio::join!(
         principal(&session, &token),
         check_project(&session, &d),
-        check_apis(&session, &d),
+        check_apis(&session, &d, &apis),
         check_permissions(&session, &d),
-        check_service_accounts(&session, &d),
-        check_repository(&session, &d),
-        check_bucket(&session, &d),
-        check_secrets(&session, &d),
-        check_service(&session, &d),
+        futures::future::join_all(selected.iter().map(|w| workload_checks(w))),
     );
     r.principal = principal;
     r.pass(
@@ -234,11 +258,26 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
                 .unwrap_or_default()
         ),
     );
-    let foreign = check_foreign_grants(&session, &d).await;
-    for part in [
-        project, apis, perms, accounts, repo, bucket, secrets, service, foreign,
-    ] {
+    for part in [project, apis, perms] {
         r.checks.extend(part?.checks);
+    }
+    // Identical checks (a shared account or bucket) are reported once; with
+    // several workloads, the others say which one they are about.
+    let several = selected.len() > 1;
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for part in per_workload {
+        let (name, checks) = part?;
+        for mut c in checks {
+            let key = (c.name.clone(), c.detail.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            if several {
+                c.name = format!("{} ({name})", c.name);
+            }
+            r.checks.push(c);
+        }
     }
 
     finish(ctx, r)
@@ -267,12 +306,11 @@ async fn check_project(session: &Session, d: &Deployment) -> Result<Report> {
 }
 
 /// Required APIs are enabled.
-async fn check_apis(session: &Session, d: &Deployment) -> Result<Report> {
+async fn check_apis(session: &Session, d: &Deployment, apis: &[String]) -> Result<Report> {
     let mut r = Report::default();
     let project_name = format!("projects/{}", d.project);
     // 4. APIs.
     let usage = build_client!(ServiceUsage, session)?;
-    let apis = required_apis(d);
     match usage
         .batch_get_services()
         .set_parent(&project_name)
@@ -632,6 +670,24 @@ async fn check_secrets(session: &Session, d: &Deployment) -> Result<Report> {
 async fn check_service(session: &Session, d: &Deployment) -> Result<Report> {
     let mut r = Report::default();
     // 9. Existing service ownership.
+    if d.is_job() {
+        let jobs = build_client!(google_cloud_run_v2::client::Jobs, session)?;
+        match jobs.get_job().set_name(d.service_name()).send().await {
+            Ok(job) => match crate::gcp::jobs::check_job_ownership(&job, &d.app, &d.stage) {
+                Ok(()) => r.pass(
+                    "job",
+                    format!("{} exists and is managed by runway", d.service_id),
+                ),
+                Err(e) => r.fail("job", e.message, "rename the job in runway.yaml"),
+            },
+            Err(e) if is_not_found(&e) => r.pass(
+                "job",
+                format!("{} will be created on first deploy", d.service_id),
+            ),
+            Err(e) => r.warn("job", short_err(&e), "check run.jobs.get permission"),
+        }
+        return Ok(r);
+    }
     let run_client = build_client!(Services, session)?;
     match run_client
         .get_service()
@@ -777,6 +833,8 @@ mod tests {
             project: "my-gcp-project".into(),
             region: "europe-west1".into(),
             service_id: "a-dev".into(),
+            key: None,
+            kind: crate::config::WorkloadKind::Service,
             artifact: if build {
                 Artifact::Build(crate::config::BuildConfig {
                     context_dir: ".".into(),
@@ -833,6 +891,8 @@ mod tests {
                 startup_cpu_boost: false,
                 execution_environment: None,
                 sandbox: false,
+                command: Vec::new(),
+                args: Vec::new(),
                 vpc: None,
                 cloud_sql: Vec::new(),
                 custom_audiences: Vec::new(),
@@ -840,6 +900,7 @@ mod tests {
             retry: Default::default(),
             apis: Default::default(),
             impersonate: None,
+            scheduler_region: "europe-west1".into(),
             project_tags: Default::default(),
             buckets: Default::default(),
             secrets: Default::default(),

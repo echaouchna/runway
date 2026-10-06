@@ -17,7 +17,7 @@ use crate::output::{OutputFormat, print_json};
 use crate::poll::PollConfig;
 use crate::traffic::{self, CANARY_TAG, Current, Target};
 use google_cloud_lro::Poller;
-use google_cloud_run_v2::client::{Revisions, Services};
+use google_cloud_run_v2::client::{Jobs, Revisions, Services};
 use google_cloud_run_v2::model::Service;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -57,16 +57,18 @@ pub struct PreviewReport {
 }
 
 pub async fn run(ctx: &Context, action: PreviewAction) -> Result<()> {
-    let stage = match &action {
-        PreviewAction::List(a) => &a.stage.stage,
-        PreviewAction::Delete(a) => &a.stage.stage,
-        PreviewAction::Prune(a) => &a.stage.stage,
+    let (stage, only) = match &action {
+        PreviewAction::List(a) => (&a.stage.stage, &a.stage.only),
+        PreviewAction::Delete(a) => (&a.stage.stage, &a.stage.only),
+        PreviewAction::Prune(a) => (&a.stage.stage, &a.stage.only),
     };
     let resolved = load(ctx, stage, &Overrides::default())?;
-    let d = &resolved.deployment;
-    let session = crate::commands::connect(ctx, d).await?;
+    let selected = resolved.select(only)?;
+    let basis = crate::commands::preview_basis(&resolved);
+    let session = crate::commands::connect(ctx, resolved.first()).await?;
     let services = build_client!(Services, session)?;
     let revisions = build_client!(Revisions, session)?;
+    let jobs = build_client!(Jobs, session)?;
     let timeout = match &action {
         PreviewAction::List(_) => std::time::Duration::from_secs(60),
         PreviewAction::Delete(a) => a.timeout,
@@ -79,30 +81,166 @@ pub async fn run(ctx: &Context, action: PreviewAction) -> Result<()> {
         poll: PollConfig::default(),
         timeout,
     };
-    let svc = rec
-        .get(&d.service_name())
-        .await?
-        .ok_or_else(|| not_deployed(&d.service_id, &d.stage))?;
-    check_ownership(&svc, &d.app, &d.stage, false)?;
-    let lines = tagged_lines(&svc, &revisions).await?;
-
-    let report = match action {
-        PreviewAction::List(_) => PreviewReport {
-            service: d.service_id.clone(),
-            action: "list",
-            applied: false,
-            base: None,
-            notes: vec![],
-            previews: lines,
-        },
-        PreviewAction::Delete(a) => delete(ctx, d, &rec, &revisions, &svc, lines, &a).await?,
-        PreviewAction::Prune(a) => prune(ctx, d, &rec, &revisions, &svc, lines, &a).await?,
+    // Branches are read once, for every service and job.
+    let info = match &action {
+        PreviewAction::Prune(a) => {
+            let dir = ctx
+                .config
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            Some(branch_info(
+                dir,
+                &a.remote,
+                a.base.as_deref(),
+                !a.no_fetch,
+                &ctx.progress,
+            )?)
+        }
+        _ => None,
     };
-    match ctx.output {
-        OutputFormat::Json => print_json(&report),
-        OutputFormat::Text => print_text(&report),
+    let several = selected.len() > 1;
+    let mut reports = Vec::new();
+    for d in selected.iter().filter(|d| !d.is_job()) {
+        let svc = match rec.get(&d.service_name()).await? {
+            Some(svc) => svc,
+            None if several => {
+                ctx.progress
+                    .info(format!("{} is not deployed", d.service_id));
+                continue;
+            }
+            None => return Err(not_deployed(&d.service_id, &d.stage)),
+        };
+        check_ownership(&svc, &d.app, &d.stage, false)?;
+        let lines = tagged_lines(&svc, &revisions).await?;
+        reports.push(match &action {
+            PreviewAction::List(_) => PreviewReport {
+                service: d.service_id.clone(),
+                action: "list",
+                applied: false,
+                base: None,
+                notes: vec![],
+                previews: lines,
+            },
+            PreviewAction::Delete(a) => {
+                delete(ctx, d, &rec, &revisions, &svc, lines, a, &basis).await?
+            }
+            PreviewAction::Prune(a) => {
+                let info = info.as_ref().expect("read for prune");
+                prune(ctx, d, &rec, &revisions, &svc, lines, a, info, &basis).await?
+            }
+        });
+    }
+    for d in selected.iter().filter(|d| d.is_job()) {
+        let r = preview_jobs(ctx, d, &jobs, &action, info.as_ref(), &basis).await?;
+        if !r.previews.is_empty() || !several {
+            reports.push(r);
+        }
+    }
+    match (ctx.output, reports.len()) {
+        (OutputFormat::Json, 1) => print_json(&reports[0]),
+        (OutputFormat::Json, _) => print_json(&reports),
+        (OutputFormat::Text, _) => reports.iter().for_each(print_text),
     }
     Ok(())
+}
+
+/// Preview copies of a job (`deploy --preview` creates `{job}-{tag}`), as
+/// report lines: listed, or deleted with their preview.
+async fn preview_jobs(
+    ctx: &Context,
+    d: &Deployment,
+    jobs: &Jobs,
+    action: &PreviewAction,
+    info: Option<&BranchInfo>,
+    basis: &str,
+) -> Result<PreviewReport> {
+    let mut found = Vec::new();
+    let mut token = String::new();
+    loop {
+        let resp = jobs
+            .list_jobs()
+            .set_parent(d.parent())
+            .set_page_token(token.clone())
+            .send()
+            .await
+            .map_err(|e| api_error(e, "listing Cloud Run jobs"))?;
+        for j in resp.jobs {
+            let l = &j.labels;
+            let ours = run::ownership_of(l, &d.app, &d.stage) == run::Ownership::Owned
+                && l.get(crate::naming::LABEL_NAME).map(String::as_str) == Some(d.name());
+            if let (true, Some(tag)) = (ours, l.get(crate::naming::LABEL_PREVIEW)) {
+                found.push((tag.clone(), j.name.clone()));
+            }
+        }
+        if resp.next_page_token.is_empty() {
+            break;
+        }
+        token = resp.next_page_token;
+    }
+    let (kind, applied, names, base) = match action {
+        PreviewAction::List(_) => ("list", false, None, None),
+        PreviewAction::Delete(a) => ("delete", a.yes, Some(&a.names), None),
+        PreviewAction::Prune(a) => ("prune", a.yes, None, info.map(|i| i.base.clone())),
+    };
+    let mut previews = Vec::new();
+    for (tag, name) in found {
+        let decision: Option<(bool, Option<String>)> = match action {
+            PreviewAction::List(_) => Some((false, None)),
+            PreviewAction::Delete(_) => names.and_then(|ns| {
+                ns.iter()
+                    .any(|n| {
+                        n == &tag || traffic::preview_tag(n, basis).ok().as_ref() == Some(&tag)
+                    })
+                    .then_some((true, None))
+            }),
+            PreviewAction::Prune(a) => {
+                let info = info.expect("read for prune");
+                Some(match prune_reason(&tag, basis, info, a.only_merged) {
+                    Some(reason) => (true, Some(reason)),
+                    None => (false, Some("branch still open".into())),
+                })
+            }
+        };
+        let Some((remove, reason)) = decision else {
+            continue;
+        };
+        let status = match (kind, remove, applied) {
+            ("list", _, _) => None,
+            (_, false, _) => Some("kept"),
+            (_, true, false) => Some("would_remove"),
+            (_, true, true) => Some("removed"),
+        };
+        if status == Some("removed") {
+            ctx.progress.step(format!(
+                "Deleting preview job {}",
+                run::short_revision(&name)
+            ));
+            let lro = jobs.delete_job().set_name(&name).send().await;
+            match lro {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(api_error(e, &format!("deleting job {name}"))),
+            }
+        }
+        previews.push(PreviewLine {
+            tag,
+            revision: run::short_revision(&name).to_string(),
+            url: String::new(),
+            preview: true,
+            status,
+            reason,
+            revision_deleted: None,
+        });
+    }
+    Ok(PreviewReport {
+        service: d.service_id.clone(),
+        action: kind,
+        applied,
+        base,
+        notes: vec![],
+        previews,
+    })
 }
 
 /// Every tagged traffic entry, with its revision, URL and preview marker.
@@ -166,6 +304,7 @@ async fn revision_annotation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn delete(
     ctx: &Context,
     d: &Deployment,
@@ -174,12 +313,13 @@ async fn delete(
     svc: &Service,
     mut lines: Vec<PreviewLine>,
     a: &PreviewDeleteArgs,
+    basis: &str,
 ) -> Result<PreviewReport> {
     let cur = run::current_traffic(svc);
     let mut remove = BTreeSet::new();
     let mut notes = Vec::new();
     for raw in &a.names {
-        match existing_tag(&cur, raw, &d.service_id) {
+        match existing_tag(&cur, raw, basis) {
             Some(t) => {
                 remove.insert(t);
             }
@@ -215,6 +355,7 @@ async fn delete(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prune(
     ctx: &Context,
     d: &Deployment,
@@ -223,19 +364,9 @@ async fn prune(
     svc: &Service,
     mut lines: Vec<PreviewLine>,
     a: &PreviewPruneArgs,
+    info: &BranchInfo,
+    basis: &str,
 ) -> Result<PreviewReport> {
-    let dir = ctx
-        .config
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let info = branch_info(
-        dir,
-        &a.remote,
-        a.base.as_deref(),
-        !a.no_fetch,
-        &ctx.progress,
-    )?;
     let mut notes = Vec::new();
     if !info.history_complete {
         notes.push(
@@ -255,7 +386,7 @@ async fn prune(
             );
             continue;
         }
-        match prune_reason(&l.tag, &d.service_id, &info, a.only_merged) {
+        match prune_reason(&l.tag, basis, info, a.only_merged) {
             Some(reason) => {
                 l.status = Some(if a.yes { "removed" } else { "would_remove" });
                 l.reason = Some(reason);

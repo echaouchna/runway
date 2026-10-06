@@ -33,6 +33,9 @@ const OPTIONAL_SERVICE: &str = r#"
   # cloud_sql: [my-instance]                  # socket at /cloudsql/PROJECT:REGION:INSTANCE
   # iap: {enabled: true, members: [group:team@example.com]}   # sign-in with Google
   # custom_audiences: [https://api.example.com]               # extra ID token audiences
+
+# More services, Cloud Run jobs and schedules (services:, jobs:, schedules:):
+# https://runway.echaouchna.dev/docs/configuration/#several-services-jobs-and-schedules
 "#;
 
 fn source_config(app: &str, project: &str, region: &str) -> String {
@@ -351,7 +354,7 @@ mod tests {
             for stage in ["dev", "prod"] {
                 let r = crate::config::resolve(&cfg, stage, &Default::default())
                     .unwrap_or_else(|d| panic!("{:#?}\n{full}", d.errors));
-                let s = r.deployment.service;
+                let s = r.deployments[0].clone().service;
                 assert!(s.vpc.is_some() && s.iap.enabled && s.identity.create);
             }
         }

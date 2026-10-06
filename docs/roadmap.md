@@ -10,8 +10,6 @@ upvote an issue if something matters to you.
 - **More service options**: Serverless VPC Access connectors, GPUs, NFS and
   in-memory volumes, session affinity, manual scaling, and `cloudsql.client`
   limited to the listed instances (IAM conditions).
-- **Several services per file** (for example an API and a web front end),
-  sharing build, identity and secrets.
 - **Docker Compose**: deploy the `compose.yaml` you already run locally.
   `runway init --from compose.yaml` writes the equivalent `runway.yaml`, or
   runway reads the Compose file directly. The mapping:
@@ -24,15 +22,9 @@ upvote an issue if something matters to you.
   Plans, previews and guardrails apply as for any configuration. What has no
   Cloud Run equivalent (host networking, privileged containers) is reported,
   not silently dropped.
-- **Cloud Run jobs**: a `jobs:` section that shares the image (or source
-  build), runtime identity, secrets and environment with the service, with
-  tasks, parallelism, timeout, retries and resources. `runway run-job NAME
-  [--wait]` and `runway logs --job NAME` complete it. Jobs get the same
-  `plan` and least-privilege grants as services.
-- **Cloud Scheduler**: a `schedules:` section that triggers a job or calls a
-  service endpoint on a cron schedule. It covers the time zone, retries, an
-  OIDC token from a dedicated invoker account granted only `run.invoker` on
-  its target, and pause/resume. Schedules show up in `plan` and `describe`.
+- **Workflows**: a `workflows:` section deploying Google Cloud Workflows
+  that call the stage's services and jobs, with an identity granted only what
+  each step calls; schedules can then target a workflow.
 - **Revisions and rollback**: `runway revisions` (digests, creation times,
   tags) and `runway rollback [--to REV]` on top of `runway traffic`.
 - **Live verification** of the features implemented but not yet exercised
@@ -53,6 +45,10 @@ upvote an issue if something matters to you.
 
 ## Done since 0.1
 
+- Several services, Cloud Run jobs and Cloud Scheduler jobs per file, with
+  `defaults`, `--only` (names or folders, for monorepos), `runway run-job`,
+  preview copies of jobs and `undeploy --orphans`. Existing files are
+  unchanged.
 - Service options: Direct VPC egress (including Shared VPC), Cloud SQL
   connections, custom audiences, `billing` and `startup_cpu_boost`,
   `execution_environment`, and Cloud Run sandboxes (preview) for running

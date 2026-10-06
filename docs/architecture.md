@@ -64,8 +64,21 @@ deploy:
   `runway-app`, `runway-stage`) and in a marker in the description of service
   accounts runway creates. runway refuses to modify what it does not own.
 - **Steps, not state.** Provisioning is a list of steps; each re-reads before
-  writing, so partial failures resume naturally. Grants, tags and IAP members
-  are additive because removals would need a record of what was added.
+  writing, so partial failures resume naturally. runway records the grants
+  it adds (annotation `runway.dev/grants`) and revokes only those, except on
+  what it owns (IAP members, service tags, adders of secrets and roles of
+  accounts it created), where whatever runway.yaml does not list is removed.
+- **A stage is a set of workloads.** Each service and job resolves to its own
+  `Deployment` (a key, a kind, the stage-wide settings); schedules sit next
+  to them in `Resolved`. Stage-wide steps (APIs, shared resources, grants)
+  are merged across workloads and run once; tags and IAP run per service.
+  Removals compare with what every workload wants, so a shared runtime
+  account keeps the roles of all of them. The grants record lives on one
+  holder (the main service, else the first service, else the first job); an
+  IAP grant of a named service names it (`service`), and a record without
+  that field means the main service, as before named services existed. A
+  stage with one service and nothing else takes the original code paths, so
+  existing files behave exactly as before.
 - **Template reuse.** When only service-level fields change (traffic,
   ingress, IAP), the live revision template is sent back untouched, so Cloud
   Run creates no revision. Previews and canaries get a marker annotation so

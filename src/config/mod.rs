@@ -23,6 +23,9 @@ pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_CPU: &str = "1";
 pub const DEFAULT_MEMORY: &str = "512Mi";
 pub const DEFAULT_TIMEOUT_SECONDS: u32 = 300;
+/// Task timeout of a job (Cloud Run's default) and its maximum (168 hours).
+pub const DEFAULT_JOB_TIMEOUT_SECONDS: u32 = 600;
+pub const MAX_JOB_TIMEOUT_SECONDS: i64 = 168 * 3600;
 pub const DEFAULT_CONCURRENCY: u32 = 80;
 pub const DEFAULT_MIN_INSTANCES: u32 = 0;
 pub const DEFAULT_MAX_INSTANCES: u32 = 10;
@@ -142,6 +145,8 @@ impl Diagnostics {
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub image: Option<String>,
+    /// The service or job `image` applies to, when there are several.
+    pub target: Option<String>,
 }
 
 /// Fully resolved and validated settings for one stage.
@@ -151,13 +156,21 @@ pub struct Deployment {
     pub stage: String,
     pub project: String,
     pub region: String,
+    /// Name under `services:`/`jobs:`; `None` for the main `service`.
+    pub key: Option<String>,
+    pub kind: WorkloadKind,
+    /// The Cloud Run service or job ID.
     pub service_id: String,
     pub artifact: Artifact,
+    /// Runtime settings (a job only uses those that apply to jobs).
     pub service: ServiceConfig,
     pub retry: crate::retry::RetryConfig,
     pub apis: ApisConfig,
     /// Service account impersonated for API calls (config default; the CLI flag wins).
     pub impersonate: Option<String>,
+    /// Where the stage's Cloud Scheduler jobs live (`scheduler.region`, else
+    /// `provider.region`), also when none is configured any more.
+    pub scheduler_region: String,
     /// Tags bound to the deployment project: namespaced key -> value short name.
     pub project_tags: BTreeMap<String, String>,
     /// Buckets runway creates and keeps configured, by key.
@@ -185,15 +198,78 @@ pub struct BucketConfig {
     pub labels: BTreeMap<String, String>,
 }
 
+/// A Cloud Run service or job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkloadKind {
+    Service,
+    Job(JobSettings),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct JobSettings {
+    pub tasks: u32,
+    /// 0: as many tasks at once as possible.
+    pub parallelism: u32,
+    pub max_retries: u32,
+}
+
 impl Deployment {
+    /// Full resource name of the service (or of the job, for a job).
     pub fn service_name(&self) -> String {
-        naming::service_name(&self.project, &self.region, &self.app, &self.stage)
+        match self.kind {
+            WorkloadKind::Service => format!("{}/services/{}", self.parent(), self.service_id),
+            WorkloadKind::Job(_) => format!("{}/jobs/{}", self.parent(), self.service_id),
+        }
+    }
+    /// How people name it (`--only`, schedules): the key, or the app name for
+    /// the main service.
+    pub fn name(&self) -> &str {
+        self.key.as_deref().unwrap_or(&self.app)
+    }
+    /// Artifact Registry package of the images built for it: `{app}` for the
+    /// main service (as before named workloads existed), `{app}-{name}`.
+    pub fn image_package(&self) -> String {
+        match &self.key {
+            None => self.app.clone(),
+            Some(k) => format!("{}-{k}", self.app),
+        }
+    }
+    /// Workloads with the same key build the same image.
+    pub fn build_key(&self) -> Option<String> {
+        match &self.artifact {
+            Artifact::Build(b) => Some(format!(
+                "{}|{:?}|{:?}|{}|{}|{}",
+                b.context_dir.display(),
+                b.strategy,
+                b.excluded,
+                b.rebuild_always,
+                b.artifact_location,
+                b.artifact_repository
+            )),
+            Artifact::Image { .. } => None,
+        }
+    }
+    pub fn is_job(&self) -> bool {
+        matches!(self.kind, WorkloadKind::Job(_))
+    }
+    /// `service api`, `job migrate`, or `service` for the main one.
+    pub fn what(&self) -> String {
+        match (&self.key, self.is_job()) {
+            (None, _) => "service".into(),
+            (Some(k), false) => format!("service {k}"),
+            (Some(k), true) => format!("job {k}"),
+        }
     }
     pub fn parent(&self) -> String {
         naming::location_parent(&self.project, &self.region)
     }
     pub fn labels(&self) -> BTreeMap<String, String> {
-        naming::ownership_labels(&self.app, &self.stage)
+        let mut l = naming::ownership_labels(&self.app, &self.stage);
+        if let Some(k) = &self.key {
+            l.insert(naming::LABEL_NAME.into(), k.clone());
+        }
+        l
     }
 }
 
@@ -338,6 +414,9 @@ pub struct ServiceConfig {
     /// Cloud SQL connection names (`PROJECT:REGION:INSTANCE`).
     pub cloud_sql: Vec<String>,
     pub custom_audiences: Vec<String>,
+    /// Entrypoint and arguments of the app container; empty: the image's.
+    pub command: Vec<String>,
+    pub args: Vec<String>,
 }
 
 /// Direct VPC egress.
@@ -546,6 +625,14 @@ pub enum RoleTarget {
         location: String,
         repository: String,
     },
+    /// A Cloud Run service, by full name (the scheduler invokes it).
+    RunService {
+        name: String,
+    },
+    /// A Cloud Run job, by full name (the scheduler runs it).
+    RunJob {
+        name: String,
+    },
 }
 
 impl std::fmt::Display for RoleTarget {
@@ -562,14 +649,175 @@ impl std::fmt::Display for RoleTarget {
             } => {
                 write!(f, "repository {location}/{repository}")
             }
+            RoleTarget::RunService { name } => {
+                write!(f, "service {}", name.rsplit('/').next().unwrap_or(name))
+            }
+            RoleTarget::RunJob { name } => {
+                write!(f, "job {}", name.rsplit('/').next().unwrap_or(name))
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    pub deployment: Deployment,
+    /// Services (the main one first, then by name), then jobs by name.
+    pub deployments: Vec<Deployment>,
+    pub schedules: Vec<ScheduleConfig>,
+    /// The Cloud Scheduler invoker; `Some` when there are schedules.
+    pub scheduler: Option<SchedulerConfig>,
     pub warnings: Vec<Issue>,
+}
+
+impl Resolved {
+    pub fn services(&self) -> impl Iterator<Item = &Deployment> {
+        self.deployments.iter().filter(|d| !d.is_job())
+    }
+    pub fn jobs(&self) -> impl Iterator<Item = &Deployment> {
+        self.deployments.iter().filter(|d| d.is_job())
+    }
+    /// Stage-wide settings (project, region, buckets, secrets...) are the same
+    /// in every workload; this one carries them.
+    pub fn first(&self) -> &Deployment {
+        &self.deployments[0]
+    }
+    /// The workload that records the grants runway adds: the main service,
+    /// else the first service, else the first job.
+    pub fn holder(&self) -> &Deployment {
+        self.services().next().unwrap_or(self.first())
+    }
+    /// Whose image a workload deploys: for a build it shares with others, the
+    /// first of them in the stage (so the package does not depend on
+    /// `--only`); otherwise itself.
+    pub fn build_owner<'a>(&'a self, d: &'a Deployment) -> &'a Deployment {
+        match d.build_key() {
+            None => d,
+            Some(k) => self
+                .deployments
+                .iter()
+                .find(|x| x.build_key().as_deref() == Some(k.as_str()))
+                .unwrap_or(d),
+        }
+    }
+    /// Workloads selected by a path: those built from inside it (a folder of
+    /// apps), else those built from the most specific folder containing it
+    /// (a root `source: .` contains every path, so it is not picked for a
+    /// path under another app's folder).
+    fn select_path(&self, path: &Path) -> crate::error::Result<Vec<&Deployment>> {
+        let cwd = std::env::current_dir()?;
+        let abs = |p: &Path| normalize_path(&cwd.join(p));
+        let path = abs(path);
+        let built: Vec<(&Deployment, PathBuf)> = self
+            .deployments
+            .iter()
+            .filter_map(|d| match &d.artifact {
+                Artifact::Build(b) => Some((d, abs(&b.context_dir))),
+                Artifact::Image { .. } => None,
+            })
+            .collect();
+        let inside: Vec<&Deployment> = built
+            .iter()
+            .filter(|(_, c)| c.starts_with(&path))
+            .map(|(d, _)| *d)
+            .collect();
+        if !inside.is_empty() {
+            return Ok(inside);
+        }
+        let deepest = built
+            .iter()
+            .filter(|(_, c)| path.starts_with(c))
+            .map(|(_, c)| c.components().count())
+            .max();
+        Ok(built
+            .iter()
+            .filter(|(_, c)| path.starts_with(c) && Some(c.components().count()) == deepest)
+            .map(|(d, _)| *d)
+            .collect())
+    }
+
+    /// Workloads matching `--only` (names, or paths inside or containing a
+    /// build context); all of them when `only` is empty.
+    pub fn select(&self, only: &[String]) -> crate::error::Result<Vec<&Deployment>> {
+        if only.is_empty() {
+            return Ok(self.deployments.iter().collect());
+        }
+        let mut out: Vec<&Deployment> = Vec::new();
+        for o in only {
+            let found: Vec<&Deployment> = match self.deployments.iter().find(|d| d.name() == o) {
+                Some(d) => vec![d],
+                None => self.select_path(Path::new(o))?,
+            };
+            if found.is_empty() {
+                let names: Vec<&str> = self.deployments.iter().map(|d| d.name()).collect();
+                return Err(Error::config(format!(
+                    "--only {o}: no service or job has this name or builds from this path (names: {})",
+                    names.join(", ")
+                )));
+            }
+            for d in found {
+                if !out
+                    .iter()
+                    .any(|x| x.service_id == d.service_id && x.is_job() == d.is_job())
+                {
+                    out.push(d);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A Cloud Scheduler job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScheduleConfig {
+    pub key: String,
+    /// Cloud Scheduler job ID: `{app}-{key}-{stage}`.
+    pub id: String,
+    pub schedule: String,
+    pub time_zone: String,
+    pub target: ScheduleTarget,
+    pub retries: u32,
+    pub attempt_deadline_seconds: u32,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScheduleTarget {
+    /// Runs a Cloud Run job.
+    Job { name: String, job_id: String },
+    /// Calls a service with an ID token.
+    Service {
+        name: String,
+        service_id: String,
+        path: String,
+        method: String,
+        body: Option<String>,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl ScheduleTarget {
+    /// The Cloud Run service or job ID it calls.
+    pub fn resource_id(&self) -> &str {
+        match self {
+            ScheduleTarget::Job { job_id, .. } => job_id,
+            ScheduleTarget::Service { service_id, .. } => service_id,
+        }
+    }
+    pub fn name(&self) -> &str {
+        match self {
+            ScheduleTarget::Job { name, .. } | ScheduleTarget::Service { name, .. } => name,
+        }
+    }
+}
+
+/// The account Cloud Scheduler calls targets with, and where it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SchedulerConfig {
+    pub service_account: String,
+    pub create: bool,
+    pub region: String,
 }
 
 /// Picks the highest-precedence value and remembers where it came from.
@@ -662,17 +910,6 @@ pub fn resolve(
         }
     };
 
-    let service_id = naming::service_id(&raw.app, stage);
-    if service_id.len() > naming::MAX_SERVICE_NAME_LEN {
-        d.error(
-            "app",
-            format!(
-                "service name `{service_id}` (app-stage) exceeds {} characters; shorten `app` or the stage name",
-                naming::MAX_SERVICE_NAME_LEN
-            ),
-        );
-    }
-
     // ---- provider ----
     let p = |f: fn(&RawProvider) -> &Option<String>, field: &str| {
         pick(stage, f(&st.provider), f(&raw.provider), "provider", field)
@@ -727,15 +964,6 @@ pub fn resolve(
                 }
             })
         };
-    let ixs = |d: &mut Diagnostics, v: &str, path: &str| -> String {
-        match ix.apply(v) {
-            Ok(x) => x,
-            Err(e) => {
-                d.error(path, e);
-                v.to_string()
-            }
-        }
-    };
     let source_bucket = interp_opt(&mut d, source_bucket);
     let build_sa = interp_opt(&mut d, build_sa);
 
@@ -824,28 +1052,207 @@ pub fn resolve(
     check_opt(&mut d, &source_bucket, validate::bucket_name);
     check_opt(&mut d, &build_sa, validate::service_account_email);
 
-    // ---- service ----
-    let base: &RawService = &raw.service;
-    let sv: &RawService = &st.service;
+    // ---- services and jobs ----
+    let inputs = workload_inputs(&mut d, raw, st, stage, overrides);
+    let shared = Shared {
+        cfg,
+        stage,
+        overrides,
+        project: &project,
+        region: &region,
+        ix: &ix,
+        buckets: &buckets,
+        create_build,
+        artifact_repository,
+        artifact_location,
+        source_bucket,
+        build_sa,
+    };
+    let mut resolved_workloads = Vec::new();
+    for w in &inputs {
+        let service_id = workload_id(&mut d, &raw.app, stage, w);
+        if let Some((artifact, service, job)) = resolve_workload(&mut d, &shared, w) {
+            resolved_workloads.push((w.key.clone(), service_id, artifact, service, job));
+        }
+    }
+    // ---- schedules ----
+    let (schedules, scheduler, scheduler_region) =
+        resolve_schedules(&mut d, raw, st, stage, &project, &region, &ix, &inputs);
+    // ---- retry ----
+    let retry = resolve_retry(&mut d, raw.retry.as_ref());
+
+    // An interpolation error makes further checks of the same field noise.
+    let interp_failed: std::collections::BTreeSet<String> = d
+        .errors
+        .iter()
+        .filter(|e| {
+            e.message.starts_with("unknown variable") || e.message.starts_with("unterminated")
+        })
+        .map(|e| e.path.clone())
+        .collect();
+    d.errors.retain(|e| {
+        !interp_failed.contains(&e.path)
+            || e.message.starts_with("unknown variable")
+            || e.message.starts_with("unterminated")
+    });
+
+    if !d.errors.is_empty() {
+        d.errors.sort();
+        d.errors.dedup();
+        return Err(d);
+    }
+
+    let deployments = resolved_workloads
+        .into_iter()
+        .map(|(key, service_id, artifact, service, job)| Deployment {
+            app: raw.app.clone(),
+            stage: stage.to_string(),
+            project: project.clone(),
+            region: region.clone(),
+            key,
+            kind: match job {
+                None => WorkloadKind::Service,
+                Some(j) => WorkloadKind::Job(j),
+            },
+            service_id,
+            artifact,
+            service,
+            retry,
+            apis: ApisConfig {
+                enable: enable_apis,
+                extra: extra_apis.clone(),
+            },
+            impersonate: impersonate.clone(),
+            scheduler_region: scheduler_region.clone(),
+            project_tags: project_tags.clone(),
+            buckets: buckets.clone(),
+            secrets: managed_secrets.clone(),
+        })
+        .collect();
+    Ok(Resolved {
+        deployments,
+        schedules,
+        scheduler,
+        warnings: d.warnings,
+    })
+}
+
+/// Where a workload's settings come from (lowest precedence first) and how
+/// it is named.
+struct WorkloadInput {
+    /// `None` for the main `service`.
+    key: Option<String>,
+    /// YAML path of the workload: `service`, `services.api`, `jobs.migrate`.
+    path: String,
+    /// `defaults`, `stages.S.defaults`, the workload, `stages.S.<workload>`:
+    /// each with its YAML path.
+    layers: Vec<(RawService, String)>,
+    /// Job-only settings, same order; `None` for a service.
+    job: Option<Vec<(schema::RawJob, String)>>,
+    /// `--image` applies to this workload.
+    image_override: bool,
+}
+
+/// Stage-wide values every workload uses.
+struct Shared<'a> {
+    cfg: &'a LoadedConfig,
+    stage: &'a str,
+    overrides: &'a Overrides,
+    project: &'a str,
+    region: &'a str,
+    ix: &'a interp::Interp,
+    buckets: &'a BTreeMap<String, BucketConfig>,
+    create_build: bool,
+    artifact_repository: Option<(String, String)>,
+    artifact_location: Option<(String, String)>,
+    source_bucket: Option<(String, String)>,
+    build_sa: Option<(String, String)>,
+}
+
+/// The highest-precedence value of a field and where it came from.
+fn pick_layers<T: Clone>(
+    layers: &[(RawService, String)],
+    f: impl Fn(&RawService) -> &Option<T>,
+    field: &str,
+) -> Option<(T, String)> {
+    layers.iter().rev().find_map(|(l, prefix)| {
+        f(l).as_ref()
+            .map(|v| (v.clone(), format!("{prefix}.{field}")))
+    })
+}
+
+/// A map field merged across layers: a higher layer adds or replaces keys,
+/// and `null` removes an inherited one (an error in the lowest layer).
+fn merge_layers<V: Clone>(
+    d: &mut Diagnostics,
+    layers: &[(RawService, String)],
+    f: impl Fn(&RawService) -> &Option<BTreeMap<String, Option<V>>>,
+    field: &str,
+) -> BTreeMap<String, (V, String)> {
+    let mut out = BTreeMap::new();
+    for (i, (l, prefix)) in layers.iter().enumerate() {
+        let Some(m) = f(l) else { continue };
+        for (k, v) in m {
+            let path = format!("{prefix}.{field}.{k}");
+            match v {
+                Some(v) => {
+                    out.insert(k.clone(), (v.clone(), path));
+                }
+                None if i == 0 => d.error(
+                    path,
+                    "value must not be null (null is only meaningful in stage overrides, to remove an inherited key)",
+                ),
+                None => {
+                    out.remove(k);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolves one service or job; errors and warnings go to `diags`.
+fn resolve_workload(
+    diags: &mut Diagnostics,
+    sh: &Shared<'_>,
+    w: &WorkloadInput,
+) -> Option<(Artifact, ServiceConfig, Option<JobSettings>)> {
+    let mut d = std::mem::take(diags);
+    let (cfg, stage, overrides) = (sh.cfg, sh.stage, sh.overrides);
+    let (project, region) = (sh.project.to_string(), sh.region.to_string());
+    let (buckets, create_build, ix) = (sh.buckets, sh.create_build, sh.ix);
+    let ixs = |d: &mut Diagnostics, v: &str, path: &str| -> String {
+        match ix.apply(v) {
+            Ok(x) => x,
+            Err(e) => {
+                d.error(path, e);
+                v.to_string()
+            }
+        }
+    };
+    let sp = w.path.as_str();
+    let is_job = w.job.is_some();
+    let _ = stage;
     macro_rules! s {
         ($f:ident) => {
-            pick(stage, &sv.$f, &base.$f, "service", stringify!($f))
+            pick_layers(&w.layers, |l| &l.$f, stringify!($f))
         };
     }
 
     let artifact = resolve_artifact(
         &mut d,
         cfg,
-        stage,
-        overrides,
-        base,
-        sv,
+        w.image_override
+            .then_some(overrides.image.as_ref())
+            .flatten(),
+        &w.layers,
+        sp,
         BuildProvider {
             region: region.clone(),
-            artifact_repository,
-            artifact_location,
-            source_bucket,
-            build_sa,
+            artifact_repository: sh.artifact_repository.clone(),
+            artifact_location: sh.artifact_location.clone(),
+            source_bucket: sh.source_bucket.clone(),
+            build_sa: sh.build_sa.clone(),
             create: create_build,
             project: project.clone(),
         },
@@ -896,13 +1303,22 @@ pub fn resolve(
             v
         }
     };
-    let timeout_seconds = int_in_range(
-        &mut d,
-        s!(timeout_seconds),
-        DEFAULT_TIMEOUT_SECONDS,
-        1,
-        3600,
-    );
+    let timeout_seconds = match is_job {
+        false => int_in_range(
+            &mut d,
+            s!(timeout_seconds),
+            DEFAULT_TIMEOUT_SECONDS,
+            1,
+            3600,
+        ),
+        true => int_in_range(
+            &mut d,
+            s!(timeout_seconds),
+            DEFAULT_JOB_TIMEOUT_SECONDS,
+            1,
+            MAX_JOB_TIMEOUT_SECONDS,
+        ),
+    };
     let concurrency = int_in_range(&mut d, s!(concurrency), DEFAULT_CONCURRENCY, 1, 1000);
     let min_v = s!(min_instances);
     let max_v = s!(max_instances);
@@ -913,7 +1329,7 @@ pub fn resolve(
         d.error(
             min_path
                 .clone()
-                .unwrap_or_else(|| "service.min_instances".into()),
+                .unwrap_or_else(|| format!("{sp}.min_instances")),
             format!(
                 "min_instances ({min_instances}) must not exceed max_instances ({max_instances})"
             ),
@@ -923,7 +1339,7 @@ pub fn resolve(
         d.warn(
             min_path
                 .clone()
-                .unwrap_or_else(|| "service.min_instances".into()),
+                .unwrap_or_else(|| format!("{sp}.min_instances")),
             format!("{min_instances} instance(s) will be kept warm and billed while idle"),
         );
     }
@@ -953,7 +1369,7 @@ pub fn resolve(
     let service_account = match s!(service_account) {
         None => {
             d.error(
-                "service.service_account",
+                format!("{sp}.service_account"),
                 "a runtime service account is required (runway does not deploy with the broad default compute service account)",
             );
             String::new()
@@ -1034,7 +1450,7 @@ pub fn resolve(
     };
 
     // ---- env / secrets ----
-    let env = merge_map(&mut d, stage, &base.env, &sv.env, "env");
+    let env = merge_layers(&mut d, &w.layers, |l| &l.env, "env");
     let mut env_out = BTreeMap::new();
     for (k, (v, path)) in env {
         if let Err(e) = validate::env_name(&k) {
@@ -1062,13 +1478,13 @@ pub fn resolve(
                 );
             }
             Some(v) if !v.contains("localhost") && !v.contains("127.0.0.1") => d.warn(
-                "service.env.OTEL_EXPORTER_OTLP_ENDPOINT",
+                format!("{sp}.env.OTEL_EXPORTER_OTLP_ENDPOINT"),
                 format!("`{v}` bypasses the otel_collector sidecar (it listens on http://localhost:4318)"),
             ),
             Some(_) => {}
         }
     }
-    let secrets = merge_map(&mut d, stage, &base.secrets, &sv.secrets, "secrets");
+    let secrets = merge_layers(&mut d, &w.layers, |l| &l.secrets, "secrets");
     let mut secrets_out = BTreeMap::new();
     let mut secret_dirs = std::collections::BTreeSet::new();
     for (k, (v, path)) in secrets {
@@ -1146,7 +1562,7 @@ pub fn resolve(
 
     // ---- tags ----
     let mut tags_out = BTreeMap::new();
-    for (k, (v, path)) in merge_map(&mut d, stage, &base.tags, &sv.tags, "tags") {
+    for (k, (v, path)) in merge_layers(&mut d, &w.layers, |l| &l.tags, "tags") {
         if let Err(e) = validate::tag_key(&k) {
             d.error(path.clone(), e);
         }
@@ -1159,7 +1575,7 @@ pub fn resolve(
     // ---- volumes ----
     let mut volumes_out = BTreeMap::new();
     let mut mount_paths = std::collections::BTreeSet::new();
-    for (name, (v, path)) in merge_map(&mut d, stage, &base.volumes, &sv.volumes, "volumes") {
+    for (name, (v, path)) in merge_layers(&mut d, &w.layers, |l| &l.volumes, "volumes") {
         if let Err(e) = validate::volume_name(&name) {
             d.error(path.clone(), e);
         }
@@ -1208,9 +1624,18 @@ pub fn resolve(
     let memory_bytes = validate::parse_memory_bytes(&memory).unwrap_or(512 * 1024 * 1024);
     let small_memory = memory_bytes < 512 * 1024 * 1024;
     let fractional_cpu = cpu_millis < 1000;
-    if fractional_cpu && concurrency != 1 {
+    // Cloud Run jobs need at least 1 CPU and 512Mi.
+    if is_job && fractional_cpu {
+        let path = s!(cpu).map_or(format!("{sp}.cpu"), |(_, p)| p);
+        d.error(path, "Cloud Run jobs need at least 1 CPU");
+    }
+    if is_job && small_memory {
+        let path = s!(memory).map_or(format!("{sp}.memory"), |(_, p)| p);
+        d.error(path, "Cloud Run jobs need at least 512Mi of memory");
+    }
+    if fractional_cpu && concurrency != 1 && !is_job {
         d.error(
-            "service.concurrency",
+            format!("{sp}.concurrency"),
             format!(
                 "with less than 1 CPU, Cloud Run requires `concurrency: 1` (got {concurrency})"
             ),
@@ -1263,12 +1688,12 @@ pub fn resolve(
             // Cloud Storage volumes run on gen2, which Cloud Run picks for them.
             if !volumes_out.is_empty() && fractional_cpu {
                 d.error(
-                    "service.cpu",
+                    format!("{sp}.cpu"),
                     "Cloud Storage volumes need the gen2 execution environment, which needs at least 1 CPU",
                 );
             } else if !volumes_out.is_empty() && small_memory {
                 d.error(
-                    "service.memory",
+                    format!("{sp}.memory"),
                     "Cloud Storage volumes need the gen2 execution environment, which needs at least 512Mi of memory",
                 );
             }
@@ -1368,14 +1793,14 @@ pub fn resolve(
     if !cloud_sql.is_empty() {
         if let Some(name) = volumes_out.keys().find(|k| *k == CLOUD_SQL_VOLUME) {
             d.error(
-                format!("service.volumes.{name}"),
+                format!("{sp}.volumes.{name}"),
                 format!("`{CLOUD_SQL_VOLUME}` is reserved for the Cloud SQL connections"),
             );
         }
         let at_cloudsql = |p: &str| p == CLOUD_SQL_MOUNT || p.starts_with("/cloudsql/");
         if let Some((name, _)) = volumes_out.iter().find(|(_, v)| at_cloudsql(&v.mount_path)) {
             d.error(
-                format!("service.volumes.{name}.mount_path"),
+                format!("{sp}.volumes.{name}.mount_path"),
                 format!("`{CLOUD_SQL_MOUNT}` is where the Cloud SQL connections are mounted"),
             );
         }
@@ -1384,7 +1809,7 @@ pub fn resolve(
             .find(|(_, s)| s.path.as_deref().is_some_and(at_cloudsql))
         {
             d.error(
-                format!("service.secrets.{key}.path"),
+                format!("{sp}.secrets.{key}.path"),
                 format!("`{CLOUD_SQL_MOUNT}` is where the Cloud SQL connections are mounted"),
             );
         }
@@ -1415,7 +1840,7 @@ pub fn resolve(
     // ---- sidecars ----
     let app_port = port;
     let mut sidecars_out = BTreeMap::new();
-    for (name, (sc, path)) in merge_map(&mut d, stage, &base.sidecars, &sv.sidecars, "sidecars") {
+    for (name, (sc, path)) in merge_layers(&mut d, &w.layers, |l| &l.sidecars, "sidecars") {
         if let Err(e) = validate::container_name(&name) {
             d.error(path.clone(), e);
         } else if name == crate::gcp::run::APP_CONTAINER
@@ -1549,7 +1974,7 @@ pub fn resolve(
     let containers = 1 + usize::from(otel_collector.is_some()) + sidecars_out.len();
     if containers > MAX_CONTAINERS {
         d.error(
-            "service.sidecars",
+            format!("{sp}.sidecars"),
             format!(
                 "{containers} containers; Cloud Run allows at most {MAX_CONTAINERS} per instance"
             ),
@@ -1611,7 +2036,7 @@ pub fn resolve(
                 && !(6..=30).contains(&local.len())
             {
                 d.error(
-                    "service.service_account",
+                    format!("{sp}.service_account"),
                     "service account names must be 6-30 characters to be created",
                 );
             }
@@ -1723,39 +2148,16 @@ pub fn resolve(
         }
     }
 
-    // ---- retry ----
-    let retry = resolve_retry(&mut d, raw.retry.as_ref());
-
-    // An interpolation error makes further checks of the same field noise.
-    let interp_failed: std::collections::BTreeSet<String> = d
-        .errors
-        .iter()
-        .filter(|e| {
-            e.message.starts_with("unknown variable") || e.message.starts_with("unterminated")
-        })
-        .map(|e| e.path.clone())
-        .collect();
-    d.errors.retain(|e| {
-        !interp_failed.contains(&e.path)
-            || e.message.starts_with("unknown variable")
-            || e.message.starts_with("unterminated")
-    });
-
-    if !d.errors.is_empty() {
-        d.errors.sort();
-        d.errors.dedup();
-        return Err(d);
-    }
-
-    Ok(Resolved {
-        deployment: Deployment {
-            app: raw.app.clone(),
-            stage: stage.to_string(),
-            project,
-            region,
-            service_id,
-            artifact: artifact.expect("artifact resolved when no errors"),
-            service: ServiceConfig {
+    let command = s!(command).map(|(v, _)| v).unwrap_or_default();
+    let args = s!(args).map(|(v, _)| v).unwrap_or_default();
+    let job = w
+        .job
+        .as_ref()
+        .map(|layers| resolve_job_settings(&mut d, layers));
+    let out = artifact.map(|artifact| {
+        (
+            artifact,
+            ServiceConfig {
                 port,
                 cpu,
                 memory,
@@ -1783,19 +2185,40 @@ pub fn resolve(
                 vpc,
                 cloud_sql,
                 custom_audiences,
+                command,
+                args,
             },
-            retry,
-            apis: ApisConfig {
-                enable: enable_apis,
-                extra: extra_apis,
-            },
-            impersonate,
-            project_tags,
-            buckets,
-            secrets: managed_secrets,
-        },
-        warnings: d.warnings,
-    })
+            job,
+        )
+    });
+    diags.errors.extend(d.errors);
+    diags.warnings.extend(d.warnings);
+    out
+}
+
+/// Tasks, parallelism and retries of a job.
+fn resolve_job_settings(d: &mut Diagnostics, layers: &[(schema::RawJob, String)]) -> JobSettings {
+    let pick = |f: fn(&schema::RawJob) -> Option<i64>, field: &str| {
+        layers
+            .iter()
+            .rev()
+            .find_map(|(l, prefix)| f(l).map(|v| (v, format!("{prefix}.{field}"))))
+    };
+    let tasks = int_in_range(d, pick(|j| j.tasks, "tasks"), 1, 1, 10_000);
+    let parallelism_v = pick(|j| j.parallelism, "parallelism");
+    let parallelism_path = parallelism_v.as_ref().map(|(_, p)| p.clone());
+    let parallelism = int_in_range(d, parallelism_v, 0, 0, 10_000);
+    if parallelism > tasks
+        && let Some(path) = parallelism_path
+    {
+        d.warn(path, format!("only {tasks} task(s) run per execution"));
+    }
+    let max_retries = int_in_range(d, pick(|j| j.max_retries, "max_retries"), 3, 0, 10);
+    JobSettings {
+        tasks,
+        parallelism,
+        max_retries,
+    }
 }
 
 fn resolve_probe(
@@ -2151,10 +2574,9 @@ struct BuildProvider {
 fn resolve_artifact(
     d: &mut Diagnostics,
     cfg: &LoadedConfig,
-    stage: &str,
-    overrides: &Overrides,
-    base: &RawService,
-    sv: &RawService,
+    image_override: Option<&String>,
+    raw_layers: &[(RawService, String)],
+    sp: &str,
     bp: BuildProvider,
 ) -> Option<Artifact> {
     struct Layer<'a> {
@@ -2165,32 +2587,24 @@ fn resolve_artifact(
         builder: Option<&'a String>,
         rebuild: Option<&'a String>,
     }
-    let layers = [
-        Layer {
-            prefix: "--image".into(),
-            image: overrides.image.as_ref(),
-            source: None,
-            dockerfile: None,
-            builder: None,
-            rebuild: None,
-        },
-        Layer {
-            prefix: format!("stages.{stage}.service"),
-            image: sv.image.as_ref(),
-            source: sv.source.as_ref(),
-            dockerfile: sv.dockerfile.as_ref(),
-            builder: sv.builder.as_ref(),
-            rebuild: sv.rebuild.as_ref(),
-        },
-        Layer {
-            prefix: "service".into(),
-            image: base.image.as_ref(),
-            source: base.source.as_ref(),
-            dockerfile: base.dockerfile.as_ref(),
-            builder: base.builder.as_ref(),
-            rebuild: base.rebuild.as_ref(),
-        },
-    ];
+    // Highest precedence first.
+    let layers: Vec<Layer> = std::iter::once(Layer {
+        prefix: "--image".into(),
+        image: image_override,
+        source: None,
+        dockerfile: None,
+        builder: None,
+        rebuild: None,
+    })
+    .chain(raw_layers.iter().rev().map(|(l, prefix)| Layer {
+        prefix: prefix.clone(),
+        image: l.image.as_ref(),
+        source: l.source.as_ref(),
+        dockerfile: l.dockerfile.as_ref(),
+        builder: l.builder.as_ref(),
+        rebuild: l.rebuild.as_ref(),
+    }))
+    .collect();
     // Same-layer conflicts are always errors.
     for l in &layers {
         if l.image.is_some()
@@ -2207,8 +2621,8 @@ fn resolve_artifact(
         l.image.is_some() || l.source.is_some() || l.dockerfile.is_some() || l.builder.is_some()
     }) else {
         d.error(
-            "service",
-            "set either `service.image` (deploy an existing image) or `service.source` (build from source with a Dockerfile or buildpacks)",
+            sp,
+            format!("set either `{sp}.image` (deploy an existing image) or `{sp}.source` (build from source with a Dockerfile or buildpacks)"),
         );
         return None;
     };
@@ -2251,7 +2665,7 @@ fn resolve_artifact(
     });
     let Some((source, source_path)) = source else {
         d.error(
-            "service.source",
+            format!("{sp}.source"),
             "is required when building from source (for example `source: .`)",
         );
         return None;
@@ -2290,7 +2704,7 @@ fn resolve_artifact(
         (explicit, None) => {
             let auto = explicit.is_none();
             let (dockerfile, dockerfile_path) = explicit
-                .unwrap_or_else(|| (DEFAULT_DOCKERFILE.to_string(), "service.dockerfile".into()));
+                .unwrap_or_else(|| (DEFAULT_DOCKERFILE.to_string(), format!("{sp}.dockerfile")));
             let df = Path::new(&dockerfile);
             if df.is_absolute() || df.components().any(|c| matches!(c, Component::ParentDir)) {
                 d.error(
@@ -2424,43 +2838,384 @@ fn normalize_path(p: &Path) -> PathBuf {
 }
 
 /// Merges `env`/`secrets` maps key by key. A `null` in the stage removes the key.
-fn merge_map<V: Clone>(
+/// The services and jobs of a stage, with the layers of their settings.
+fn workload_inputs(
     d: &mut Diagnostics,
+    raw: &RawConfig,
+    st: &RawStage,
     stage: &str,
-    base: &Option<BTreeMap<String, Option<V>>>,
-    over: &Option<BTreeMap<String, Option<V>>>,
-    field: &str,
-) -> BTreeMap<String, (V, String)> {
-    let mut out = BTreeMap::new();
-    if let Some(b) = base {
-        for (k, v) in b {
-            match v {
-                Some(v) => {
-                    out.insert(k.clone(), (v.clone(), format!("service.{field}.{k}")));
-                }
-                None => d.error(
-                    format!("service.{field}.{k}"),
-                    "value must not be null (null is only meaningful in stage overrides, to remove an inherited key)",
-                ),
-            }
-        }
+    overrides: &Overrides,
+) -> Vec<WorkloadInput> {
+    let defaults: Vec<(&RawService, String)> = [
+        (raw.defaults.as_ref(), "defaults".to_string()),
+        (st.defaults.as_ref(), format!("stages.{stage}.defaults")),
+    ]
+    .into_iter()
+    .filter_map(|(l, p)| l.map(|l| (l, p)))
+    .collect();
+    let named = !raw.services.is_empty()
+        || !raw.jobs.is_empty()
+        || !st.services.is_empty()
+        || !st.jobs.is_empty();
+    let mut out = Vec::new();
+    // Without services or jobs, a file is about the main service (as before
+    // they existed), so errors still point at `service`.
+    if raw.service.is_some() || st.service.is_some() || !named {
+        let mut layers: Vec<(RawService, String)> = defaults
+            .iter()
+            .map(|(l, p)| ((*l).clone(), p.clone()))
+            .collect();
+        layers.extend(raw.service.clone().map(|l| (l, "service".to_string())));
+        layers.extend(
+            st.service
+                .clone()
+                .map(|l| (l, format!("stages.{stage}.service"))),
+        );
+        out.push(WorkloadInput {
+            key: None,
+            path: "service".into(),
+            layers,
+            job: None,
+            image_override: false,
+        });
     }
-    if let Some(o) = over {
-        for (k, v) in o {
-            match v {
-                Some(v) => {
-                    out.insert(
-                        k.clone(),
-                        (v.clone(), format!("stages.{stage}.service.{field}.{k}")),
-                    );
-                }
-                None => {
-                    out.remove(k);
-                }
-            }
+    let check_key = |d: &mut Diagnostics, what: &str, key: &str, path: &str| {
+        if let Err(e) = validate::name_component(what, key, 30) {
+            d.error(path, e);
+        } else if key == raw.app {
+            d.error(
+                path,
+                format!("`{key}` is the app name, which names the main service"),
+            );
+        }
+    };
+    let keys: BTreeSet<&String> = raw.services.keys().chain(st.services.keys()).collect();
+    for key in keys {
+        if matches!(st.services.get(key), Some(None)) {
+            continue;
+        }
+        check_key(d, "service name", key, &format!("services.{key}"));
+        let mut layers: Vec<(RawService, String)> = defaults
+            .iter()
+            .map(|(l, p)| ((*l).clone(), p.clone()))
+            .collect();
+        if let Some(b) = raw.services.get(key) {
+            layers.push((b.clone().unwrap_or_default(), format!("services.{key}")));
+        }
+        if let Some(Some(o)) = st.services.get(key) {
+            layers.push((o.clone(), format!("stages.{stage}.services.{key}")));
+        }
+        out.push(WorkloadInput {
+            key: Some(key.clone()),
+            path: format!("services.{key}"),
+            layers,
+            job: None,
+            image_override: false,
+        });
+    }
+    let keys: BTreeSet<&String> = raw.jobs.keys().chain(st.jobs.keys()).collect();
+    for key in keys {
+        if matches!(st.jobs.get(key), Some(None)) {
+            continue;
+        }
+        check_key(d, "job name", key, &format!("jobs.{key}"));
+        if raw.services.contains_key(key) || st.services.contains_key(key) {
+            d.error(
+                format!("jobs.{key}"),
+                format!("`{key}` is also a service name; names select services and jobs (`--only`, schedules)"),
+            );
+        }
+        let mut layers: Vec<(RawService, String)> = defaults
+            .iter()
+            .map(|(l, p)| (l.for_job(), p.clone()))
+            .collect();
+        let mut job_layers = Vec::new();
+        if let Some(b) = raw.jobs.get(key) {
+            let b = b.clone().unwrap_or_default();
+            layers.push((b.as_service(), format!("jobs.{key}")));
+            job_layers.push((b, format!("jobs.{key}")));
+        }
+        if let Some(Some(o)) = st.jobs.get(key) {
+            layers.push((o.as_service(), format!("stages.{stage}.jobs.{key}")));
+            job_layers.push((o.clone(), format!("stages.{stage}.jobs.{key}")));
+        }
+        out.push(WorkloadInput {
+            key: Some(key.clone()),
+            path: format!("jobs.{key}"),
+            layers,
+            job: Some(job_layers),
+            image_override: false,
+        });
+    }
+    if overrides.image.is_some() {
+        let name = |w: &WorkloadInput| w.key.clone().unwrap_or_else(|| raw.app.clone());
+        match (&overrides.target, out.len()) {
+            (_, 1) => out[0].image_override = true,
+            (Some(t), _) => match out.iter_mut().find(|w| name(w) == *t) {
+                Some(w) => w.image_override = true,
+                None => d.error("--image", format!("`{t}` is not a service or job of this stage")),
+            },
+            (None, _) => d.error(
+                "--image",
+                "this stage has several services and jobs: choose the one the image is for with `--only NAME`",
+            ),
         }
     }
     out
+}
+
+/// The Cloud Run ID of a workload, checked against Cloud Run's length limits.
+fn workload_id(d: &mut Diagnostics, app: &str, stage: &str, w: &WorkloadInput) -> String {
+    let id = naming::workload_id(app, w.key.as_deref(), stage);
+    let max = match w.job {
+        Some(_) => naming::MAX_JOB_NAME_LEN,
+        None => naming::MAX_SERVICE_NAME_LEN,
+    };
+    if id.len() > max {
+        match &w.key {
+            None => d.error(
+                "app",
+                format!(
+                    "service name `{id}` (app-stage) exceeds {max} characters; shorten `app` or the stage name"
+                ),
+            ),
+            Some(_) => d.error(
+                w.path.clone(),
+                format!("`{id}` (app-name-stage) exceeds {max} characters; shorten the name"),
+            ),
+        }
+    }
+    id
+}
+
+/// Schedules of a stage (a stage entry replaces the inherited one, `null`
+/// removes it) and the invoker account they use.
+#[allow(clippy::too_many_arguments)]
+fn resolve_schedules(
+    d: &mut Diagnostics,
+    raw: &RawConfig,
+    st: &RawStage,
+    stage: &str,
+    project: &str,
+    region: &str,
+    ix: &interp::Interp,
+    inputs: &[WorkloadInput],
+) -> (Vec<ScheduleConfig>, Option<SchedulerConfig>, String) {
+    let ixs = |d: &mut Diagnostics, v: &str, path: &str| -> String {
+        ix.apply(v).unwrap_or_else(|e| {
+            d.error(path, e);
+            v.to_string()
+        })
+    };
+    let mut merged: BTreeMap<String, (schema::RawSchedule, String)> = BTreeMap::new();
+    for (k, v) in &raw.schedules {
+        match v {
+            Some(v) => {
+                merged.insert(k.clone(), (v.clone(), format!("schedules.{k}")));
+            }
+            None => d.error(format!("schedules.{k}"), "value must not be null"),
+        }
+    }
+    for (k, v) in &st.schedules {
+        match v {
+            Some(v) => {
+                merged.insert(
+                    k.clone(),
+                    (v.clone(), format!("stages.{stage}.schedules.{k}")),
+                );
+            }
+            None => {
+                merged.remove(k);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (key, (sch, path)) in merged {
+        if let Err(e) = validate::name_component("schedule name", &key, 30) {
+            d.error(path.clone(), e);
+        }
+        if let Err(e) = validate::cron(&sch.schedule) {
+            d.error(format!("{path}.schedule"), e);
+        }
+        let time_zone = sch.time_zone.clone().unwrap_or_else(|| "Etc/UTC".into());
+        if let Err(e) = validate::time_zone(&time_zone) {
+            d.error(format!("{path}.time_zone"), e);
+        }
+        let find = |key: Option<&str>, job: bool| {
+            inputs
+                .iter()
+                .find(|w| w.job.is_some() == job && w.key.as_deref() == key)
+        };
+        let target = match (&sch.job, &sch.service) {
+            (Some(j), None) => {
+                for f in [
+                    ("path", sch.path.is_some()),
+                    ("method", sch.method.is_some()),
+                    ("body", sch.body.is_some()),
+                    ("headers", sch.headers.is_some()),
+                ] {
+                    if f.1 {
+                        d.error(format!("{path}.{}", f.0), "only for a `service` target");
+                    }
+                }
+                match find(Some(j), true) {
+                    Some(_) => Some(ScheduleTarget::Job {
+                        name: j.clone(),
+                        job_id: naming::workload_id(&raw.app, Some(j), stage),
+                    }),
+                    None => {
+                        d.error(
+                            format!("{path}.job"),
+                            format!("`{j}` is not a job of stage `{stage}`"),
+                        );
+                        None
+                    }
+                }
+            }
+            (None, Some(svc)) => {
+                let key = (svc != &raw.app).then_some(svc.as_str());
+                if find(key, false).is_none() {
+                    d.error(
+                        format!("{path}.service"),
+                        format!("`{svc}` is not a service of stage `{stage}` (the main service is named after the app)"),
+                    );
+                }
+                let method = sch
+                    .method
+                    .clone()
+                    .unwrap_or_else(|| "POST".into())
+                    .to_uppercase();
+                if !["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+                    .contains(&method.as_str())
+                {
+                    d.error(
+                        format!("{path}.method"),
+                        format!("`{method}` is not an HTTP method"),
+                    );
+                }
+                let target_path = match &sch.path {
+                    None => "/".to_string(),
+                    Some(p) => {
+                        let p = ixs(d, p, &format!("{path}.path"));
+                        if !p.starts_with('/') {
+                            d.error(format!("{path}.path"), "must start with `/`");
+                        }
+                        p
+                    }
+                };
+                let body = sch
+                    .body
+                    .as_ref()
+                    .map(|b| ixs(d, b, &format!("{path}.body")));
+                if body.is_some() && !["POST", "PUT", "PATCH"].contains(&method.as_str()) {
+                    d.error(
+                        format!("{path}.body"),
+                        format!("a {method} request has no body"),
+                    );
+                }
+                let headers = sch
+                    .headers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let v = ixs(d, &v, &format!("{path}.headers.{k}"));
+                        (k, v)
+                    })
+                    .collect();
+                Some(ScheduleTarget::Service {
+                    name: svc.clone(),
+                    service_id: naming::workload_id(&raw.app, key, stage),
+                    path: target_path,
+                    method,
+                    body,
+                    headers,
+                })
+            }
+            _ => {
+                d.error(path.clone(), "set exactly one target: `job` or `service`");
+                None
+            }
+        };
+        let retries = int_in_range(
+            d,
+            sch.retries.map(|v| (v, format!("{path}.retries"))),
+            0,
+            0,
+            5,
+        );
+        let attempt_deadline_seconds = int_in_range(
+            d,
+            sch.attempt_deadline_seconds
+                .map(|v| (v, format!("{path}.attempt_deadline_seconds"))),
+            180,
+            15,
+            1800,
+        );
+        if let Some(target) = target {
+            out.push(ScheduleConfig {
+                id: format!("{}-{key}-{stage}", raw.app),
+                key,
+                schedule: sch.schedule.clone(),
+                time_zone,
+                target,
+                retries,
+                attempt_deadline_seconds,
+                paused: sch.paused.unwrap_or(false),
+            });
+        }
+    }
+    let pick_s = |f: fn(&schema::RawScheduler) -> Option<String>, field: &str| {
+        st.scheduler
+            .as_ref()
+            .and_then(f)
+            .map(|v| (v, format!("stages.{stage}.scheduler.{field}")))
+            .or_else(|| {
+                raw.scheduler
+                    .as_ref()
+                    .and_then(f)
+                    .map(|v| (v, format!("scheduler.{field}")))
+            })
+    };
+    // Also without schedules: those left after the last one was removed
+    // from runway.yaml are looked for (and deleted) there.
+    let scheduler_region = match pick_s(|s| s.region.clone(), "region") {
+        Some((r, p)) => {
+            if let Err(e) = validate::region(&r) {
+                d.error(p, e);
+            }
+            r
+        }
+        None => region.to_string(),
+    };
+    let scheduler = (!out.is_empty() || !raw.schedules.is_empty()).then(|| {
+        let given = pick_s(|s| s.service_account.clone(), "service_account");
+        let service_account = match &given {
+            Some((v, p)) => {
+                let v = ixs(d, v, p);
+                if let Err(e) = validate::service_account_email(&v) {
+                    d.error(p.clone(), e);
+                }
+                v
+            }
+            None => format!(
+                "{}@{project}.iam.gserviceaccount.com",
+                naming::scheduler_account_id(&raw.app, stage)
+            ),
+        };
+        let create = st
+            .scheduler
+            .as_ref()
+            .and_then(|s| s.create)
+            .or(raw.scheduler.as_ref().and_then(|s| s.create))
+            .unwrap_or(given.is_none());
+        SchedulerConfig {
+            service_account,
+            create,
+            region: scheduler_region.clone(),
+        }
+    });
+    (out, scheduler, scheduler_region)
 }
 
 /// Validates every defined stage. Returns per-stage results.

@@ -42,7 +42,8 @@ stages: {{prod: {{}}}}
     config::load_and_resolve(&p, "prod", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 async fn server(service_labels: Value, sa_description: &str) -> MockServer {
@@ -134,10 +135,18 @@ fn endpoints(uri: &str) -> Endpoints {
         secret_manager: Some(uri.into()),
         service_usage: Some(uri.into()),
         artifact_registry: Some(uri.into()),
+        run: Some(uri.into()),
+        scheduler: Some(uri.into()),
     }
 }
 
-async fn clients(s: &MockServer) -> (Session, google_cloud_run_v2::client::Services) {
+async fn clients(
+    s: &MockServer,
+) -> (
+    Session,
+    google_cloud_run_v2::client::Services,
+    google_cloud_run_v2::client::Jobs,
+) {
     let session = Session::from_static_token("t").unwrap();
     let run = google_cloud_run_v2::client::Services::builder()
         .with_endpoint(s.uri())
@@ -145,7 +154,21 @@ async fn clients(s: &MockServer) -> (Session, google_cloud_run_v2::client::Servi
         .build()
         .await
         .unwrap();
-    (session, run)
+    let jobs = google_cloud_run_v2::client::Jobs::builder()
+        .with_endpoint(s.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    // No job uses the runtime account.
+    Mock::given(method("GET"))
+        .and(path(
+            "/v2/projects/my-gcp-project/locations/europe-west1/jobs",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(s)
+        .await;
+    (session, run, jobs)
 }
 
 #[tokio::test]
@@ -157,12 +180,14 @@ async fn removes_what_runway_created_and_keeps_data() {
         &sa_marker("gcptree", Some("prod"), "runtime"),
     )
     .await;
-    let (session, run) = clients(&s).await;
+    let (session, run, jobs) = clients(&s).await;
     let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
 
-    let (mut items, del_svc, del_sa) = plan(&d, &run, &prov, false).await.unwrap();
+    let (mut items, del_svc, del_sa) = plan(&d, &run, &jobs, &prov, false, &[d.service_name()])
+        .await
+        .unwrap();
     assert!(del_svc && del_sa);
     let action = |res: &str| {
         items
@@ -201,6 +226,7 @@ async fn removes_what_runway_created_and_keeps_data() {
     execute(
         &d,
         &run,
+        &jobs,
         &prov,
         &retry,
         &Progress::silent(),
@@ -275,11 +301,13 @@ async fn keeps_accounts_without_marker_and_refuses_foreign_services() {
         "created by the platform team",
     )
     .await;
-    let (session, run) = clients(&s).await;
+    let (session, run, jobs) = clients(&s).await;
     let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
-    let (items, del_svc, del_sa) = plan(&d, &run, &prov, false).await.unwrap();
+    let (items, del_svc, del_sa) = plan(&d, &run, &jobs, &prov, false, &[d.service_name()])
+        .await
+        .unwrap();
     assert!(del_svc && !del_sa);
     let sa = items
         .iter()
@@ -300,11 +328,13 @@ async fn keeps_accounts_without_marker_and_refuses_foreign_services() {
         "x",
     )
     .await;
-    let (session, run) = clients(&s).await;
+    let (session, run, jobs) = clients(&s).await;
     let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
-    let err = plan(&d, &run, &prov, false).await.unwrap_err();
+    let err = plan(&d, &run, &jobs, &prov, false, &[d.service_name()])
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, runway::error::ErrorKind::Conflict);
 }
 
@@ -319,7 +349,7 @@ async fn never_deletes_a_service_that_changed_owner_after_planning() {
         &sa_marker("gcptree", Some("prod"), "runtime"),
     )
     .await;
-    let (session, run) = clients(&s).await;
+    let (session, run, jobs) = clients(&s).await;
     let prov = Provisioner::with_endpoints(&d, &session, &run, &endpoints(&s.uri()))
         .await
         .unwrap();
@@ -331,6 +361,7 @@ async fn never_deletes_a_service_that_changed_owner_after_planning() {
     let err = execute(
         &d,
         &run,
+        &jobs,
         &prov,
         &retry,
         &Progress::silent(),
