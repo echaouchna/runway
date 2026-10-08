@@ -1,0 +1,1539 @@
+# What `runway explain` says about runway.yaml.
+#
+# A block starts with `@ PATH` (a key, with `<name>` for names you choose, or
+# `:topic` for a guide). Then optional `title:`, `type:`, `default:`,
+# `group:` (to group a service key), `docs:` (page#anchor), `see:` (related
+# keys), `resolved:` (where the resolved value is, `-` for nowhere), then
+# paragraphs (the first one is the summary), `Example:` (indented lines) and
+# `Rules:` (`- ` lines). Lines starting with `#` are comments.
+
+@ :start
+title: Start here
+docs: configuration.md
+runway.yaml describes a Cloud Run application: how its image is built, how it runs, who may call it, what it needs (secrets, buckets, a runtime identity), and the stages it is deployed to. `runway plan` shows what a deploy would change; `runway deploy` makes the live project match the file.
+
+A file needs `version`, `app`, `provider` (project and region), at least one stage, and something to deploy: the main `service` (named `<app>-<stage>`), more `services`, or `jobs`.
+
+Browse the keys on the left: each one says what it does, its default, an example and its rules. Keys marked ● are set in your runway.yaml; their values per stage are shown below the explanation.
+Example:
+  version: 1
+  app: hello
+  provider:
+    project: my-gcp-project
+    region: europe-west1
+    enable_apis: true             # turn on the APIs it needs
+    create_build_resources: true  # and the repository, bucket and build account
+  service:
+    source: .
+    service_account: hello-runtime@my-gcp-project.iam.gserviceaccount.com
+    identity: {create: true}
+    public: true
+  stages:
+    dev: {}
+    prod:
+      service: {min_instances: 1}
+Rules:
+- Unknown keys are errors (with the list of valid ones): typos never go unnoticed.
+- `runway validate` checks the file without credentials; `runway describe --stage S` explains what a stage deploys.
+
+@ :layers
+title: Stages, defaults and precedence
+docs: configuration.md#stage-override-precedence
+see: stages, defaults, stages.<name>.service
+Every stage is deployed from the same file. A stage block changes only what differs: `stages.prod.service.min_instances: 1` keeps everything else from `service`.
+
+Lowest first: `defaults`, `stages.S.defaults`, the service or job, `stages.S.<its block>`, then `--image` on the command line. Scalars are replaced; maps (`env`, `secrets`, `tags`, `volumes`, `sidecars`, `vars`) merge key by key, and `null` removes an inherited key. `identity`, `iap`, `vpc` and `health_check` blocks are replaced as a whole.
+
+The highest layer that sets `image` or `source`/`dockerfile` chooses how the image is made: a stage that sets `image` replaces a top-level source build, and the other way round.
+Example:
+  service:
+    memory: 512Mi
+    env: {LOG_LEVEL: info, DEBUG: "1"}
+  stages:
+    prod:
+      service:
+        memory: 1Gi          # replaced
+        env: {DEBUG: null}   # removed; LOG_LEVEL stays
+Rules:
+- Setting both `image` and `source` in one block is an error.
+- Scalars cannot be removed with `null`, only replaced.
+
+@ :variables
+title: Variables
+docs: configuration.md#variables
+see: vars, buckets, secrets
+`${...}` is replaced in most names: `provider.source_bucket`, `provider.build_service_account`, bucket and secret names, `service_account`, `env` values, `identity`, volume buckets and IAP members.
+
+Available: `${project}`, `${region}`, `${app}`, `${stage}`, `${vars.NAME}`, `${buckets.KEY}` (the name of a declared bucket) and `${secrets.KEY}` (a secret runway creates). `$$` is a literal `$`.
+Example:
+  vars:
+    data_project: my-data-project
+  service:
+    service_account: "${app}-runtime@${project}.iam.gserviceaccount.com"
+    env:
+      DATA_PROJECT: "${vars.data_project}"
+Rules:
+- Unknown variables are validation errors.
+
+@ :names
+title: Names of what runway creates
+docs: configuration.md#several-services-jobs-and-schedules
+see: app, services, jobs
+The main service is `<app>-<stage>`; named services and jobs are `<app>-<name>-<stage>`, and so are schedules. Images go to the package `<app>` (main service) or `<app>-<name>`.
+
+Everything runway creates carries the labels `managed-by=runway`, `runway-app` and `runway-stage` (or a marker in its description): runway never changes nor deletes what it does not own.
+Rules:
+- Service names are at most 49 characters, job names 63.
+- A service and a job cannot share a name, and none can be the app name.
+
+@ version
+type: integer
+docs: configuration.md
+The schema version of the file. Only `1` exists.
+Example:
+  version: 1
+Rules:
+- Required.
+
+@ app
+type: string
+docs: configuration.md
+see: :names
+The application name. It names everything runway creates: the main service is `<app>-<stage>`, named ones `<app>-<name>-<stage>`.
+Example:
+  app: hello-api
+Rules:
+- Required: lowercase letters, digits and hyphens, starting with a letter, up to 40 characters.
+- Changing it deploys new services under new names (the old ones stay until `undeploy`).
+
+@ vars
+type: map of strings
+docs: configuration.md#variables
+see: :variables, stages.<name>.vars
+Your own variables, used as `${vars.NAME}`. Values may use the built-in variables (`${project}`, `${stage}`…).
+Example:
+  vars:
+    data_project: my-data-project
+
+@ provider
+type: block
+docs: configuration.md
+Where the app is deployed (project and region), how images are built (repository, source bucket, build account) and what runway may create for you. A stage can override any of it.
+Example:
+  provider:
+    project: my-gcp-project
+    region: europe-west1
+    enable_apis: true
+    create_build_resources: true
+
+@ provider.project
+type: string
+resolved: /project
+docs: configuration.md
+The Google Cloud project ID everything is deployed to.
+Example:
+  project: my-gcp-project
+Rules:
+- Required (here or in every stage).
+
+@ provider.region
+type: string
+resolved: /region
+docs: configuration.md
+The Cloud Run region, also used by Cloud Build and as the default location of buckets, secrets and the repository.
+Example:
+  region: europe-west1
+Rules:
+- Required (here or in every stage).
+
+@ provider.enable_apis
+type: boolean
+default: false
+resolved: /apis/enable
+docs: getting-started.md#let-runway-create-what-it-needs
+see: provider.apis
+Enable the Google Cloud APIs the configuration needs when they are missing (Cloud Run, Cloud Build, Secret Manager…). Without it, `runway doctor` reports the missing ones.
+Example:
+  enable_apis: true
+Rules:
+- Needs `roles/serviceusage.serviceUsageAdmin`.
+- APIs are never disabled by runway, not even by `undeploy`.
+
+@ provider.apis
+type: list of strings
+resolved: /apis/extra
+docs: configuration.md
+Extra APIs runway cannot infer from the file (for example ones your app calls), checked by `doctor` and enabled with `enable_apis`.
+Example:
+  apis: [telemetry.googleapis.com, translate.googleapis.com]
+
+@ provider.create_build_resources
+type: boolean
+default: false
+docs: getting-started.md#let-runway-create-what-it-needs
+Create what source builds need when missing: the Artifact Registry repository, the source bucket and the build service account with its roles. The three names then default to `runway`, `<project>-runway-sources` and `runway-build@<project>.iam.gserviceaccount.com`.
+Example:
+  create_build_resources: true
+
+@ provider.artifact_repository
+type: string
+default: runway (with create_build_resources)
+docs: configuration.md
+The Artifact Registry repository (Docker format) built images are pushed to.
+Example:
+  artifact_repository: applications
+Rules:
+- Required for source builds, unless `create_build_resources` is true.
+
+@ provider.artifact_location
+type: string
+default: provider.region
+docs: configuration.md
+The location of the repository, when it is not the region (for example a multi-region `europe`).
+Example:
+  artifact_location: europe
+
+@ provider.source_bucket
+type: string
+default: <project>-runway-sources (with create_build_resources)
+docs: configuration.md
+The Cloud Storage bucket the source archive is uploaded to before a build. A name without `gs://`; variables work.
+Example:
+  source_bucket: "${project}-runway-sources"
+Rules:
+- Required for source builds, unless `create_build_resources` is true.
+
+@ provider.build_service_account
+type: string
+default: runway-build@<project>.iam.gserviceaccount.com (with create_build_resources)
+docs: permissions.md
+The account Cloud Build runs as: it reads the source archive, pushes the image and writes build logs.
+Example:
+  build_service_account: "builds@${project}.iam.gserviceaccount.com"
+Rules:
+- Required for source builds, unless `create_build_resources` is true.
+
+@ provider.impersonate_service_account
+type: string
+resolved: /impersonate
+docs: ci-cd.md
+Make every API call as this service account (your credentials need `roles/iam.serviceAccountTokenCreator` on it). `SA` or a delegation chain `DELEGATE,...,SA`.
+Example:
+  impersonate_service_account: deployer@my-gcp-project.iam.gserviceaccount.com
+Rules:
+- `--impersonate-service-account` on the command line wins.
+
+@ provider.tags
+type: map
+resolved: /project_tags
+docs: how-it-works.md
+see: service.tags, service.bootstrap
+Resource Manager tags bound to the project before anything is created, then awaited until effective: for organization policies that only allow something (like `ingress: all`) on tagged projects.
+Example:
+  tags:
+    "123456789012/allowIngressAllForCloudRun": allow-ingress-all
+Rules:
+- Keys are `ORG_OR_PROJECT_ID/key`.
+- A stage map replaces the inherited one.
+
+@ service
+type: block
+docs: configuration.md
+see: defaults, services, :layers
+The main service, named `<app>-<stage>`. Its keys are the ones of every service: how the image is made, resources, access, identity, secrets, storage, networking, containers and domains.
+Example:
+  service:
+    source: .
+    port: 8080
+    memory: 1Gi
+    public: true
+    service_account: hello-runtime@my-gcp-project.iam.gserviceaccount.com
+Rules:
+- Optional when `services` or `jobs` exist.
+
+@ service.source
+type: path
+default: . (when there is no image)
+group: Build and image
+resolved: /artifact
+docs: configuration.md
+The folder to build the image from, relative to runway.yaml. runway uploads it (minus `.runwayignore`/`.dockerignore`), builds it with Cloud Build and skips the build when neither the source nor a base image changed.
+Example:
+  source: apps/web
+Rules:
+- Not with `image` in the same block.
+- Services and jobs with the same build (folder, Dockerfile or builder) share one image, built once.
+
+@ service.dockerfile
+type: path
+default: Dockerfile, if present (else buildpacks)
+group: Build and image
+resolved: /artifact
+docs: configuration.md
+The Dockerfile, relative to `source`. Without one, Google Cloud buildpacks build the image.
+Example:
+  dockerfile: docker/Dockerfile.prod
+
+@ service.builder
+type: image
+default: gcr.io/buildpacks/builder:latest
+group: Build and image
+resolved: /artifact
+docs: limitations.md
+Build with buildpacks using this builder image, even if there is a Dockerfile.
+Example:
+  builder: gcr.io/buildpacks/builder:google-22
+Rules:
+- The default is a moving tag: each new digest rebuilds. Pin it for reproducible builds.
+
+@ service.rebuild
+type: on-change | always
+default: on-change
+group: Build and image
+docs: configuration.md
+When to rebuild: `on-change` when the source or a base image changed, `always` on every deploy (like `--force-build`).
+Example:
+  rebuild: always
+
+@ service.image
+type: image reference
+group: Build and image
+resolved: /artifact
+docs: configuration.md
+Deploy an existing image instead of building one. A tag is resolved to its digest at deploy time when the registry allows it, so a plan shows exactly what runs.
+Example:
+  image: europe-west1-docker.pkg.dev/my-gcp-project/apps/hello:1.2.3
+Rules:
+- Not with `source`/`dockerfile`/`builder` in the same block.
+- `--image` on `plan`/`deploy` overrides it.
+
+@ service.command
+type: list of strings
+default: the image's entrypoint
+group: Build and image
+docs: configuration.md
+The entrypoint of the app container.
+Example:
+  command: [gunicorn]
+  args: [--workers, "2", app:app]
+
+@ service.args
+type: list of strings
+default: the image's arguments
+group: Build and image
+docs: configuration.md
+The arguments of the entrypoint.
+Example:
+  args: [--workers, "2"]
+
+@ service.port
+type: integer
+default: 8080
+group: Resources and scaling
+docs: configuration.md
+The port the app listens on; Cloud Run sends requests there and sets `$PORT`.
+Example:
+  port: 3000
+
+@ service.cpu
+type: number or string
+default: 1
+group: Resources and scaling
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+vCPUs per instance: 1, 2, 4, 6 or 8, or between 0.08 and 1 (also `"500m"`).
+Example:
+  cpu: 2
+Rules:
+- Below 1 needs `concurrency: 1`, request-based billing and gen1.
+- Jobs need at least 1.
+
+@ service.memory
+type: string
+default: 512Mi
+group: Resources and scaling
+docs: configuration.md
+Memory per instance, from 128Mi to 32Gi.
+Example:
+  memory: 1Gi
+Rules:
+- gen2, sandboxes, instance-based billing and jobs need at least 512Mi.
+- More memory needs more CPU: above 4Gi at least 2 CPUs, above 8Gi 4, above 16Gi 6, above 24Gi 8.
+
+@ service.timeout_seconds
+type: integer
+default: 300
+group: Resources and scaling
+docs: configuration.md
+How long a request may take, from 1 to 3600 seconds.
+Example:
+  timeout_seconds: 60
+Rules:
+- For a job, see `jobs.<name>.timeout_seconds` (a task timeout).
+
+@ service.concurrency
+type: integer
+default: 80
+group: Resources and scaling
+docs: configuration.md
+Requests one instance handles at once, from 1 to 1000.
+Example:
+  concurrency: 20
+
+@ service.min_instances
+type: integer
+default: 0
+group: Resources and scaling
+docs: configuration.md
+Instances kept running even without traffic (no cold starts, billed while idle).
+Example:
+  min_instances: 1
+Rules:
+- At most `max_instances`. runway warns that warm instances are billed.
+
+@ service.max_instances
+type: integer
+default: 10
+group: Resources and scaling
+docs: configuration.md
+The most instances Cloud Run may start: a cap on cost and on load on what the app calls.
+Example:
+  max_instances: 50
+
+@ service.billing
+type: request-based | instance-based
+default: request-based
+group: Resources and scaling
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+`request-based` gives CPU only while requests are handled; `instance-based` gives it for the instance's whole life (background work, exporters) and is billed that way.
+Example:
+  billing: instance-based
+Rules:
+- `instance-based` needs at least 1 CPU and 512Mi.
+
+@ service.startup_cpu_boost
+type: boolean
+default: false
+group: Resources and scaling
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+More CPU while instances start and for 10 seconds after: faster cold starts, billed.
+Example:
+  startup_cpu_boost: true
+
+@ service.execution_environment
+type: gen1 | gen2
+default: Cloud Run chooses
+group: Resources and scaling
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+`gen2` gives full Linux compatibility and faster CPU and network, with slower cold starts; `gen1` starts faster.
+Example:
+  execution_environment: gen2
+Rules:
+- gen2 needs at least 512Mi; gen1 cannot mount Cloud Storage volumes.
+
+@ service.sandbox
+type: boolean
+default: false
+group: Resources and scaling
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+Cloud Run sandboxes (preview): the app can run untrusted code (AI-written code, user scripts, a headless browser) in isolated sandboxes with the `sandbox` command, for example `sandbox do -- python3 script.py`. Sandboxes have no network, environment or secrets unless the app passes them.
+Example:
+  sandbox: true
+Rules:
+- Implies gen2 (gen1 is rejected), so at least 1 CPU and 512Mi.
+- Sandboxes share the container's CPU and memory.
+
+@ service.public
+type: boolean
+default: false
+group: Access and networking
+docs: configuration.md
+Anyone may call the service (the `allUsers` invoker binding). Private services need an identity token with `roles/run.invoker`.
+Example:
+  public: true
+Rules:
+- Organizations with Domain Restricted Sharing refuse `allUsers`: keep the service private or use `iap`.
+
+@ service.ingress
+type: all | internal | internal-and-cloud-load-balancing
+default: all
+group: Access and networking
+docs: configuration.md
+Where requests may come from: anywhere, only from inside the VPC/project, or also through a Google Cloud load balancer.
+Example:
+  ingress: internal-and-cloud-load-balancing
+Rules:
+- With `domains` behind a load balancer, `internal-and-cloud-load-balancing` forces traffic through it.
+
+@ service.iap
+type: block
+group: Access and networking
+docs: configuration.md#removing-access
+Identity-Aware Proxy: people of your organization sign in with Google before reaching the service.
+Example:
+  iap:
+    members: [group:finops@example.com, user:alice@example.com]
+Rules:
+- `iap.members` is the complete list: members added elsewhere are removed by the next main deploy.
+- A stage block replaces the inherited one.
+
+@ service.iap.enabled
+type: boolean
+default: true (when the block is present)
+docs: configuration.md
+Turn IAP off in a stage without removing the block (members are then removed).
+Example:
+  iap: {enabled: false}
+
+@ service.iap.members
+type: list of principals
+docs: configuration.md#removing-access
+Who may pass IAP (`roles/iap.httpsResourceAccessor`): `user:`, `group:`, `domain:` or `serviceAccount:` principals.
+Example:
+  members: [group:finops@example.com]
+
+@ service.tags
+type: map
+group: Access and networking
+docs: how-it-works.md
+see: provider.tags, service.bootstrap
+Resource Manager tags bound to the service, for example a tag an organization policy needs before allowing public access. Tags bound directly to the service and not listed here are removed.
+Example:
+  tags:
+    "123456789012/allow-public-access": "true"
+Rules:
+- Keys are `ORG_OR_PROJECT_ID/key`; `null` in a stage removes an inherited tag.
+
+@ service.bootstrap
+type: block
+group: Access and networking
+docs: how-it-works.md
+see: service.tags
+First deploy only: create the service with a restricted ingress (and optionally a placeholder image), bind its `tags`, wait until they are effective, then apply the real configuration. For organization policies that only accept tagged services.
+Example:
+  bootstrap: {}
+
+@ service.bootstrap.ingress
+type: string
+default: internal
+docs: how-it-works.md
+The ingress used until the tags are effective.
+Example:
+  ingress: internal
+
+@ service.bootstrap.image
+type: image reference
+default: the real app
+docs: how-it-works.md
+A placeholder image deployed first, instead of the app.
+Example:
+  image: us-docker.pkg.dev/cloudrun/container/hello
+
+@ service.custom_audiences
+type: list of strings
+group: Access and networking
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+Extra audiences accepted in ID tokens, besides the `run.app` URL: for callers that use a custom domain or a load balancer URL.
+Example:
+  custom_audiences: [https://api.example.com]
+Rules:
+- Changing it creates no revision. Audiences set outside runway are removed.
+
+@ service.vpc
+type: block
+group: Access and networking
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+Direct VPC egress (no connector): the service reaches private addresses in a VPC network, Shared VPC included.
+Example:
+  vpc:
+    network: default
+    subnet: default
+Rules:
+- A stage block replaces the inherited one.
+- In a Shared VPC, the Cloud Run service agent needs `roles/compute.networkUser` on the host project or subnet (runway does not grant it).
+
+@ service.vpc.network
+type: string
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+The network: a name in the deployment project, or `projects/HOST_PROJECT/global/networks/NAME` in a Shared VPC.
+Example:
+  network: projects/my-host-project/global/networks/shared
+
+@ service.vpc.subnet
+type: string
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+The subnet, in the service region: a name, or `projects/HOST_PROJECT/regions/REGION/subnetworks/NAME`.
+Example:
+  subnet: run-egress
+Rules:
+- `/26` or larger in practice (about two addresses per instance).
+
+@ service.vpc.egress
+type: private-ranges-only | all-traffic
+default: private-ranges-only
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+What goes through the VPC: only private ranges, or everything (the internet then needs a Cloud NAT).
+Example:
+  egress: all-traffic
+
+@ service.vpc.network_tags
+type: list of strings
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+Network tags on the instances, for firewall rules.
+Example:
+  network_tags: [run-egress]
+
+@ service.domains
+type: list of strings
+group: Domains
+docs: domains.md
+see: domains, service.preview_domain
+Custom domains of the service: a host (`shop.example.com`), a host and path prefix (`example.com/api`, load balancer modes), or a Cloud Run custom URL (`my-shop.cloud.run`). How they are served is chosen by the stage-wide `domains` block.
+Example:
+  domains: [shop.example.com, example.com/api, my-shop.cloud.run]
+Rules:
+- A host, or host and path, belongs to one service.
+- Custom URL names are 6 to 63 characters.
+- Changes with a full deploy; removed domains are cleaned up by a full deploy of everything.
+
+@ service.preview_domain
+type: wildcard host
+group: Domains
+docs: domains.md#previews-on-your-domain
+Previews also answer on your domain: with `*.preview.example.com`, `deploy --preview feature/login` serves `feature-login.preview.example.com`.
+Example:
+  preview_domain: "*.preview.example.com"
+Rules:
+- Load balancer modes only (not `domain-mapping`).
+
+@ service.service_account
+type: email
+group: Identity, secrets and env
+docs: permissions.md
+see: service.identity
+The runtime identity of the container: what the app may do in Google Cloud. runway grants it what the file implies (secrets, volumes, Cloud SQL) and `identity.roles`.
+Example:
+  service_account: hello-runtime@my-gcp-project.iam.gserviceaccount.com
+Rules:
+- Required (here, in `defaults` or on each service and job).
+
+@ service.identity
+type: block
+group: Identity, secrets and env
+docs: configuration.md#removing-access
+Manage the runtime service account: create it, and grant it roles on resources.
+Example:
+  identity:
+    create: true
+    roles:
+      - role: roles/bigquery.jobUser
+        project: my-data-project
+Rules:
+- A stage block replaces the inherited one.
+- On an account runway created, roles the file no longer lists are revoked.
+
+@ service.identity.create
+type: boolean
+default: false
+docs: configuration.md
+Create `service_account` if it does not exist (marked as runway's, so `undeploy` may delete it once nothing runs as it).
+Example:
+  create: true
+
+@ service.identity.display_name
+type: string
+docs: configuration.md
+The display name of the account runway creates.
+Example:
+  display_name: hello runtime
+
+@ service.identity.roles
+type: list
+docs: configuration.md#removing-access
+Roles granted to the runtime account, each on exactly one resource: a `project`, a `bucket`, a `dataset` or a `secret`.
+Example:
+  roles:
+    - role: roles/storage.objectUser
+      bucket: "${buckets.cache}"
+    - role: roles/bigquery.dataViewer
+      dataset: my-data-project.analytics
+
+@ service.identity.roles.role
+type: string
+docs: configuration.md
+The role to grant, for example `roles/bigquery.jobUser`.
+Example:
+  role: roles/bigquery.jobUser
+
+@ service.identity.roles.project
+type: string
+docs: configuration.md
+Grant the role on this project.
+Example:
+  project: my-data-project
+
+@ service.identity.roles.bucket
+type: string
+docs: configuration.md
+Grant the role on this bucket (a name, or `${buckets.KEY}`).
+Example:
+  bucket: "${buckets.cache}"
+
+@ service.identity.roles.dataset
+type: string
+docs: configuration.md
+Grant the role on this BigQuery dataset: `PROJECT.DATASET` or `PROJECT:DATASET`.
+Example:
+  dataset: my-data-project.analytics
+
+@ service.identity.roles.secret
+type: string
+docs: configuration.md
+Grant the role on this secret: an ID in the deployment project, or `projects/P/secrets/S`.
+Example:
+  secret: database-url
+
+@ service.env
+type: map
+group: Identity, secrets and env
+docs: configuration.md
+Plain environment variables. Values are shown in plans: anything sensitive belongs in `secrets`.
+Example:
+  env:
+    LOG_LEVEL: info
+    FEATURE_X: true
+Rules:
+- `PORT`, `K_SERVICE`, `K_REVISION` and `K_CONFIGURATION` are reserved.
+- `null` in a stage removes an inherited variable.
+
+@ service.secrets
+type: map
+group: Identity, secrets and env
+docs: secrets.md
+see: secrets
+Secret Manager secrets as environment variables or files. The runtime account gets `roles/secretmanager.secretAccessor` on each; values never appear in runway.yaml, its output, or Cloud Run's configuration.
+Example:
+  secrets:
+    DATABASE_URL: {secret: database-url, version: "3"}
+    API_KEY: {secret: "${secrets.api-key}"}
+
+@ service.secrets.<NAME>
+type: block
+docs: secrets.md
+The environment variable (or, with `path`, the file) and the secret it comes from.
+Example:
+  DATABASE_URL:
+    secret: database-url
+
+@ service.secrets.<NAME>.secret
+type: string
+docs: secrets.md
+The secret: an ID (`database-url`), a full name (`projects/123/secrets/database-url`), or `${secrets.KEY}` for one runway creates.
+Example:
+  secret: database-url
+
+@ service.secrets.<NAME>.version
+type: number or latest
+default: newest version, pinned at deploy (files: latest)
+docs: secrets.md
+The version to use. Omitted, an environment variable gets the newest enabled version, pinned when you deploy (a new value rolls out with the next deploy); a file reads `latest` live.
+Example:
+  version: "3"
+Rules:
+- `latest` for an environment variable is accepted with a warning: instances read it at start.
+
+@ service.secrets.<NAME>.path
+type: absolute path
+docs: secrets.md
+Mount the secret as a file at this path instead of an environment variable.
+Example:
+  path: /secrets/tls/cert.pem
+Rules:
+- One secret file per directory.
+
+@ service.volumes
+type: map
+group: Storage and databases
+docs: configuration.md
+Cloud Storage buckets mounted as folders. The runtime account gets `objectViewer` on read-only buckets, `objectUser` otherwise.
+Example:
+  volumes:
+    cache:
+      bucket: "${buckets.cache}"
+      mount_path: /mnt/cache
+Rules:
+- Not with gen1. `null` in a stage removes an inherited volume.
+
+@ service.volumes.<name>
+type: block
+docs: configuration.md
+A bucket mount; sidecars can mount it too by name.
+
+@ service.volumes.<name>.bucket
+type: string
+docs: configuration.md
+The bucket: a name or `${buckets.KEY}`.
+Example:
+  bucket: "${buckets.cache}"
+
+@ service.volumes.<name>.mount_path
+type: absolute path
+docs: configuration.md
+Where the bucket appears in the container.
+Example:
+  mount_path: /mnt/cache
+
+@ service.volumes.<name>.read_only
+type: boolean
+default: false
+docs: configuration.md
+Mount read-only (and grant read access only).
+Example:
+  read_only: true
+
+@ service.volumes.<name>.mount_options
+type: list of strings
+docs: configuration.md
+Cloud Storage FUSE options.
+Example:
+  mount_options: [implicit-dirs]
+
+@ service.cloud_sql
+type: list of strings
+group: Storage and databases
+docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
+Cloud SQL instances reachable through a Unix socket at `/cloudsql/PROJECT:REGION:INSTANCE`. runway grants the runtime account `roles/cloudsql.client` in each instance's project.
+Example:
+  cloud_sql: [db, other-project:europe-west1:analytics]
+Rules:
+- A bare name is an instance in the deployment project and region.
+- For private IP, use `vpc` and the instance's address instead.
+
+@ service.health_check
+type: block
+group: Containers and health
+docs: configuration.md
+HTTP probes on the app port: a startup probe (Cloud Run waits for it before sending traffic) and a liveness probe (restarts an instance that stops answering). Without it, Cloud Run uses a TCP startup probe.
+Example:
+  health_check:
+    path: /healthz
+    startup: {period_seconds: 5}
+    liveness: true
+Rules:
+- A stage block replaces the inherited one.
+
+@ service.health_check.path
+type: path
+docs: configuration.md
+The HTTP path probed, for example `/healthz`.
+Example:
+  path: /healthz
+Rules:
+- Required in a `health_check` block.
+
+@ service.health_check.startup
+type: block
+default: every 10s, timeout 3s, 12 failures, no delay
+docs: configuration.md
+Tune the startup probe.
+Example:
+  startup:
+    period_seconds: 5
+    failure_threshold: 24
+
+@ service.health_check.startup.initial_delay_seconds
+type: integer
+default: 0
+docs: configuration.md
+Wait this long before the first probe (up to 240).
+
+@ service.health_check.startup.period_seconds
+type: integer
+default: 10 (startup), 30 (liveness)
+docs: configuration.md
+Seconds between probes (up to 240).
+
+@ service.health_check.startup.timeout_seconds
+type: integer
+default: 3
+docs: configuration.md
+How long a probe may take.
+
+@ service.health_check.startup.failure_threshold
+type: integer
+default: 12 (startup), 3 (liveness)
+docs: configuration.md
+Failed probes before the instance counts as failed.
+
+@ service.health_check.liveness
+type: boolean or block
+default: true (every 30s, timeout 3s, 3 failures)
+docs: configuration.md
+`false` disables the liveness probe; a block with the same keys as `startup` tunes it.
+Example:
+  liveness: {period_seconds: 60}
+
+@ service.sidecars
+type: map
+group: Containers and health
+docs: configuration.md#sidecars
+Extra containers next to the app in every instance: a database proxy, a cache, an auth proxy, a log forwarder. The app reaches them on `localhost`.
+Example:
+  sidecars:
+    sql-proxy:
+      image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.0
+      args: ["--port=5432", "my-project:europe-west1:db"]
+      health_check: {port: 5432}
+Rules:
+- 10 containers at most, app and collector included.
+- `null` in a stage removes an inherited sidecar; a map replaces it.
+
+@ service.sidecars.<name>
+type: block
+docs: configuration.md#sidecars
+One sidecar container, named by its key.
+
+@ service.sidecars.<name>.image
+type: image reference
+docs: configuration.md#sidecars
+The sidecar's image.
+Rules:
+- Required.
+
+@ service.sidecars.<name>.cpu
+type: number or string
+default: 1
+docs: configuration.md#sidecars
+The sidecar's CPU (with request-based billing, only while requests are served).
+
+@ service.sidecars.<name>.memory
+type: string
+default: 512Mi
+docs: configuration.md#sidecars
+The sidecar's memory.
+
+@ service.sidecars.<name>.command
+type: list of strings
+docs: configuration.md#sidecars
+Replaces the image's entrypoint.
+
+@ service.sidecars.<name>.args
+type: list of strings
+docs: configuration.md#sidecars
+Arguments of the entrypoint.
+
+@ service.sidecars.<name>.env
+type: map
+docs: configuration.md#sidecars
+Plain environment variables of the sidecar.
+
+@ service.sidecars.<name>.secrets
+type: map
+docs: configuration.md#sidecars
+Secrets as environment variables of the sidecar (same form as `service.secrets`, no files); the runtime account gets access to them.
+
+@ service.sidecars.<name>.health_check
+type: block
+docs: configuration.md#sidecars
+The sidecar's startup check: TCP on `port`, or HTTP `GET path` when `path` is set.
+Example:
+  health_check: {port: 5432}
+Rules:
+- The port must differ from `service.port`.
+
+@ service.sidecars.<name>.health_check.port
+type: integer
+docs: configuration.md#sidecars
+The port checked.
+
+@ service.sidecars.<name>.health_check.path
+type: path
+docs: configuration.md#sidecars
+Makes the check an HTTP GET on this path.
+
+@ service.sidecars.<name>.start_before_app
+type: boolean
+default: true
+docs: configuration.md#sidecars
+Start the sidecar (and pass its check) before the app starts.
+
+@ service.sidecars.<name>.volumes
+type: map
+docs: configuration.md#sidecars
+Service volumes mounted in the sidecar: volume name to mount path.
+Example:
+  volumes: {cache: /cache}
+
+@ service.otel_collector
+type: block
+group: Containers and health
+docs: configuration.md
+Google's OpenTelemetry Collector as a sidecar: the app sends OTLP to `localhost:4317`/`4318`, the collector exports to Cloud Trace, Cloud Logging and Managed Service for Prometheus.
+Example:
+  otel_collector: {}
+
+@ service.otel_collector.enabled
+type: boolean
+default: true (when the block is present)
+docs: configuration.md
+Turn the collector off in a stage.
+
+@ service.otel_collector.version
+type: string
+default: newest release, looked up at plan and deploy
+docs: configuration.md
+Pin the collector version.
+Example:
+  version: "0.160.0"
+
+@ service.otel_collector.image
+type: image reference
+docs: configuration.md
+A full image reference, instead of `version`.
+
+@ service.otel_collector.cpu
+type: number or string
+default: 1
+docs: configuration.md
+The collector's CPU.
+
+@ service.otel_collector.memory
+type: string
+default: 512Mi
+docs: configuration.md
+The collector's memory.
+
+@ service.otel_collector.config
+type: YAML string
+default: OTLP in, Google Cloud out
+docs: configuration.md
+Your own collector configuration.
+
+@ defaults
+type: block (service keys)
+docs: configuration.md#several-services-jobs-and-schedules
+see: service, :layers
+What every service and job inherits: the same keys as `service`. Jobs take only what jobs have (build or image, command, CPU, memory, env, secrets, volumes, identity, VPC, Cloud SQL…), not `timeout_seconds` nor `domains`.
+Example:
+  defaults:
+    service_account: shop-runtime@my-gcp-project.iam.gserviceaccount.com
+    identity: {create: true}
+    env: {LOG_LEVEL: info}
+
+@ services
+type: map
+docs: services-and-jobs.md#add-a-second-service
+see: service, defaults
+More services, by name: each is `<app>-<name>-<stage>`, with the same keys as `service`.
+Example:
+  services:
+    web:
+      source: apps/web
+      public: true
+
+@ services.<name>
+type: block (service keys)
+docs: services-and-jobs.md#add-a-second-service
+see: service
+A named service. Every key of `service` works here.
+Rules:
+- Names are lowercase letters, digits and hyphens, and cannot be the app name.
+
+@ jobs
+type: map
+docs: services-and-jobs.md#add-a-job
+see: schedules
+Cloud Run jobs, by name (`<app>-<name>-<stage>`): containers that run to completion, for migrations, batch work, reports. `runway run-job NAME --wait` runs one; `schedules` run them on a timetable.
+Example:
+  jobs:
+    migrate:
+      command: [python, manage.py, migrate]
+      max_retries: 1
+
+@ jobs.<name>
+type: block
+docs: services-and-jobs.md#add-a-job
+A job. It accepts the service keys jobs have: `source`, `dockerfile`, `builder`, `rebuild`, `image`, `command`, `args`, `cpu`, `memory`, `service_account`, `identity`, `env`, `secrets`, `volumes`, `vpc`, `cloud_sql`, `execution_environment` and `sandbox`, plus the job keys below.
+Rules:
+- At least 1 CPU and 512Mi.
+- With the same build as a service, the image is built once.
+
+@ jobs.<name>.tasks
+type: integer
+default: 1
+resolved: /kind/tasks
+docs: configuration.md#several-services-jobs-and-schedules
+Tasks per execution; each gets `CLOUD_RUN_TASK_INDEX` to split the work.
+Example:
+  tasks: 10
+
+@ jobs.<name>.parallelism
+type: integer
+default: 0 (as many as possible)
+resolved: /kind/parallelism
+docs: configuration.md#several-services-jobs-and-schedules
+Tasks running at once.
+Example:
+  parallelism: 2
+
+@ jobs.<name>.max_retries
+type: integer
+default: 3
+resolved: /kind/max_retries
+docs: configuration.md#several-services-jobs-and-schedules
+Retries of a failed task.
+Example:
+  max_retries: 1
+
+@ jobs.<name>.timeout_seconds
+type: integer
+default: 600
+resolved: /service/timeout_seconds
+docs: configuration.md#several-services-jobs-and-schedules
+How long each task may run, up to 168 hours (604800 seconds).
+Example:
+  timeout_seconds: 1800
+
+@ schedules
+type: map
+docs: services-and-jobs.md#run-a-job-every-night
+see: scheduler, jobs
+Cloud Scheduler jobs that run a job or call a service on a timetable, named `<app>-<name>-<stage>`.
+Example:
+  schedules:
+    nightly:
+      schedule: "0 3 * * *"
+      time_zone: Europe/Paris
+      job: migrate
+Rules:
+- Schedules change with a full deploy; one removed from runway.yaml is deleted by the next one.
+- A stage entry replaces the inherited one; `null` removes it.
+
+@ schedules.<name>
+type: block
+docs: services-and-jobs.md#run-a-job-every-night
+One schedule, with exactly one target: `job` or `service`.
+
+@ schedules.<name>.schedule
+type: cron
+docs: services-and-jobs.md#run-a-job-every-night
+When it runs, in unix cron format.
+Example:
+  schedule: "*/10 * * * *"
+Rules:
+- Required.
+
+@ schedules.<name>.time_zone
+type: IANA time zone
+default: Etc/UTC
+docs: services-and-jobs.md#run-a-job-every-night
+The time zone of the cron expression.
+Example:
+  time_zone: Europe/Paris
+
+@ schedules.<name>.job
+type: job name
+docs: services-and-jobs.md#run-a-job-every-night
+Run this job (a key of `jobs`) through the Cloud Run Admin API.
+Example:
+  job: migrate
+
+@ schedules.<name>.service
+type: service name
+docs: services-and-jobs.md#call-a-service-on-a-schedule
+Call this service (a key of `services`, or the app name for the main service) at its URL plus `path`, with an ID token.
+Example:
+  service: web
+
+@ schedules.<name>.path
+type: path
+default: /
+docs: services-and-jobs.md#call-a-service-on-a-schedule
+The path called on the service.
+Example:
+  path: /tasks/warm
+
+@ schedules.<name>.method
+type: string
+default: POST
+docs: services-and-jobs.md#call-a-service-on-a-schedule
+The HTTP method used to call the service.
+
+@ schedules.<name>.body
+type: string
+docs: services-and-jobs.md#call-a-service-on-a-schedule
+The request body sent to the service.
+
+@ schedules.<name>.headers
+type: map
+docs: services-and-jobs.md#call-a-service-on-a-schedule
+Request headers sent to the service.
+Example:
+  headers: {Content-Type: application/json}
+
+@ schedules.<name>.retries
+type: integer
+default: 0
+docs: configuration.md#several-services-jobs-and-schedules
+Retries of a failed attempt, from 0 to 5.
+
+@ schedules.<name>.attempt_deadline_seconds
+type: integer
+default: 180
+docs: configuration.md#several-services-jobs-and-schedules
+How long an attempt may take, from 15 to 1800 seconds.
+
+@ schedules.<name>.paused
+type: boolean
+default: false
+docs: configuration.md#several-services-jobs-and-schedules
+Keep the schedule paused.
+
+@ scheduler
+type: block
+docs: configuration.md#several-services-jobs-and-schedules
+see: schedules
+The account and region Cloud Scheduler uses. One account per app and stage, granted `roles/run.invoker` on each target only.
+Example:
+  scheduler:
+    region: europe-west1
+
+@ scheduler.service_account
+type: email
+default: <app>-<stage>-sched@<project>.iam.gserviceaccount.com
+docs: configuration.md#several-services-jobs-and-schedules
+The account Cloud Scheduler calls targets with.
+
+@ scheduler.create
+type: boolean
+default: true for the default account
+docs: configuration.md#several-services-jobs-and-schedules
+Create the account when missing.
+
+@ scheduler.region
+type: string
+default: provider.region
+resolved: /scheduler_region
+docs: configuration.md#several-services-jobs-and-schedules
+The Cloud Scheduler region (not every Cloud Run region has Cloud Scheduler).
+Example:
+  region: europe-west1
+
+@ release
+type: block
+docs: releases.md
+see: stages.<name>.release
+Where released images are published (`deploy --tag`, `--tag-rc`). With a stage mapped to `tag-rc`, `--tag` releases the latest release candidate without rebuilding.
+Example:
+  release:
+    repository: {project: my-release-project, repository: releases}
+
+@ release.flag
+type: tag | tag-rc
+resolved: /release/flag
+docs: releases.md#release-what-you-tested
+In a stage: the flag that deploys it. `runway deploy --tag-rc` deploys the stage mapped to `tag-rc`, and no other.
+Example:
+  stages:
+    staging: {release: {flag: tag-rc}}
+    prod: {release: {flag: tag}}
+
+@ release.from
+type: stage name
+docs: releases.md#release-what-you-tested
+In a `tag` stage: the `tag-rc` stage whose candidates it releases, when several are mapped.
+
+@ release.repository
+type: block
+docs: releases.md#publish-to-a-release-repository
+The Artifact Registry repository released images are copied to (same digest). A stage's replaces the global one.
+Example:
+  repository:
+    project: my-release-project
+    repository: releases
+
+@ release.repository.project
+type: string
+default: provider.project
+docs: releases.md#publish-to-a-release-repository
+The repository's project.
+
+@ release.repository.location
+type: string
+default: the build repository's location
+docs: releases.md#publish-to-a-release-repository
+The repository's location.
+
+@ release.repository.repository
+type: string
+docs: releases.md#publish-to-a-release-repository
+The repository name.
+Rules:
+- Required.
+
+@ domains
+type: block
+docs: domains.md
+see: service.domains
+How the stage serves its services' custom domains: a load balancer runway creates, routes in a load balancer you have, or Cloud Run domain mappings. A stage's block replaces the global one.
+Example:
+  domains:
+    mode: load-balancer
+    dns: {zone: example-com}
+
+@ domains.mode
+type: load-balancer | existing-load-balancer | domain-mapping
+default: load-balancer
+resolved: /domains/mode
+docs: domains.md#choose-how-domains-are-served
+`load-balancer`: a global external Application Load Balancer for the app and stage, with managed certificates (about $18/month). `existing-load-balancer`: only runway's routes and backends in a URL map you own. `domain-mapping`: Cloud Run domain mappings (preview, some regions, whole hosts).
+Example:
+  mode: existing-load-balancer
+Rules:
+- `domain-mapping` needs a supported region and no paths nor `preview_domain`.
+
+@ domains.dns
+type: block
+docs: domains.md#dns-records
+A Cloud DNS zone runway writes the records to (A records, certificate authorizations, mapping records). Without it, or without permission, `plan` and `deploy` print the records to create elsewhere.
+Example:
+  dns:
+    zone: example-com
+    project: my-dns-project
+Rules:
+- runway only changes or deletes records whose data is what it set.
+
+@ domains.dns.zone
+type: string
+docs: domains.md#dns-records
+The managed zone's name (not its DNS name).
+Example:
+  zone: example-com
+
+@ domains.dns.project
+type: string
+default: provider.project
+docs: domains.md#dns-records
+The zone's project.
+
+@ domains.load_balancer
+type: block
+docs: domains.md#an-existing-load-balancer
+The load balancer runway adds routes to, with `mode: existing-load-balancer` (which requires it).
+Example:
+  load_balancer:
+    url_map: shared-lb
+    certificate_map: shared-certs
+    address: 203.0.113.10
+
+@ domains.load_balancer.url_map
+type: string
+docs: domains.md#an-existing-load-balancer
+The URL map, in the deployment project. runway adds one host rule per host, marked as runway's, and keeps everything else.
+
+@ domains.load_balancer.certificate_map
+type: string
+docs: domains.md#an-existing-load-balancer
+The certificate map its HTTPS proxy uses: runway adds certificates for its hosts. Without it, certificates are not runway's business.
+
+@ domains.load_balancer.address
+type: IPv4 address
+docs: domains.md#an-existing-load-balancer
+The load balancer's IP, for the hosts' A records.
+
+@ retry
+type: block
+docs: how-it-works.md#failure-handling-and-recovery
+How deploy retries a failed step (top level only); `--retries` overrides the attempts.
+Example:
+  retry:
+    attempts: 5
+    delay: 10s
+
+@ retry.attempts
+type: integer
+default: 3
+resolved: /retry/attempts
+docs: how-it-works.md#failure-handling-and-recovery
+Total attempts per step, from 1 (no retry) to 20.
+
+@ retry.delay
+type: duration
+default: 5s
+docs: how-it-works.md#failure-handling-and-recovery
+The first delay between attempts; it doubles each time.
+
+@ retry.max_delay
+type: duration
+default: 60s
+docs: how-it-works.md#failure-handling-and-recovery
+The longest delay between attempts.
+
+@ buckets
+type: map
+docs: configuration.md
+see: service.volumes, service.identity.roles.bucket
+Cloud Storage buckets runway creates and keeps configured, by key; use them as `${buckets.KEY}`. runway never deletes them (they hold data).
+Example:
+  buckets:
+    cache:
+      name: "${project}-hello-cache"
+      delete_after_days: 30
+Rules:
+- An existing bucket is only updated if runway created it for this app; any other is used as is.
+
+@ buckets.<key>
+type: block
+docs: configuration.md
+One bucket.
+
+@ buckets.<key>.name
+type: string
+docs: configuration.md
+The globally unique bucket name; variables work.
+Rules:
+- Required.
+
+@ buckets.<key>.location
+type: string
+default: provider.region
+docs: configuration.md
+The bucket location. It cannot change once created.
+
+@ buckets.<key>.storage_class
+type: string
+docs: configuration.md
+The default storage class, for example `STANDARD` or `NEARLINE`.
+
+@ buckets.<key>.versioning
+type: boolean
+docs: configuration.md
+Keep previous versions of objects.
+
+@ buckets.<key>.delete_after_days
+type: integer
+docs: configuration.md
+Delete objects older than this many days.
+
+@ buckets.<key>.labels
+type: map
+docs: configuration.md
+Your labels; runway adds its own.
+
+@ secrets
+type: map
+docs: secrets.md
+see: service.secrets
+Secret Manager secrets runway creates, empty: people add the values, and deploy stops (with the exact command) until a secret has one. Use them as `${secrets.KEY}`. runway never deletes them.
+Example:
+  secrets:
+    api-key:
+      adders: [group:devops@example.com]
+
+@ secrets.<key>
+type: block
+docs: secrets.md
+One secret runway creates.
+
+@ secrets.<key>.name
+type: string
+default: the key
+docs: secrets.md
+The secret ID; variables work.
+Example:
+  name: "${app}-${stage}-api-key"
+
+@ secrets.<key>.adders
+type: list of principals
+docs: secrets.md
+Who may add values (`roles/secretmanager.secretVersionAdder`). On a secret runway created, adders not listed are removed.
+Example:
+  adders: [group:devops@example.com]
+
+@ secrets.<key>.locations
+type: list of strings
+default: [provider.region]
+docs: secrets.md
+Replica locations; `[]` for automatic replication.
+
+@ secrets.<key>.labels
+type: map
+docs: secrets.md
+Your labels; runway adds its own.
+
+@ stages
+type: map
+docs: configuration.md#stage-override-precedence
+see: :layers
+The stages the app is deployed to (`--stage NAME`). Each changes only what differs from the rest of the file.
+Example:
+  stages:
+    dev:
+      service: {max_instances: 2}
+    prod:
+      provider: {project: my-prod-project}
+      service: {min_instances: 1}
+Rules:
+- At least one.
+
+@ stages.<name>
+type: block
+docs: configuration.md#stage-override-precedence
+One stage. It accepts `vars`, `provider`, `service`, `defaults`, `services`, `jobs`, `schedules`, `scheduler`, `release` and `domains`, each overriding the top-level one.
+
+@ stages.<name>.vars
+type: map
+docs: configuration.md#variables
+Variables of this stage, overriding the top-level ones.
+
+@ stages.<name>.provider
+type: block (provider keys)
+docs: configuration.md#stage-override-precedence
+Provider settings of this stage, for example another project.
+Example:
+  provider: {project: my-prod-project}
+
+@ stages.<name>.service
+type: block (service keys)
+docs: configuration.md#stage-override-precedence
+The main service in this stage: only what differs.
+Example:
+  service: {min_instances: 1, memory: 1Gi}
+
+@ stages.<name>.defaults
+type: block (service keys)
+docs: configuration.md#several-services-jobs-and-schedules
+Defaults of this stage, above the top-level `defaults`.
+
+@ stages.<name>.services
+type: map
+docs: configuration.md#several-services-jobs-and-schedules
+Named services in this stage: only what differs, or `null` to leave one out.
+Example:
+  services: {web: {min_instances: 1}, admin: null}
+
+@ stages.<name>.jobs
+type: map
+docs: configuration.md#several-services-jobs-and-schedules
+Jobs in this stage: only what differs, or `null` to leave one out.
+
+@ stages.<name>.schedules
+type: map
+docs: configuration.md#several-services-jobs-and-schedules
+Schedules in this stage: an entry replaces the inherited one, `null` removes it.
+
+@ stages.<name>.scheduler
+type: block
+docs: configuration.md#several-services-jobs-and-schedules
+The scheduler settings of this stage.
+
+@ stages.<name>.release
+type: block
+docs: releases.md#release-what-you-tested
+The release settings of this stage: its `flag`, `from`, and a `repository` replacing the global one.
+Example:
+  release: {flag: tag}
+
+@ stages.<name>.domains
+type: block
+docs: domains.md
+How this stage serves custom domains; replaces the global `domains` block.

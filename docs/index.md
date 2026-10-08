@@ -101,6 +101,8 @@ New here? Start with [Getting started](getting-started.md).
 | Deploy an existing image | `service.image`, or `--image` | [Configuration](configuration.md) |
 | See what a deploy would change | `runway plan --stage S` | [Commands](commands.md#plans-and-image-digests) |
 | Draw the stack | `runway describe --stage S` | [Commands](commands.md#stack-diagrams) |
+| Understand a key, or my whole runway.yaml | `runway explain [KEY]` | [Commands](commands.md#learn-the-configuration) |
+| Give an AI assistant the reference | `runway explain --agent [KEY]` | [Commands](commands.md#learn-the-configuration) |
 | Check credentials and permissions | `runway doctor --stage S` | [Commands](commands.md) |
 | Add a second service or a job | `services:`, `jobs:` | [Services, jobs and schedules](services-and-jobs.md) |
 | Run a job on a schedule | `schedules:` | [Services, jobs and schedules](services-and-jobs.md#run-a-job-every-night) |

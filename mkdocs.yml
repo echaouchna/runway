@@ -11,18 +11,20 @@ exclude_docs: |
 
 theme:
   name: material
-  logo: assets/runway-icon.svg
+  logo: assets/runway-logo-dark.svg
   favicon: assets/runway-icon.svg
+  # The homepage's system font stacks (docs/assets/stylesheets/runway.css):
+  # nothing is loaded from Google Fonts.
+  font: false
+  # Dark first, like runway.echaouchna.dev; colors in runway.css.
   palette:
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: indigo
-      accent: cyan
+    - scheme: slate
+      primary: custom
+      accent: custom
       toggle: { icon: material/weather-sunny, name: Light mode }
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: indigo
-      accent: cyan
+    - scheme: default
+      primary: custom
+      accent: custom
       toggle: { icon: material/weather-night, name: Dark mode }
   features:
     - navigation.instant
@@ -35,6 +37,9 @@ theme:
     - search.suggest
   icon:
     repo: fontawesome/brands/github
+
+extra_css:
+  - assets/stylesheets/runway.css
 
 nav:
   - Home: index.md

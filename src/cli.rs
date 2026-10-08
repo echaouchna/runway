@@ -232,6 +232,8 @@ pub enum Command {
     Logs(LogsArgs),
     /// Draw the stack (ASCII art or Mermaid) and explain it, from the configuration only.
     Describe(DescribeArgs),
+    /// Learn runway.yaml: browse every key (what it does, example, rules) and what your file sets.
+    Explain(ExplainArgs),
     /// Show or change the traffic split: promote a canary, split, remove preview URLs.
     Traffic(TrafficArgs),
     /// Branch previews: list them, delete some, or prune those of merged or deleted branches.
@@ -392,6 +394,22 @@ pub struct UndeployArgs {
 pub enum DiagramFormat {
     Ascii,
     Mermaid,
+}
+
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// A key as written in runway.yaml (`service.vpc`, `services.web.memory`,
+    /// `stages.prod.service.env`) or a topic (`variables`): print it.
+    /// Without it, a terminal opens the browser; otherwise every key is listed.
+    pub key: Option<String>,
+    /// Print instead of opening the browser.
+    #[arg(long)]
+    pub plain: bool,
+    /// Markdown for LLMs and coding agents: every rule, default and example,
+    /// and what the current runway.yaml sets and gets wrong (with KEY: that
+    /// key and the keys below it). `-o json` gives JSON instead.
+    #[arg(long, conflicts_with = "plain")]
+    pub agent: bool,
 }
 
 #[derive(Debug, Args)]
@@ -604,6 +622,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::RunJob(a) => commands::run_job::run(&ctx, a).await,
         Command::Logs(a) => commands::logs::run(&ctx, a).await,
         Command::Describe(a) => commands::describe::run(&ctx, a),
+        Command::Explain(a) => crate::explain::run(&ctx, a),
         Command::Traffic(a) => commands::traffic::run(&ctx, a).await,
         Command::Preview(a) => commands::preview::run(&ctx, a).await,
         Command::Undeploy(a) => commands::undeploy::run(&ctx, a).await,
