@@ -41,6 +41,20 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
   ([Custom domains](domains.md)). With a tag-based exception, use
   `service.tags` and `service.bootstrap` (see [How it works](how-it-works.md)).
 
+**Several runs at once**
+
+- The lease's expiry relies on the runners' clocks (CI runners keep them
+  synchronized; the 2-minute expiry absorbs small differences).
+- Each renewal (every 30 seconds) is an update of the holder service's
+  annotations: it creates no revision but appears in the audit logs.
+- A stage whose holder service is not runway's (for example an unmanaged
+  main service while `--only` deploys a job) is not locked; runway says so.
+- A shared lease does not reserve the stage for a waiting deploy: a steady
+  stream of previews can keep a deploy waiting until `--wait-timeout`.
+- The commit check compares with the commit recorded by the last deploy;
+  deploys made before this version recorded none, so the first deploy after
+  upgrading is not checked.
+
 **No state file**
 
 - `runway.yaml` is the complete list of access on what runway owns (IAP

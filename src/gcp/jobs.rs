@@ -115,6 +115,9 @@ pub fn desired_job(spec: &ServiceSpec, j: &JobSettings, existing: Option<&Job>) 
         })
         .unwrap_or_default();
     annotations.extend(spec.annotations.clone());
+    if let Some(e) = existing {
+        run::keep_live(&mut annotations, &e.annotations);
+    }
     let (container, volumes) = run::app_container_and_volumes(spec);
     let container = match spec.sandbox {
         true => run::with_sandbox_launcher(container),
@@ -204,6 +207,19 @@ impl JobReconciler<'_> {
     ) -> Result<JobChange> {
         if let Some(job) = &existing {
             check_job_ownership(job, app, stage)?;
+            // The holder's update carries this run's lease: never overwrite
+            // one another run holds.
+            if let Some(e) = crate::lease::created_by_other(
+                spec.annotations
+                    .get(crate::lease::ANNOTATION_LEASE)
+                    .map(String::as_str),
+                job.annotations
+                    .get(crate::lease::ANNOTATION_LEASE)
+                    .map(String::as_str),
+                job_id,
+            ) {
+                return Err(e);
+            }
             if changes(Some(job), spec, j).is_empty() {
                 return Ok(JobChange::Unchanged);
             }

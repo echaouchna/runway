@@ -48,6 +48,8 @@ pub struct ServiceResult {
     pub revision: String,
     pub image: String,
     pub change: ServiceChange,
+    /// Every field the rollout changed (all of them for a new service).
+    pub changes: Vec<crate::plan::FieldChange>,
     pub public: bool,
     pub access_change: AccessChange,
     pub iap: bool,
@@ -63,6 +65,8 @@ pub struct JobResult {
     pub job: String,
     pub image: String,
     pub change: JobChange,
+    /// Every field changed (all of them for a new job).
+    pub changes: Vec<crate::plan::FieldChange>,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,6 +321,20 @@ pub async fn run(
     for n in notes {
         p.info(n);
     }
+
+    // The stage's lease: other deploys, canaries, traffic changes and
+    // teardowns of the stage wait for this run (previews share it).
+    let mut lease = crate::commands::take_lease(
+        r,
+        &run_client,
+        Some(&jobs_client),
+        crate::commands::lease_mode(&mode),
+        &crate::commands::deploy::command_line(&first.stage, &mode),
+        &args.lock,
+        p,
+    )
+    .await?;
+    let outcome = async {
     // `--tag` with release candidates: each build's candidate, nothing built.
     // Only looked up here (the APIs are enabled); the release step copies it
     // into the stage's release repository, once provisioned.
@@ -353,7 +371,7 @@ pub async fn run(
 
     // 2. Inspect: every workload, one image decision per distinct build, and
     //    the grants recorded on the holder. Ownership is checked first.
-    let (mut lives, decisions, by_workload, (recorded, domains_previous)) =
+    let (mut lives, decisions, by_workload, mut records) =
         with_retry(&retry, p, "inspect current state", |_| async {
             let mut lives = Vec::new();
             for d in &ws {
@@ -395,12 +413,60 @@ pub async fn run(
             Ok((lives, decisions, by_workload, records))
         })
         .await?;
-    for (d, live) in ws.iter().zip(&lives) {
-        match live {
-            Live::Service(Some(svc)) => check_ownership(svc, &d.app, &d.stage, args.adopt)?,
-            Live::Job(Some(j)) => check_job_ownership(j, &d.app, &d.stage)?,
-            _ => {}
+    let check_owners = |lives: &[Live]| -> Result<()> {
+        for (d, live) in ws.iter().zip(lives) {
+            match live {
+                Live::Service(Some(svc)) => check_ownership(svc, &d.app, &d.stage, args.adopt)?,
+                Live::Job(Some(j)) => check_job_ownership(j, &d.app, &d.stage)?,
+                _ => {}
+            }
         }
+        Ok(())
+    };
+    check_owners(&lives)?;
+    // A first deploy whose holder another run created since: take the lease
+    // on it (or wait) before changing anything; then what was read before is
+    // stale (the workloads that run deployed, its recorded commit, grants and
+    // domains).
+    let h = r.holder();
+    if lease.confirm(&h.app, &h.stage, args.lock.wait(), p).await? {
+        p.info(format!(
+            "{} was created by another run meanwhile: reading the stage again",
+            h.service_id
+        ));
+        let (fresh, fresh_records) = with_retry(&retry, p, "inspect current state", |_| async {
+            let mut fresh = Vec::new();
+            for d in &ws {
+                fresh.push(match d.is_job() {
+                    true => Live::Job(jrec.get(&job_for_mode(d, &mode)?.service_name()).await?),
+                    false => Live::Service(reconciler.get(&d.service_name()).await?),
+                });
+            }
+            Ok((fresh, holder_records(r, &run_client, &jobs_client).await?))
+        })
+        .await?;
+        lives = fresh;
+        records = fresh_records;
+        check_owners(&lives)?;
+    }
+    let (recorded, domains_previous) = (records.grants.clone(), records.domains.clone());
+    let held = lease.held();
+    provisioner.hold(held.clone());
+    // A deploy of an older commit than the one serving is refused (previews
+    // do not change what serves).
+    let source = crate::commands::this_source(ctx);
+    let records_source = !matches!(mode, Mode::Preview { .. });
+    if records_source {
+        if let Some(l) = &records.source {
+            p.info(format!("deployed: {l}"));
+        }
+        crate::source::check(
+            &crate::commands::config_dir(ctx),
+            source.as_ref(),
+            records.source.as_ref(),
+            &first.stage,
+            args.allow_older,
+        )?;
     }
     // The workload whose build produces each decision's image.
     let owners: Vec<&Deployment> = (0..decisions.len())
@@ -629,6 +695,14 @@ pub async fn run(
         let k = by_workload[i];
         let image = &images[k];
         let mut annotations = decisions[k].annotations.clone();
+        // The holder's rollout carries this run's lease: it creates the
+        // holder with it (a first deploy), and an update never overwrites
+        // another run's.
+        if is_holder(d, holder.d)
+            && let Some((k, v)) = lease.annotation()
+        {
+            annotations.insert(k, v);
+        }
         if is_holder(d, holder.d) && (!record.is_empty() || !recorded.is_empty()) {
             annotations.insert(ANNOTATION_GRANTS.to_string(), encode_grants(&record));
         }
@@ -687,20 +761,14 @@ pub async fn run(
                     },
                     target.service_id
                 ));
-                if let Some(j) = &known {
-                    for c in crate::gcp::jobs::changes(Some(j), &spec, settings) {
-                        match (&c.before, &c.after) {
-                            (Some(b), Some(a)) => p.info(format!("~ {}: {b} -> {a}", c.field)),
-                            (None, Some(a)) => p.info(format!("+ {}: {a}", c.field)),
-                            (Some(b), None) => p.info(format!("- {}: {b}", c.field)),
-                            (None, None) => {}
-                        }
-                    }
-                }
+                let job_changes = crate::gcp::jobs::changes(known.as_ref(), &spec, settings);
+                p.details(&crate::commands::deploy::change_lines(&job_changes));
                 let name = target.service_name();
                 let change = with_retry(&retry, p, "deploy job", |attempt| {
                     let (jrec, spec, target, known, name) = (&jrec, &spec, &target, &known, &name);
+                    let held = &held;
                     async move {
+                        held.check()?;
                         // A retry re-reads the job: its etag changed if the
                         // failed attempt applied.
                         let existing = match attempt {
@@ -724,6 +792,10 @@ pub async fn run(
                     name: d.name().to_string(),
                     job: target.service_id.clone(),
                     image: image.clone(),
+                    changes: match change {
+                        JobChange::Unchanged => Vec::new(),
+                        _ => job_changes,
+                    },
                     change,
                 });
             }
@@ -848,6 +920,30 @@ pub async fn run(
         }
     }
 
+    // What serves now comes from this commit: a later deploy of an older one
+    // is refused.
+    // Not on a holder runway does not own (it is not changed).
+    if records_source
+        && (records.owned || !records.exists || holder.adopting)
+        && let Some(src) = &source
+    {
+        let value = src.encode();
+        let name = holder.d.service_name();
+        with_retry(&retry, p, "record the deployed commit", |_| async {
+            held.check()?;
+            match holder.d.is_job() {
+                true => jrec.set_annotation(&name, crate::source::ANNOTATION_SOURCE, &value).await,
+                false => {
+                    reconciler
+                        .set_annotation(&name, crate::source::ANNOTATION_SOURCE, &value)
+                        .await
+                }
+            }
+        })
+        .await
+        .map_err(|e| after_rollout(e, first, any_url.as_deref()))?;
+    }
+
     let result = StackResult {
         app: first.app.clone(),
         stage: first.stage.clone(),
@@ -872,6 +968,10 @@ pub async fn run(
         ));
     }
     Ok(())
+    }
+    .await;
+    lease.release(p).await;
+    outcome
 }
 
 /// One service: bootstrap on first deploy, tags, rollout, its tags and IAP,
@@ -904,15 +1004,20 @@ async fn deploy_service(
             d.service_id, bs.ingress
         ));
         with_retry(retry, p, "create the service", |attempt| {
-            roll_out(
-                reconciler,
-                d,
-                &name,
-                &placeholder,
-                if attempt == 1 { Some(None) } else { None },
-                false,
-                p,
-            )
+            let (name, placeholder) = (&name, &placeholder);
+            async move {
+                view.check_lease()?;
+                roll_out(
+                    reconciler,
+                    d,
+                    name,
+                    placeholder,
+                    if attempt == 1 { Some(None) } else { None },
+                    false,
+                    p,
+                )
+                .await
+            }
         })
         .await?;
         existing = reconciler.get(&name).await?;
@@ -945,10 +1050,11 @@ async fn deploy_service(
         (Some(_), _) => format!("Updating Cloud Run service {}", d.service_id),
     });
     let tag_just_bound = steps.iter().any(|x| x.outcome == StepOutcome::Changed);
-    let (applied, svc) = with_retry(retry, p, "deploy service", |attempt| {
+    let (applied, svc, changes) = with_retry(retry, p, "deploy service", |attempt| {
         let known = if attempt == 1 { Some(existing.clone()) } else { None };
         let (name, base_spec) = (&name, &base_spec);
         async move {
+            view.check_lease()?;
             roll_out(reconciler, d, name, base_spec, known, adopt, p)
                 .await
                 .map_err(|mut e| {
@@ -974,8 +1080,9 @@ async fn deploy_service(
             .await
             .map_err(|e| after_rollout(e, d, url.as_deref()))?,
     );
-    let access_change = with_retry(retry, p, "invoker access", |_| {
-        reconciler.ensure_access(&name, d.service.public)
+    let access_change = with_retry(retry, p, "invoker access", |_| async {
+        view.check_lease()?;
+        reconciler.ensure_access(&name, d.service.public).await
     })
     .await
     .map_err(|e| after_rollout(e, d, url.as_deref()))?;
@@ -988,6 +1095,7 @@ async fn deploy_service(
             .unwrap_or_else(|| run::short_revision(&svc.latest_ready_revision).to_string()),
         image: image.to_string(),
         change: applied.change,
+        changes,
         public: d.service.public,
         access_change,
         iap: d.service.iap.enabled,
@@ -1101,58 +1209,63 @@ async fn apply_releases(
 }
 
 fn print_text(p: &Progress, r: &StackResult) {
-    p.success(format!(
-        "{} (stage {}) deployed in {}s",
-        r.app, r.stage, r.duration_seconds
-    ));
+    use crate::commands::summary as sm;
     let c = crate::style::out();
-    let verb = |ch: ServiceChange| match ch {
-        ServiceChange::Created => "created",
-        ServiceChange::Updated => "updated",
-        ServiceChange::Unchanged => "unchanged",
-    };
-    if !r.services.is_empty() {
-        println!("Services:");
-        for s in &r.services {
-            println!(
-                "  {} {} {} {}",
-                c.bold(&s.service),
-                c.bold_cyan(s.url.as_deref().unwrap_or("(no URL)")),
-                s.revision,
-                c.dim(&format!("({})", verb(s.change)))
-            );
-            if let Some(u) = &s.revision_url {
-                println!(
-                    "    {}: {}",
-                    match r.traffic_mode {
-                        Mode::Preview { .. } => "preview",
-                        _ => "canary",
-                    },
-                    c.bold_cyan(u)
-                );
-            }
+    p.success(format!(
+        "{} (stage {}) deployed in {}",
+        r.app,
+        r.stage,
+        crate::lease::short_duration(std::time::Duration::from_secs(r.duration_seconds))
+    ));
+    let mut s = String::new();
+    for svc in &r.services {
+        s.push_str(&sm::heading(&c, &format!("Service {}", svc.service)));
+        s.push_str(&sm::field(&c, "Change", sm::service_change(svc.change)));
+        s.push_str(&sm::field(
+            &c,
+            "URL",
+            &c.bold_cyan(svc.url.as_deref().unwrap_or("(no URL)")),
+        ));
+        s.push_str(&sm::field(&c, "Revision", &svc.revision));
+        if let Some(u) = &svc.revision_url {
+            s.push_str(&sm::field(
+                &c,
+                match r.traffic_mode {
+                    Mode::Preview { .. } => "Preview",
+                    _ => "Canary",
+                },
+                &c.bold_cyan(u),
+            ));
+        }
+        s.push_str(&sm::field(&c, "Image", &svc.image));
+        s.push_str(&sm::field(
+            &c,
+            "Access",
+            &sm::access(&c, svc.iap, svc.public, &svc.access_change),
+        ));
+        s.push_str(&sm::field(&c, "Traffic", ""));
+        s.push_str(&sm::traffic(&c, &svc.traffic, "    "));
+        s.push_str(&sm::field(&c, "Changes", &svc.changes.len().to_string()));
+        s.push_str(&sm::changes(&c, &svc.changes, "    "));
+    }
+    for j in &r.jobs {
+        let v = match j.change {
+            JobChange::Created => "created",
+            JobChange::Updated => "updated",
+            JobChange::Unchanged => "unchanged",
+        };
+        s.push_str(&sm::heading(&c, &format!("Job {}", j.job)));
+        s.push_str(&sm::field(&c, "Change", v));
+        s.push_str(&sm::field(&c, "Image", &j.image));
+        s.push_str(&sm::field(&c, "Changes", &j.changes.len().to_string()));
+        s.push_str(&sm::changes(&c, &j.changes, "    "));
+    }
+    if !r.releases.is_empty() {
+        s.push_str(&sm::heading(&c, "Releases"));
+        for rel in &r.releases {
+            s.push_str(&format!("  {}\n", c.bold_green(&rel.tag)));
         }
     }
-    if !r.jobs.is_empty() {
-        println!("Jobs:");
-        for j in &r.jobs {
-            let v = match j.change {
-                JobChange::Created => "created",
-                JobChange::Updated => "updated",
-                JobChange::Unchanged => "unchanged",
-            };
-            println!("  {} {}", c.bold(&j.job), c.dim(&format!("({v})")));
-        }
-    }
-    for rel in &r.releases {
-        println!("Release:  {}", c.bold_green(&rel.tag));
-    }
-    let changed = r
-        .steps
-        .iter()
-        .filter(|s| s.outcome == StepOutcome::Changed)
-        .count();
-    if !r.steps.is_empty() {
-        println!("Steps:    {} step(s), {changed} changed", r.steps.len());
-    }
+    s.push_str(&sm::steps(&c, &r.steps));
+    print!("{s}");
 }

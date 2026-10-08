@@ -190,8 +190,10 @@ authentication or TLS proxy, a log forwarder.
   them too, at their `mount_path`).
 - In a stage, `sidecars: { NAME: null }` removes an inherited sidecar; a map
   replaces it entirely.
-- Plans show each sidecar on one line (`sidecars.NAME`) with its image, CPU,
-  memory and a fingerprint of the rest of its settings.
+- Plans show every setting of a sidecar on a line of its own
+  (`sidecars.NAME.image`, `.cpu`, `.memory`, `.command`, `.args`,
+  `.env.KEY`, `.startup_check`, `.mounts.VOLUME`, `.start_before_app`), so a
+  change shows exactly what changes.
 
 CPU is allocated per container: with request-based billing, sidecars only get
 CPU while requests are being served.

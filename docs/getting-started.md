@@ -4,7 +4,7 @@
 
 ### Homebrew
 
-On macOS and Linux (arm64 and x86_64):
+On macOS (Apple silicon) and Linux (arm64 and x86_64):
 
 ```sh
 brew install echaouchna/tap/runway
@@ -27,13 +27,13 @@ runway --version                       # 0.1.0-edge.42 (1a2b3c4): version, build
 ### Binaries
 
 Each [release](https://github.com/echaouchna/runway/releases) has archives
-for Linux (x86_64, aarch64; glibc 2.35+) and macOS (arm64, x86_64), and
+for Linux (x86_64, aarch64; glibc 2.35+) and macOS (Apple silicon, arm64), and
 `SHA256SUMS`. The [edge](https://github.com/echaouchna/runway/releases/tag/edge)
 pre-release has the same archives for the latest `main`
 (`runway-v0.1.0-edge.N-<target>.tar.gz`, replaced on every change).
 
 ```sh
-version=v0.1.0 target=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+version=v0.1.0 target=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 curl -fsSLO "https://github.com/echaouchna/runway/releases/download/$version/runway-$version-$target.tar.gz"
 tar -xzf "runway-$version-$target.tar.gz"
 sudo install "runway-$version-$target/runway" /usr/local/bin/

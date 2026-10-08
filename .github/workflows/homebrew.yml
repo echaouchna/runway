@@ -63,11 +63,13 @@ jobs:
             s=$(sha "$2")
             [ -z "$s" ] || printf '    %s do\n      url "%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$1" "$url" "$2" "$s"
           }
-          os() { # on_macos / on_linux with the CPUs that were built
-            [ -n "$(sha "$2")$(sha "$3")" ] || return 0
+          os() { # on_macos / on_linux with the CPUs that were built (arm, then intel if any)
+            [ -n "$(sha "$2")${3:+$(sha "$3")}" ] || return 0
             printf '\n  on_%s do\n' "$1"
+            # macOS: Apple silicon only (Intel Macs get a clear error).
+            [ "$1" != macos ] || printf '    depends_on arch: :arm64\n'
             cpu on_arm "$2"
-            cpu on_intel "$3"
+            [ -z "${3:-}" ] || cpu on_intel "$3"
             printf '  end\n'
           }
           {
@@ -83,7 +85,7 @@ jobs:
             else
               printf '\n  livecheck do\n    skip "Rebuilt on every push to main"\n  end\n'
             fi
-            os macos aarch64-apple-darwin x86_64-apple-darwin
+            os macos aarch64-apple-darwin
             os linux aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
             printf '\n  def install\n'
             printf '    bin.install "runway"\n'

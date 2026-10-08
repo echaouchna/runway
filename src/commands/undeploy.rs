@@ -386,6 +386,28 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
     let session = connect(ctx, first).await?;
     let run_client = build_client!(Services, session)?;
     let jobs_client = build_client!(Jobs, session)?;
+    // A teardown excludes every other run on the stage; removing one
+    // preview shares it with other previews. The plan (no `--yes`) takes
+    // nothing.
+    let lease = match args.yes {
+        false => crate::lease::Guard::none(),
+        true => {
+            crate::commands::take_lease(
+                &resolved,
+                &run_client,
+                Some(&jobs_client),
+                match args.preview {
+                    Some(_) => crate::lease::Mode::Shared,
+                    None => crate::lease::Mode::Exclusive,
+                },
+                &format!("runway undeploy --stage {} --yes", args.stage.stage),
+                &args.lock,
+                p,
+            )
+            .await?
+        }
+    };
+    let outcome = async {
     if let Some(name) = &args.preview {
         return remove_previews(
             ctx,
@@ -395,6 +417,7 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
             &jobs_client,
             name,
             &args,
+            &lease.held(),
         )
         .await;
     }
@@ -505,10 +528,13 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         return Ok(());
     }
 
+    prov.hold(lease.held());
     if let Some(previous) = &domains_previous {
         p.step("Removing custom domains");
-        let report = with_retry(&retry, p, "remove custom domains", |_| {
+        let report = with_retry(&retry, p, "remove custom domains", |_| async {
+            prov.check_lease()?;
             prov.teardown_domains(previous, true, args.release_urls)
+                .await
         })
         .await?;
         for n in prov.take_notes() {
@@ -524,6 +550,7 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         let id = name.rsplit('/').next().unwrap_or(name).to_string();
         p.step(format!("Deleting schedule {id}"));
         let o = with_retry(&retry, p, "delete schedule", |_| async {
+            prov.check_lease()?;
             let (app, stage) = (&first.app, &first.stage);
             Ok(
                 match crate::gcp::scheduler::delete_owned(&scheduler, name, app, stage).await? {
@@ -535,6 +562,18 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         .await?;
         mark(&mut items, &format!("schedule {id}"), o);
     }
+    // The scheduler's account (nothing calls the targets any more), before
+    // the workloads: the one holding the lease goes last.
+    if let Some(email) = delete_invoker {
+        p.step(format!("Deleting service account {email}"));
+        let o = with_retry(&retry, p, "delete service account", |_| async {
+            prov.check_lease()?;
+            prov.delete_service_account(&email).await
+        })
+        .await?;
+        mark(&mut items, &format!("service account {email}"), o);
+    }
+    let holder = resolved.holder().service_name();
     execute_all(
         &plans,
         &run_client,
@@ -545,16 +584,9 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         &mut items,
         args.delete_images,
         args.timeout,
+        Some(&holder),
     )
     .await?;
-    if let Some(email) = delete_invoker {
-        p.step(format!("Deleting service account {email}"));
-        let o = with_retry(&retry, p, "delete service account", |_| {
-            prov.delete_service_account(&email)
-        })
-        .await?;
-        mark(&mut items, &format!("service account {email}"), o);
-    }
 
     match ctx.output {
         OutputFormat::Json => print_json(&Report {
@@ -569,6 +601,10 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         }
     }
     Ok(())
+    }
+    .await;
+    lease.release(p).await;
+    outcome
 }
 
 /// What runway set up for the stage's custom domains: the holder's record,
@@ -579,7 +615,9 @@ async fn domains_record(
     run: &Services,
     jobs: &Jobs,
 ) -> Result<Option<crate::domains::Recorded>> {
-    let (_, recorded) = crate::commands::plan::holder_records(r, run, jobs).await?;
+    let recorded = crate::commands::plan::holder_records(r, run, jobs)
+        .await?
+        .domains;
     if recorded.is_none() && !crate::domains::configured(r) {
         return Ok(None);
     }
@@ -606,6 +644,7 @@ fn domain_items(report: &crate::domains::Report, items: &mut Vec<Item>) {
 
 /// `--preview NAME`: the preview's URL on every selected service, and the
 /// preview copy of every selected job.
+#[allow(clippy::too_many_arguments)]
 async fn remove_previews(
     ctx: &Context,
     resolved: &crate::config::Resolved,
@@ -614,6 +653,7 @@ async fn remove_previews(
     jobs: &Jobs,
     name: &str,
     args: &UndeployArgs,
+    held: &crate::lease::Held,
 ) -> Result<()> {
     let rec = crate::deploy::Reconciler {
         run: run_client,
@@ -626,6 +666,7 @@ async fn remove_previews(
     let single = services.len() == 1 && selected.len() == 1;
     let mut reports = Vec::new();
     for d in services {
+        held.check()?;
         reports.push(
             crate::commands::traffic::remove_preview(ctx, d, &rec, name, args.yes, single).await?,
         );
@@ -647,6 +688,7 @@ async fn remove_previews(
             (false, _) => "not_found",
             (true, false) => "would_remove",
             (true, true) => {
+                held.check()?;
                 ctx.progress.step(format!("Deleting preview job {id}"));
                 match jobs.delete_job().set_name(&full).send().await {
                     Ok(_) => {}
@@ -898,6 +940,7 @@ pub async fn execute_all(
     items: &mut [Item],
     delete_images: bool,
     timeout: std::time::Duration,
+    last: Option<&str>,
 ) -> Result<()> {
     let phase = |delete_service, delete_sa, delete_images| Teardown {
         delete_service,
@@ -905,7 +948,12 @@ pub async fn execute_all(
         delete_images,
         timeout,
     };
-    for (d, delete_service, _) in plans {
+    // The workload holding the stage's lease (`last`, by full name) is
+    // deleted at the very end: until then the lease keeps every other run
+    // out, also while accounts and images are deleted.
+    let is_last = |d: &Deployment| last == Some(d.service_name().as_str());
+    for (d, delete_service, _) in plans.iter().filter(|(d, _, _)| !is_last(d)) {
+        prov.check_lease()?;
         execute(
             d,
             run,
@@ -935,6 +983,7 @@ pub async fn execute_all(
                     }
                 }
             }
+            prov.check_lease()?;
             execute(
                 &merged,
                 run,
@@ -950,6 +999,7 @@ pub async fn execute_all(
     }
     if delete_images {
         for (d, _, _) in plans {
+            prov.check_lease()?;
             execute(
                 d,
                 run,
@@ -962,6 +1012,20 @@ pub async fn execute_all(
             )
             .await?;
         }
+    }
+    for (d, delete_service, _) in plans.iter().filter(|(d, _, _)| is_last(d)) {
+        prov.check_lease()?;
+        execute(
+            d,
+            run,
+            jobs,
+            prov,
+            retry,
+            p,
+            items,
+            phase(*delete_service, false, false),
+        )
+        .await?;
     }
     Ok(())
 }

@@ -11,11 +11,13 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Progress reporter writing to stderr.
+/// Progress reporter writing to stderr. Phases (`step`) show the time since
+/// the command started; details go on indented lines below them.
 #[derive(Debug, Clone)]
 pub struct Progress {
     enabled: bool,
     color: bool,
+    start: std::time::Instant,
 }
 
 impl Progress {
@@ -23,6 +25,7 @@ impl Progress {
         Self {
             enabled,
             color: crate::style::err().enabled,
+            start: std::time::Instant::now(),
         }
     }
 
@@ -31,6 +34,34 @@ impl Progress {
         Self {
             enabled: false,
             color: false,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// `0:07`, `12:41`: time since the command started.
+    fn elapsed(&self) -> String {
+        let s = self.start.elapsed().as_secs();
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+
+    /// Lines under the previous one, indented, each colored by its leading
+    /// marker (`+` green, `-` red, `~` yellow, `=` dim).
+    pub fn details(&self, lines: &str) {
+        if !self.enabled {
+            return;
+        }
+        for l in lines.lines().filter(|l| !l.trim().is_empty()) {
+            let code = match l.trim_start().chars().next() {
+                Some('+') => Some("32"),
+                Some('-') => Some("31"),
+                Some('~') => Some("33"),
+                Some('=') => Some("2"),
+                _ => None,
+            };
+            match code {
+                Some(c) => eprintln!("        {}", self.paint(c, l)),
+                None => eprintln!("        {l}"),
+            }
         }
     }
 
@@ -44,7 +75,12 @@ impl Progress {
 
     pub fn step(&self, msg: impl AsRef<str>) {
         if self.enabled {
-            eprintln!("{} {}", self.paint("1;36", "==>"), msg.as_ref());
+            eprintln!(
+                "{} {} {}",
+                self.paint("1;36", "==>"),
+                self.paint("2", &format!("[{}]", self.elapsed())),
+                self.paint("1", msg.as_ref())
+            );
         }
     }
 

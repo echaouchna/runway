@@ -5,8 +5,8 @@
 # Always: Linux x86_64 (glibc 2.35+). Also, when the repository is public or
 # the variable is "true":
 #   - Linux aarch64 (BUILD_ARM64): free arm64 runners are for public repositories;
-#   - macOS arm64 + x86_64 (BUILD_MACOS): macOS minutes count 10x in private
-#     repositories, so both targets are built in one job.
+#   - macOS arm64 only (BUILD_MACOS; macOS minutes count 10x in private
+#     repositories). No Intel macOS build: Apple silicon only.
 name: build
 
 on:
@@ -36,7 +36,7 @@ jobs:
         include: ${{ fromJSON(format('[{0}{1}{2}]',
           format('{{"name":"linux-x86_64","runner":"{0}","targets":"x86_64-unknown-linux-gnu"}}', vars.RUNNER_LINUX_2204 || 'ubuntu-22.04'),
           (!github.event.repository.private || vars.BUILD_ARM64 == 'true') && format(',{{"name":"linux-aarch64","runner":"{0}","targets":"aarch64-unknown-linux-gnu"}}', vars.RUNNER_LINUX_ARM_2204 || 'ubuntu-22.04-arm') || '',
-          (!github.event.repository.private || vars.BUILD_MACOS == 'true') && ',{"name":"macos","runner":"macos-15","targets":"aarch64-apple-darwin x86_64-apple-darwin"}' || '')) }}
+          (!github.event.repository.private || vars.BUILD_MACOS == 'true') && ',{"name":"macos","runner":"macos-15","targets":"aarch64-apple-darwin"}' || '')) }}
     name: build (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60

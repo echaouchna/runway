@@ -291,7 +291,12 @@ pub fn revoke_steps(recorded: &[ManagedGrant], d: &Deployment) -> Vec<Step> {
 impl Step {
     pub fn describe(&self, d: &Deployment) -> String {
         match self {
-            Step::EnableApis(apis) => format!("{} API(s) enabled on {}", apis.len(), d.project),
+            Step::EnableApis(apis) => format!(
+                "{} API(s) enabled on {}: {}",
+                apis.len(),
+                d.project,
+                apis.join(", ")
+            ),
             Step::ProjectTag { key, value } => {
                 format!("project tag {key}={value} on {}", d.project)
             }
@@ -771,7 +776,7 @@ fn change_summary(changes: &[crate::plan::FieldChange]) -> String {
             (None, None) => c.field.clone(),
         })
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("\n")
 }
 
 /// Role the scheduler invoker gets on each target (it includes running jobs).
@@ -1098,6 +1103,9 @@ pub struct Provisioner<'a> {
     /// (policy, role, member): the next read decides. Present means runway's
     /// write committed, so the grant is runway's; missing means it did not.
     uncertain: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// The run's lease, checked before every step: a run that lost it
+    /// changes nothing more (see [`crate::lease::Held::check`]).
+    lease: Arc<Mutex<crate::lease::Held>>,
     /// What steps want said (DNS records to create elsewhere, certificate
     /// states), shared by the views; see [`Provisioner::take_notes`].
     notes: Arc<Mutex<Vec<String>>>,
@@ -1226,6 +1234,7 @@ impl<'a> Provisioner<'a> {
             project_number: Default::default(),
             granted: Default::default(),
             uncertain: Default::default(),
+            lease: Arc::new(Mutex::new(crate::lease::Held::none())),
             notes: Default::default(),
             domain_endpoints: crate::domains::Endpoints {
                 compute: ep.compute.clone(),
@@ -1247,6 +1256,17 @@ impl<'a> Provisioner<'a> {
         self
     }
 
+    /// Checks `held` before every step from now on (also in the views of
+    /// [`Self::for_service`]).
+    pub fn hold(&self, held: crate::lease::Held) {
+        *self.lease.lock().expect("not poisoned") = held;
+    }
+
+    /// Fails when the run lost its lease.
+    pub fn check_lease(&self) -> Result<()> {
+        self.lease.lock().expect("not poisoned").check()
+    }
+
     /// The same provisioner (clients, what it granted) for the tags and IAP
     /// of one service.
     pub fn for_service(&self, d: &'a Deployment) -> Provisioner<'a> {
@@ -1260,6 +1280,7 @@ impl<'a> Provisioner<'a> {
             service_usage: self.service_usage.clone(),
             granted: self.granted.clone(),
             uncertain: self.uncertain.clone(),
+            lease: self.lease.clone(),
             notes: self.notes.clone(),
             domain_endpoints: self.domain_endpoints.clone(),
         }
@@ -1941,9 +1962,9 @@ impl<'a> Provisioner<'a> {
                 match report.changes.is_empty() {
                     true => (StepState::InSync, "up to date".into()),
                     false if want.is_empty() => {
-                        (StepState::PendingRemoval, report.changes.join("; "))
+                        (StepState::PendingRemoval, report.changes.join("\n"))
                     }
-                    false => (StepState::Pending, report.changes.join("; ")),
+                    false => (StepState::Pending, report.changes.join("\n")),
                 }
             }
         })
@@ -2177,6 +2198,7 @@ impl<'a> Provisioner<'a> {
     }
 
     pub async fn apply(&self, step: &Step) -> Result<StepResult> {
+        self.check_lease()?;
         let name = step.describe(self.d);
         let (outcome, detail) = match step {
             Step::EnableApis(apis) => self.ensure_apis(apis).await?,
@@ -2299,7 +2321,7 @@ impl<'a> Provisioner<'a> {
                 let report = self.domains(want, previous, *removals, true, false).await?;
                 match report.changes.is_empty() {
                     true => (StepOutcome::Unchanged, "up to date".into()),
-                    false => (StepOutcome::Changed, report.changes.join("; ")),
+                    false => (StepOutcome::Changed, report.changes.join("\n")),
                 }
             }
             Step::Unschedule { name } => {

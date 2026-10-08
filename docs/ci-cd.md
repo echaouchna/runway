@@ -80,6 +80,13 @@ Every command reads the live project, so a pipeline is just the commands you
 would type. Use `-o json` where a script reads the result (exit codes are in
 [Commands](commands.md#exit-codes)).
 
+Concurrent pipelines need no `resource_group` or `concurrency:` setting:
+runs on the same stage wait for each other, previews run together, and a
+pipeline that finishes after a newer one is refused instead of rolling
+production back (see [Several runs at once](how-it-works.md#several-runs-at-once)).
+runway reads the commit from the checkout; with a shallow clone, it compares
+commit dates when the deployed commit is not in the clone.
+
 **A URL per merge request, production on main** (GitLab CI, with the
 credential setup above in a `before_script`):
 

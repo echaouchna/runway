@@ -106,8 +106,8 @@ project is the state: no state file or cluster to maintain.
 
 ## Install
 
-With [Homebrew](https://brew.sh) (macOS and Linux, arm64 and x86_64; bash,
-zsh and fish completions included):
+With [Homebrew](https://brew.sh) (macOS on Apple silicon, Linux on arm64 and
+x86_64; bash, zsh and fish completions included):
 
 ```sh
 brew install echaouchna/tap/runway
