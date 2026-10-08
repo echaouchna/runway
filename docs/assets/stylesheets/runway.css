@@ -3,7 +3,10 @@
    the default, as on the homepage; the light scheme keeps the brand header
    and code blocks. */
 
-:root {
+/* Material sets its palette on the element carrying the color scheme
+   (`body`): ours goes there too (this file loads after Material's). */
+:root,
+[data-md-color-scheme] {
   --rw-bg: #070b18;
   --rw-card: #111a3a;
   --rw-card2: #16214a;
@@ -132,6 +135,11 @@ body[data-md-color-scheme="default"] {
   -webkit-backdrop-filter: saturate(140%) blur(14px);
   border-bottom: 1px solid rgba(38, 51, 95, .8);
   box-shadow: none;
+}
+
+/* Over a light page, a translucent navy turns gray: nearly opaque there. */
+[data-md-color-scheme="default"] .md-header {
+  background: rgba(7, 11, 24, .96);
 }
 
 .md-header--shadow {
@@ -292,6 +300,12 @@ body[data-md-color-scheme="default"] {
 .md-typeset .headerlink {
   border-bottom: none;
   color: var(--rw-dim);
+}
+
+/* Gradient text paints every glyph, hidden or not: no permalink on the
+   page title. */
+.md-typeset h1 .headerlink {
+  display: none;
 }
 
 .md-typeset hr {
