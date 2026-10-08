@@ -159,16 +159,10 @@ impl ServiceSpec {
             (1 + usize::from(self.otel_collector.is_some()) + self.sidecars.len()).to_string(),
         );
         for (name, sc) in &self.sidecars {
-            m.insert(
-                format!("sidecars.{name}"),
-                sidecar_fingerprint(&SidecarView::from_config(sc)),
-            );
+            m.extend(sidecar_flat(name, &SidecarView::from_config(sc)));
         }
         if let Some(o) = &self.otel_collector {
-            m.insert(
-                format!("sidecars.{}", crate::config::OTEL_COLLECTOR_NAME),
-                sidecar_display(&o.image, &o.cpu, &o.memory, &o.config),
-            );
+            m.extend(collector_flat(&o.image, &o.cpu, &o.memory, &o.config));
         }
         for (k, v) in &self.env {
             m.insert(format!("env.{k}"), v.clone());
@@ -184,7 +178,11 @@ impl ServiceSpec {
         }
         // runway's service annotations (image reference, source hash, base
         // images, release): service-level, they never create a revision.
-        for (k, v) in &self.annotations {
+        for (k, v) in self
+            .annotations
+            .iter()
+            .filter(|(k, _)| !crate::gcp::run::is_coordination(k))
+        {
             m.insert(format!("annotations.{k}"), v.clone());
         }
         for (k, v) in &self.volumes {
@@ -277,15 +275,31 @@ pub fn list_display(items: &[String]) -> String {
 }
 
 /// `IMAGE, cpu C, memory M, config <hash>` for the collector sidecar (desired and observed).
-pub fn sidecar_display(image: &str, cpu: &str, memory: &str, config: &str) -> String {
+/// The OpenTelemetry Collector as plan fields (`sidecars.otel-collector.image`,
+/// `.cpu`, `.memory`, `.config`). A configuration you wrote is shown in full
+/// (`⏎` marks its line breaks); runway's built-in one by name and hash, which
+/// still changes when an upgrade changes it.
+pub fn collector_flat(
+    image: &str,
+    cpu: &str,
+    memory: &str,
+    config: &str,
+) -> BTreeMap<String, String> {
     use sha2::Digest;
-    let h = crate::build::package::hex(&sha2::Sha256::digest(config.as_bytes()));
-    format!(
-        "{image}, cpu {}, memory {}, config {}",
-        normalize_cpu(cpu),
-        normalize_memory(memory),
-        &h[..12]
-    )
+    let k = |f: &str| format!("sidecars.{}.{f}", crate::config::OTEL_COLLECTOR_NAME);
+    let config = match config.trim() == crate::config::OTEL_COLLECTOR_DEFAULT_CONFIG.trim() {
+        true => format!(
+            "runway default (sha256 {})",
+            &crate::build::package::hex(&sha2::Sha256::digest(config.trim().as_bytes()))[..12]
+        ),
+        false => config.trim_end().lines().collect::<Vec<_>>().join(" ⏎ "),
+    };
+    BTreeMap::from([
+        (k("image"), image.to_string()),
+        (k("cpu"), normalize_cpu(cpu)),
+        (k("memory"), normalize_memory(memory)),
+        (k("config"), config),
+    ])
 }
 
 /// What identifies a generic sidecar, built the same way from the
@@ -336,22 +350,33 @@ pub fn sidecar_probe(path: Option<&str>, port: u16) -> String {
     }
 }
 
-/// `IMAGE, cpu C, memory M, config <hash>`: the hash covers the command,
-/// arguments, environment, probe, mounts and start order.
-pub fn sidecar_fingerprint(v: &SidecarView) -> String {
-    use sha2::Digest;
-    let rest = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{}",
-        v.command, v.args, v.env, v.probe, v.mounts, v.before_app
-    );
-    let h = crate::build::package::hex(&sha2::Sha256::digest(rest.as_bytes()));
-    format!(
-        "{}, cpu {}, memory {}, config {}",
-        v.image,
-        normalize_cpu(&v.cpu),
-        normalize_memory(&v.memory),
-        &h[..12]
-    )
+/// A sidecar as one plan field per setting (`sidecars.NAME.image`,
+/// `.cpu`, `.memory`, `.command`, `.args`, `.env.KEY`, `.startup_check`,
+/// `.mounts.VOLUME`, `.start_before_app`): a plan shows exactly what
+/// changes in it.
+pub fn sidecar_flat(name: &str, v: &SidecarView) -> BTreeMap<String, String> {
+    let k = |f: &str| format!("sidecars.{name}.{f}");
+    let mut m = BTreeMap::new();
+    m.insert(k("image"), v.image.clone());
+    m.insert(k("cpu"), normalize_cpu(&v.cpu));
+    m.insert(k("memory"), normalize_memory(&v.memory));
+    if !v.command.is_empty() {
+        m.insert(k("command"), args_display(&v.command));
+    }
+    if !v.args.is_empty() {
+        m.insert(k("args"), args_display(&v.args));
+    }
+    for (key, value) in &v.env {
+        m.insert(k(&format!("env.{key}")), value.clone());
+    }
+    if let Some(p) = &v.probe {
+        m.insert(k("startup_check"), p.clone());
+    }
+    for (volume, path) in &v.mounts {
+        m.insert(k(&format!("mounts.{volume}")), path.clone());
+    }
+    m.insert(k("start_before_app"), v.before_app.to_string());
+    m
 }
 
 /// `GET /healthz every 10s, timeout 3s, 12 failures, delay 0s` (desired and observed).
@@ -647,10 +672,36 @@ fn diff_line(
         "=" => c.dim(&body),
         _ => c.bold_yellow(&body),
     };
-    match detail {
-        Some(d) if !d.is_empty() => format!("{indent}{body} {}\n", c.dim(&format!("({d})"))),
-        _ => format!("{indent}{body}\n"),
+    let Some(d) = detail.filter(|d| !d.is_empty()) else {
+        return format!("{indent}{body}\n");
+    };
+    // One change per line, under the step, each colored by its marker.
+    let mut lines = d.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or_default();
+    let mut out = match d.contains('\n') && starts_with_mark(first) {
+        true => format!("{indent}{body}\n{}", sub_line(c, indent, first)),
+        false => format!("{indent}{body} {}\n", c.dim(&format!("({first})"))),
+    };
+    for l in lines {
+        out.push_str(&sub_line(c, indent, l));
     }
+    out
+}
+
+fn starts_with_mark(l: &str) -> bool {
+    matches!(l.trim_start().chars().next(), Some('+' | '-' | '~' | '='))
+}
+
+/// A detail line under a step: `+`/`-`/`~` lines in their colors.
+fn sub_line(c: &crate::style::Painter, indent: &str, l: &str) -> String {
+    let l = l.trim_end();
+    let colored = match l.trim_start().chars().next() {
+        Some('+') => c.green(l),
+        Some('-') => c.red(l),
+        Some('~') => c.yellow(l),
+        _ => c.dim(l),
+    };
+    format!("{indent}      {colored}\n")
 }
 
 /// The plan of a stage with several services, jobs or schedules. A stage
@@ -733,7 +784,7 @@ fn step_lines(c: &crate::style::Painter, steps: &[crate::provision::StepCheck]) 
     s
 }
 
-/// Human-readable plan of a stage: each service as [`render_text`], then
+/// Human-readable plan of a stage: each service as [`render_body`], then
 /// jobs, stage-wide steps and one verdict.
 pub fn render_stack_text(p: &StackPlan) -> String {
     let c = crate::style::out();
@@ -747,8 +798,7 @@ pub fn render_stack_text(p: &StackPlan) -> String {
         p.region
     );
     for svc in &p.services {
-        let text = render_text(svc);
-        let body = text.split("\nThis plan is").next().unwrap_or(&text);
+        let body = render_body(svc);
         s.push('\n');
         s.push_str(body.trim_end());
         s.push('\n');
@@ -794,6 +844,33 @@ pub fn render_stack_text(p: &StackPlan) -> String {
             s.push_str(&format!("  - {n}\n"));
         }
     }
+    s.push_str(&header("Summary:"));
+    for svc in &p.services {
+        s.push_str(&format!("  {}\n", service_summary(svc)));
+    }
+    for j in &p.jobs {
+        s.push_str(&format!(
+            "  {}\n",
+            match j.action {
+                ServiceAction::Create =>
+                    format!("create job {} ({} field(s))", j.job, j.changes.len()),
+                ServiceAction::Update =>
+                    format!("update job {}: {} field(s) change", j.job, j.changes.len()),
+                ServiceAction::NoChange => format!("no change to job {}", j.job),
+                ServiceAction::Conflict => format!("refused: job {} is not runway's", j.job),
+                ServiceAction::Unknown => format!("create or update job {} (not inspected)", j.job),
+            }
+        ));
+    }
+    let all: Vec<crate::provision::StepCheck> = p
+        .steps
+        .iter()
+        .chain(p.services.iter().flat_map(|s| &s.steps))
+        .cloned()
+        .collect();
+    if let Some(steps) = steps_summary(&all) {
+        s.push_str(&format!("  {steps}\n"));
+    }
     s.push_str(&format!(
         "\nThis plan is {}.\n",
         if p.exact {
@@ -807,9 +884,9 @@ pub fn render_stack_text(p: &StackPlan) -> String {
     s
 }
 
-/// Human-readable plan. Colors (diff markers, headers, verdict) only appear
-/// when stdout is a terminal; see [`crate::style`].
-pub fn render_text(p: &Plan) -> String {
+/// The plan of one service, without its summary and verdict (the stage
+/// plan embeds it).
+pub fn render_body(p: &Plan) -> String {
     let c = crate::style::out();
     let header = |t: &str| format!("\n{}\n", c.bold(t));
     let mut s = String::new();
@@ -980,6 +1057,20 @@ pub fn render_text(p: &Plan) -> String {
             s.push_str(&format!("  - {n}\n"));
         }
     }
+    s
+}
+
+/// Human-readable plan. Colors (diff markers, headers, verdict) only appear
+/// when stdout is a terminal; see [`crate::style`].
+pub fn render_text(p: &Plan) -> String {
+    let c = crate::style::out();
+    let header = |t: &str| format!("\n{}\n", c.bold(t));
+    let mut s = render_body(p);
+    s.push_str(&header("Summary:"));
+    s.push_str(&format!("  {}\n", service_summary(p)));
+    if let Some(steps) = steps_summary(&p.steps) {
+        s.push_str(&format!("  {steps}\n"));
+    }
     s.push_str(&format!(
         "\nThis plan is {}.\n",
         if p.exact {
@@ -993,6 +1084,45 @@ pub fn render_text(p: &Plan) -> String {
     s
 }
 
+/// `update shop-prod: 3 field(s); access unchanged`.
+fn service_summary(p: &Plan) -> String {
+    let what = match p.action {
+        ServiceAction::Create => format!("create {} ({} field(s))", p.service, p.changes.len()),
+        ServiceAction::Update => {
+            format!("update {}: {} field(s) change", p.service, p.changes.len())
+        }
+        ServiceAction::NoChange => format!("no change to {}", p.service),
+        ServiceAction::Conflict => format!("refused: {} is not runway's", p.service),
+        ServiceAction::Unknown => format!("create or update {} (not inspected)", p.service),
+    };
+    let access = match p.access.action {
+        AccessAction::GrantPublic => "access: made public",
+        AccessAction::RevokePublic => "access: made private",
+        AccessAction::NoChange => "access unchanged",
+        AccessAction::Unknown => "access not inspected",
+    };
+    format!("{what}; {access}")
+}
+
+/// `provisioning: 3 to apply, 1 to remove, 9 in sync, 0 unknown`.
+fn steps_summary(steps: &[crate::provision::StepCheck]) -> Option<String> {
+    use crate::provision::StepState;
+    if steps.is_empty() {
+        return None;
+    }
+    let n = |s: StepState| steps.iter().filter(|x| x.state == s).count();
+    let mut parts = vec![
+        format!("{} to apply", n(StepState::Pending)),
+        format!("{} to remove", n(StepState::PendingRemoval)),
+        format!("{} in sync", n(StepState::InSync)),
+    ];
+    let unknown = n(StepState::Unknown);
+    if unknown > 0 {
+        parts.push(format!("{unknown} not checked"));
+    }
+    Some(format!("provisioning: {}", parts.join(", ")))
+}
+
 pub fn human_bytes(b: u64) -> String {
     const K: f64 = 1024.0;
     let f = b as f64;
@@ -1004,6 +1134,31 @@ pub fn human_bytes(b: u64) -> String {
         format!("{:.1} MiB", f / K / K)
     } else {
         format!("{:.1} GiB", f / K / K / K)
+    }
+}
+
+#[cfg(test)]
+mod collector_tests {
+    use super::*;
+
+    #[test]
+    fn the_collector_shows_a_written_config_in_full_and_the_default_by_hash() {
+        let mine = collector_flat("img", "1", "512Mi", "receivers:\n  otlp: {}\n");
+        assert_eq!(
+            mine["sidecars.otel-collector.config"],
+            "receivers: ⏎   otlp: {}"
+        );
+        assert_eq!(mine["sidecars.otel-collector.image"], "img");
+        let default = collector_flat(
+            "img",
+            "1",
+            "512Mi",
+            crate::config::OTEL_COLLECTOR_DEFAULT_CONFIG,
+        );
+        assert!(
+            default["sidecars.otel-collector.config"].starts_with("runway default (sha256 "),
+            "{default:?}"
+        );
     }
 }
 

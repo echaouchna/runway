@@ -29,8 +29,12 @@ $ runway undeploy --stage dev --preview feature/login --yes   # one preview URL 
 | Tag keys/values, IAP service agent | kept |
 
 Order: custom domains first (nothing routes to what is being deleted), then
-schedules (nothing calls it), then every service and job, then runtime accounts, then images. An account shared by two
-services is only deleted once neither runs.
+schedules (nothing calls it) and the scheduler account, then every service
+and job, then runtime accounts, then images, and last the service holding the
+stage's lease (see [Several runs at once](how-it-works.md#several-runs-at-once)),
+so that no other run starts on the stage before the cleanup is over. An
+account shared by two services is only deleted once neither is needed any
+more.
 
 **Removed from runway.yaml.** A service or job you delete from the file is
 not deleted by `deploy`, which lists it. `--orphans` deletes the services and

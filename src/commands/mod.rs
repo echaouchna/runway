@@ -12,8 +12,10 @@ pub mod plan;
 pub mod preview;
 pub mod release;
 pub mod run_job;
+pub mod summary;
 pub mod traffic;
 pub mod undeploy;
+pub mod unlock;
 pub mod validate;
 
 use crate::cli::Context;
@@ -260,4 +262,71 @@ pub(crate) fn not_deployed(service: &str, stage: &str) -> Error {
         format!("service {service} does not exist yet"),
     )
     .hint(format!("deploy it with `runway deploy --stage {stage}`"))
+}
+
+/// The workload holding the stage's lease: the holder of the grants record.
+pub(crate) fn lease_target(
+    r: &Resolved,
+    run: &google_cloud_run_v2::client::Services,
+    jobs: Option<&google_cloud_run_v2::client::Jobs>,
+) -> Option<crate::lease::Target> {
+    let h = r.holder();
+    match (h.is_job(), jobs) {
+        (false, _) => Some(crate::lease::Target::Service {
+            run: run.clone(),
+            name: h.service_name(),
+        }),
+        (true, Some(jobs)) => Some(crate::lease::Target::Job {
+            jobs: jobs.clone(),
+            name: h.service_name(),
+        }),
+        (true, None) => None,
+    }
+}
+
+/// Takes the stage's lease for `command` (see [`crate::lease`]).
+pub(crate) async fn take_lease(
+    r: &Resolved,
+    run: &google_cloud_run_v2::client::Services,
+    jobs: Option<&google_cloud_run_v2::client::Jobs>,
+    mode: crate::lease::Mode,
+    command: &str,
+    lock: &crate::cli::LockArgs,
+    p: &Progress,
+) -> Result<crate::lease::Guard> {
+    let Some(target) = lease_target(r, run, jobs) else {
+        return Ok(crate::lease::Guard::none());
+    };
+    let h = r.holder();
+    crate::lease::acquire(target, mode, &h.app, &h.stage, command, lock.wait(), p).await
+}
+
+/// Exclusive for what changes the code or traffic of the stage; shared for
+/// a preview (it only adds its own tag).
+pub(crate) fn lease_mode(mode: &crate::traffic::Mode) -> crate::lease::Mode {
+    match mode {
+        crate::traffic::Mode::Preview { .. } => crate::lease::Mode::Shared,
+        _ => crate::lease::Mode::Exclusive,
+    }
+}
+
+/// The folder of runway.yaml (`.` when it is in the current one).
+pub(crate) fn config_dir(ctx: &Context) -> std::path::PathBuf {
+    ctx.config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| ".".into())
+}
+
+/// The commit this checkout deploys, said once.
+pub(crate) fn this_source(ctx: &Context) -> Option<crate::source::Source> {
+    let s = crate::source::current(&config_dir(ctx));
+    match &s {
+        Some(s) => ctx.progress.info(format!("source: {s}")),
+        None => ctx.progress.info(
+            "source: not a git checkout (set RUNWAY_SOURCE_COMMIT and RUNWAY_SOURCE_TIME to record it): older deploys are not detected",
+        ),
+    }
+    s
 }

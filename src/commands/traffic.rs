@@ -42,12 +42,48 @@ pub async fn run(ctx: &Context, args: TrafficArgs) -> Result<()> {
         timeout: args.timeout,
     };
     let several = services.len() > 1;
+    // Changing the split excludes deploys and other changes of the stage;
+    // showing it takes nothing.
+    let changes = args.promote || !args.set.is_empty() || !args.remove_tag.is_empty();
+    let lease = match changes {
+        false => crate::lease::Guard::none(),
+        true => {
+            let jobs = build_client!(google_cloud_run_v2::client::Jobs, session)?;
+            crate::commands::take_lease(
+                &resolved,
+                &client,
+                Some(&jobs),
+                crate::lease::Mode::Exclusive,
+                &format!("runway traffic --stage {}", args.stage.stage),
+                &args.lock,
+                &ctx.progress,
+            )
+            .await?
+        }
+    };
     let mut all = Vec::new();
     let mut promoted = false;
+    let mut failed = None;
+    let held = lease.held();
     for d in &services {
-        let (done, lines) = one_service(ctx, &args, d, &rec, several).await?;
-        promoted |= done.is_some();
-        all.push((d, lines));
+        if let Err(e) = held.check() {
+            failed = Some(e);
+            break;
+        }
+        match one_service(ctx, &args, d, &rec, several).await {
+            Ok((done, lines)) => {
+                promoted |= done.is_some();
+                all.push((d, lines));
+            }
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    lease.release(&ctx.progress).await;
+    if let Some(e) = failed {
+        return Err(e);
     }
     if args.promote && !promoted {
         return Err(Error::new(

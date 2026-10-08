@@ -12,6 +12,31 @@ migration notes.
 
 ### Added
 
+- **Several runs at once.** Runs on the same stage coordinate through a lease
+  on the stage's own Cloud Run service (annotation `runway.dev/lease`,
+  written with the etag; no lock file): deploys, canaries, traffic changes
+  and teardowns are exclusive, previews share the stage. A busy stage makes
+  a run wait and say for whom (`--wait-timeout`, default 30m; `--no-wait`).
+  Leases are renewed every 30 seconds and expire after 2 minutes;
+  `runway unlock --stage S [--yes]` shows or removes one (on services runway
+  manages only); `plan` says when the stage is busy. A run that loses its
+  lease stops before its next change; a teardown deletes the service holding
+  the lease last.
+- **Older commits are refused.** Deploys record their commit
+  (`runway.dev/source`); a deploy or canary of a commit older than the one
+  serving (by ancestry, else commit date) is refused unless `--allow-older`.
+  `RUNWAY_SOURCE_COMMIT`/`RUNWAY_SOURCE_TIME` replace git; `plan` says when a
+  deploy would be refused.
+- **Clearer plan and deploy output, nothing hidden.** Sidecars appear setting
+  by setting instead of a hash, the OpenTelemetry Collector too (a
+  configuration you wrote in full, runway's default by name and hash); step details with several changes get a line
+  each; the APIs step lists the APIs; `plan` ends with a summary; `deploy`
+  shows the time of each phase, every step (already-done ones with their
+  details too), every field a rollout sets (also when it creates a service
+  or job), and ends with each service's URL, revision, image, access, whole
+  traffic split and changes, each job, and every step. `-o json` gains
+  `changes` per service and job.
+
 - **`runway explain`.** Learn `runway.yaml` in the terminal: a full-screen
   browser of every key (what it does, default, example, rules, docs link),
   with service keys grouped by topic, search (`/`), and guide topics (stages
@@ -125,6 +150,11 @@ migration notes.
   builds about 30% faster (`docs/development.md` has the clean-up commands).
 
 ### Changed
+
+- **macOS: Apple silicon only.** Releases and the Homebrew formulas no longer
+  include an Intel (x86_64) macOS build; on an Intel Mac, build from source
+  (`cargo install --locked --git https://github.com/echaouchna/runway runway`) or use
+  the container image.
 
 - Smaller container image: `debian:trixie-slim` with only git, curl and CA
   certificates, instead of `buildpack-deps:trixie-scm` (which also shipped

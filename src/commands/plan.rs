@@ -710,6 +710,23 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
         )
         .await?;
         plan.notes.extend(version_notes);
+        // Who holds the stage, and the commit that serves.
+        if let Ok(svc) = run.get_service().set_name(d.service_name()).send().await
+            && run::ownership(&svc, &d.app, &d.stage) == Ownership::Owned
+        {
+            for l in crate::lease::status(&svc.annotations) {
+                plan.notes
+                    .push(format!("the stage is busy: {l}; deploy waits for it"));
+            }
+            let live = crate::source::Source::decode(
+                svc.annotations
+                    .get(crate::source::ANNOTATION_SOURCE)
+                    .map(String::as_str),
+            );
+            plan.notes.extend(source_note(ctx, &mode, live.as_ref()));
+        } else {
+            plan.notes.extend(source_note(ctx, &mode, None));
+        }
         (plan, dec)
     };
     plan.notes.dedup();
@@ -718,6 +735,20 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
         OutputFormat::Text => print!("{}", render_text(&plan)),
     }
     Ok(())
+}
+
+/// The commit a deploy in `mode` would come from, against the one that
+/// serves (previews do not change what serves).
+fn source_note(
+    ctx: &Context,
+    mode: &crate::traffic::Mode,
+    live: Option<&crate::source::Source>,
+) -> Option<String> {
+    if matches!(mode, crate::traffic::Mode::Preview { .. }) {
+        return None;
+    }
+    let dir = crate::commands::config_dir(ctx);
+    crate::source::plan_note(&dir, crate::source::current(&dir).as_ref(), live)
 }
 
 /// The job a deploy in `mode` changes: the job itself, or with `--preview`
@@ -819,37 +850,62 @@ pub async fn holder_record(
     run: &Services,
     jobs: &Jobs,
 ) -> Result<Vec<crate::provision::ManagedGrant>> {
-    Ok(holder_records(r, run, jobs).await?.0)
+    Ok(holder_records(r, run, jobs).await?.grants)
 }
 
 /// Grants and the custom domains record (see
 /// [`crate::domains::ANNOTATION_DOMAINS`]) on the stage's holder.
-pub async fn holder_records(
-    r: &Resolved,
-    run: &Services,
-    jobs: &Jobs,
-) -> Result<(
-    Vec<crate::provision::ManagedGrant>,
-    Option<crate::domains::Recorded>,
-)> {
+pub async fn holder_records(r: &Resolved, run: &Services, jobs: &Jobs) -> Result<HolderRecords> {
     let h = r.holder();
-    let (labels, annotations) = match h.is_job() {
+    let live = match h.is_job() {
         false => match run.get_service().set_name(h.service_name()).send().await {
-            Ok(svc) => (svc.labels, svc.annotations),
-            Err(e) if crate::gcp::is_not_found(&e) => Default::default(),
+            Ok(svc) => Some((svc.labels, svc.annotations)),
+            Err(e) if crate::gcp::is_not_found(&e) => None,
             Err(e) => return Err(crate::gcp::api_error(e, "reading the service")),
         },
         true => match jobs.get_job().set_name(h.service_name()).send().await {
-            Ok(j) => (j.labels, j.annotations),
-            Err(e) if crate::gcp::is_not_found(&e) => Default::default(),
+            Ok(j) => Some((j.labels, j.annotations)),
+            Err(e) if crate::gcp::is_not_found(&e) => None,
             Err(e) => return Err(crate::gcp::api_error(e, "reading the job")),
         },
     };
+    let exists = live.is_some();
+    let (labels, annotations) = live.unwrap_or_default();
     // Annotations on a resource runway does not own are not its record.
     if run::ownership_of(&labels, &h.app, &h.stage) != Ownership::Owned {
-        return Ok((Vec::new(), None));
+        return Ok(HolderRecords {
+            exists,
+            ..Default::default()
+        });
     }
-    Ok((recorded_grants(&annotations), domains_record(&annotations)))
+    Ok(HolderRecords {
+        exists,
+        owned: exists,
+        grants: recorded_grants(&annotations),
+        domains: domains_record(&annotations),
+        source: crate::source::Source::decode(
+            annotations
+                .get(crate::source::ANNOTATION_SOURCE)
+                .map(String::as_str),
+        ),
+        lease: crate::lease::status(&annotations),
+    })
+}
+
+/// What runway records on the stage's holder (see [`Resolved::holder`]),
+/// when runway owns it.
+#[derive(Debug, Clone, Default)]
+pub struct HolderRecords {
+    /// The holder exists (owned or not).
+    pub exists: bool,
+    /// It exists and runway owns it for this app and stage.
+    pub owned: bool,
+    pub grants: Vec<crate::provision::ManagedGrant>,
+    pub domains: Option<crate::domains::Recorded>,
+    /// The commit that serves.
+    pub source: Option<crate::source::Source>,
+    /// Who holds the stage's lease (descriptions).
+    pub lease: Vec<String>,
 }
 
 pub fn domains_record(
@@ -971,7 +1027,12 @@ async fn stack_plan(
         futures::future::join_all(schedule_steps.iter().map(|s| prov.check(s, true))).await,
     );
     // Removals: only a full deploy of every service and job makes them.
-    let (recorded, domains_previous) = holder_records(r, &run, &jobs).await?;
+    let records = holder_records(r, &run, &jobs).await?;
+    let (recorded, domains_previous) = (records.grants.clone(), records.domains.clone());
+    for l in &records.lease {
+        notes.push(format!("the stage is busy: {l}; deploy waits for it"));
+    }
+    notes.extend(source_note(ctx, mode, records.source.as_ref()));
     // Custom domains change with a full deploy (removals: of everything).
     match crate::provision::domains_step(r, domains_previous, only.is_empty()) {
         Some(s) if full => steps.push(prov.check(&s, true).await),

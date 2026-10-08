@@ -190,6 +190,7 @@ async fn tear_down(
     r: &Resolved,
     c: &Clients,
     s: &MockServer,
+    last: Option<&str>,
 ) -> Vec<runway::commands::undeploy::Item> {
     let prov = Provisioner::with_endpoints(r.first(), &c.session, &c.run, &endpoints(&s.uri()))
         .await
@@ -230,6 +231,7 @@ async fn tear_down(
         &mut items,
         false,
         Duration::from_secs(5),
+        last,
     )
     .await
     .unwrap();
@@ -242,7 +244,7 @@ async fn a_shared_account_is_deleted_after_every_service() {
     let sa_path = mount_two_services(&s).await;
     let c = clients(&s).await;
     let (_dir, r) = resolved("service: {}\nservices: {web: {}}");
-    let _ = tear_down(&r, &c, &s).await;
+    let _ = tear_down(&r, &c, &s, None).await;
     let order: Vec<String> = s
         .received_requests()
         .await
@@ -253,6 +255,34 @@ async fn a_shared_account_is_deleted_after_every_service() {
         .collect();
     assert_eq!(order.len(), 3, "{order:?}");
     assert_eq!(order[2], sa_path, "the account goes last: {order:?}");
+}
+
+#[tokio::test]
+async fn the_workload_holding_the_lease_is_deleted_last() {
+    let s = MockServer::start().await;
+    let sa_path = mount_two_services(&s).await;
+    let c = clients(&s).await;
+    let (_dir, r) = resolved("service: {}\nservices: {web: {}}");
+    let holder = r.holder().service_name();
+    assert!(holder.ends_with("/services/shop-prod"));
+    let _ = tear_down(&r, &c, &s, Some(&holder)).await;
+    let order: Vec<String> = s
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|q| q.method.as_str() == "DELETE")
+        .map(|q| q.url.path().to_string())
+        .collect();
+    assert_eq!(
+        order,
+        [
+            format!("/v2/{PARENT}/services/shop-web-prod"),
+            sa_path,
+            format!("/v2/{holder}"),
+        ],
+        "the lease stays in force until the end of the teardown"
+    );
 }
 
 /// Two services share the account with different roles; `main_create` is
@@ -282,7 +312,7 @@ async fn shared_account_with_different_roles(main_create: bool) {
         "service:\n  identity: {{create: {main_create}, roles: [{{role: roles/viewer, project: my-gcp-project}}]}}\n\
          services:\n  web:\n    identity: {{create: true, roles: [{{role: roles/logging.viewer, project: my-gcp-project}}]}}",
     ));
-    let items = tear_down(&r, &c, &s).await;
+    let items = tear_down(&r, &c, &s, None).await;
     // The plan says what execution does: the account goes, both roles too.
     let action = |res: &str| items.iter().find(|i| i.resource == res).map(|i| i.action);
     assert_eq!(
@@ -488,4 +518,73 @@ async fn leftover_schedules_are_found_in_the_scheduler_region() {
         .unwrap();
     let left = prov.orphan_schedules().await.unwrap();
     assert_eq!(left, vec![Step::Unschedule { name: mine }]);
+}
+
+#[tokio::test]
+async fn an_update_never_overwrites_another_run_s_lease() {
+    let s = MockServer::start().await;
+    let (_dir, r) = resolved("service: {}");
+    let d = r.first();
+    let now = chrono::Utc::now();
+    let entry = |id: &str| runway::lease::Holder {
+        id: id.into(),
+        mode: runway::lease::Mode::Exclusive,
+        by: format!("run {id}"),
+        since: now,
+        until: now + chrono::Duration::minutes(2),
+    };
+    let lease = |id: &str| {
+        runway::lease::Lease::default()
+            .with(entry(id), now)
+            .encode()
+            .unwrap()
+    };
+    let name = d.service_name();
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{name}")))
+        .respond_with(ok(
+            json!({"name": name, "labels": owned_labels(), "etag": "\"e\"",
+            "annotations": {(runway::lease::ANNOTATION_LEASE): lease("theirs")}}),
+        ))
+        .mount(&s)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ok(json!({})))
+        .expect(0)
+        .mount(&s)
+        .await;
+    let c = clients(&s).await;
+    let progress = Progress::silent();
+    let rec = Reconciler {
+        run: &c.run,
+        revisions: None,
+        progress: &progress,
+        poll: PollConfig::fast(),
+        timeout: Duration::from_secs(5),
+    };
+    // This run's rollout of the holder carries its own lease (it was a first
+    // deploy when it started; another run created the service since).
+    let spec = runway::plan::ServiceSpec::from_deployment(
+        d,
+        IMAGE,
+        [(runway::lease::ANNOTATION_LEASE.to_string(), lease("mine"))].into(),
+    );
+    let existing = rec.get(&name).await.unwrap();
+    let parent = d.parent();
+    let t = runway::deploy::Target {
+        parent: &parent,
+        service_id: &d.service_id,
+        name: &name,
+        app: &d.app,
+        stage: &d.stage,
+        adopt: false,
+        force: true,
+    };
+    let e = rec.apply(&t, &spec, existing).await.expect_err("refused");
+    assert_eq!(e.kind, runway::error::ErrorKind::Conflict);
+    assert!(
+        e.message.contains("another runway run holds shop-prod"),
+        "{}",
+        e.message
+    );
 }

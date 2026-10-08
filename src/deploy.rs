@@ -246,6 +246,20 @@ impl Reconciler<'_> {
                             match self.get(name).await? {
                                 Some(svc) => {
                                     check_ownership(&svc, app, stage, false)?;
+                                    // A first deploy whose service another
+                                    // run created meanwhile: that run holds
+                                    // the stage, this one stops.
+                                    if let Some(e) = crate::lease::created_by_other(
+                                        spec.annotations
+                                            .get(crate::lease::ANNOTATION_LEASE)
+                                            .map(String::as_str),
+                                        svc.annotations
+                                            .get(crate::lease::ANNOTATION_LEASE)
+                                            .map(String::as_str),
+                                        service_id,
+                                    ) {
+                                        return Err(e);
+                                    }
                                     if ambiguous
                                         && diff(&run::observed_flat(&svc), &desired_flat).is_empty()
                                     {
@@ -277,6 +291,20 @@ impl Reconciler<'_> {
                 }
                 Some(current) => {
                     check_ownership(&current, app, stage, adopt)?;
+                    // The holder's rollout carries this run's lease: never
+                    // overwrite one another run holds.
+                    if let Some(e) = crate::lease::created_by_other(
+                        spec.annotations
+                            .get(crate::lease::ANNOTATION_LEASE)
+                            .map(String::as_str),
+                        current
+                            .annotations
+                            .get(crate::lease::ANNOTATION_LEASE)
+                            .map(String::as_str),
+                        service_id,
+                    ) {
+                        return Err(e);
+                    }
                     if !force
                         && run::ownership(&current, app, stage) == Ownership::Owned
                         && run::pending_changes(&current, spec).is_empty()

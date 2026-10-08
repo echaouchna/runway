@@ -243,6 +243,8 @@ pub enum Command {
     Undeploy(UndeployArgs),
     /// Run a Cloud Run job of the stage now (optionally wait for it to finish).
     RunJob(RunJobArgs),
+    /// Show who holds the stage's lease, or remove it (a run that was killed).
+    Unlock(UnlockArgs),
     /// Print a shell completion script (bash, zsh, fish, nushell, xonsh, elvish, powershell).
     Completions(CompletionsArgs),
 }
@@ -311,6 +313,8 @@ pub struct PreviewDeleteArgs {
     /// Maximum time to wait for Cloud Run.
     #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
     pub timeout: std::time::Duration,
+    #[command(flatten)]
+    pub lock: LockArgs,
 }
 
 #[derive(Debug, Args)]
@@ -340,6 +344,8 @@ pub struct PreviewPruneArgs {
     /// Maximum time to wait for Cloud Run.
     #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
     pub timeout: std::time::Duration,
+    #[command(flatten)]
+    pub lock: LockArgs,
 }
 
 #[derive(Debug, Args)]
@@ -356,6 +362,8 @@ pub struct TrafficArgs {
     /// Remove a tag and its URL (for example a merged branch's preview), repeatable.
     #[arg(long, value_name = "NAME")]
     pub remove_tag: Vec<String>,
+    #[command(flatten)]
+    pub lock: LockArgs,
     /// Maximum time to wait for the change to be applied.
     #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
     pub timeout: std::time::Duration,
@@ -382,6 +390,8 @@ pub struct UndeployArgs {
     /// default: once deleted, anyone can claim the name).
     #[arg(long)]
     pub release_urls: bool,
+    #[command(flatten)]
+    pub lock: LockArgs,
     /// Maximum time to wait for the service deletion.
     #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
     pub timeout: std::time::Duration,
@@ -497,6 +507,27 @@ pub struct PlanArgs {
     pub traffic: Option<u32>,
 }
 
+/// Waiting for other runway runs on the stage (see [`crate::lease`]).
+#[derive(Debug, Clone, Args)]
+pub struct LockArgs {
+    /// Longest wait for another runway run on the same stage (a deploy,
+    /// canary, traffic change or teardown) to finish.
+    #[arg(long, default_value = "30m", value_parser = humantime::parse_duration, env = "RUNWAY_WAIT_TIMEOUT")]
+    pub wait_timeout: std::time::Duration,
+    /// Fail at once when another runway run holds the stage.
+    #[arg(long)]
+    pub no_wait: bool,
+}
+
+impl LockArgs {
+    pub fn wait(&self) -> crate::lease::Wait {
+        crate::lease::Wait {
+            timeout: (!self.no_wait).then_some(self.wait_timeout),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct DeployArgs {
     #[command(flatten)]
@@ -537,6 +568,22 @@ pub struct DeployArgs {
     /// Initial delay between retries, doubling each time (overrides `retry.delay`).
     #[arg(long, value_parser = humantime::parse_duration)]
     pub retry_delay: Option<std::time::Duration>,
+    /// Deploy even if the stage runs a newer commit than this checkout (a
+    /// rollback on purpose).
+    #[arg(long)]
+    pub allow_older: bool,
+    #[command(flatten)]
+    pub lock: LockArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct UnlockArgs {
+    /// Stage whose lease to show or remove.
+    #[arg(short, long, env = "RUNWAY_STAGE")]
+    pub stage: String,
+    /// Remove the lease (without it, only show who holds it).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -620,6 +667,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Deploy(a) => commands::deploy::run(&ctx, a).await,
         Command::Info(a) => commands::info::run(&ctx, a).await,
         Command::RunJob(a) => commands::run_job::run(&ctx, a).await,
+        Command::Unlock(a) => commands::unlock::run(&ctx, a).await,
         Command::Logs(a) => commands::logs::run(&ctx, a).await,
         Command::Describe(a) => commands::describe::run(&ctx, a),
         Command::Explain(a) => crate::explain::run(&ctx, a),

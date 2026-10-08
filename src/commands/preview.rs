@@ -100,49 +100,79 @@ pub async fn run(ctx: &Context, action: PreviewAction) -> Result<()> {
         _ => None,
     };
     let several = selected.len() > 1;
-    let mut reports = Vec::new();
-    for d in selected.iter().filter(|d| !d.is_job()) {
-        let svc = match rec.get(&d.service_name()).await? {
-            Some(svc) => svc,
-            None if several => {
-                ctx.progress
-                    .info(format!("{} is not deployed", d.service_id));
-                continue;
-            }
-            None => return Err(not_deployed(&d.service_id, &d.stage)),
-        };
-        check_ownership(&svc, &d.app, &d.stage, false)?;
-        let lines = tagged_lines(&svc, &revisions).await?;
-        reports.push(match &action {
-            PreviewAction::List(_) => PreviewReport {
-                service: d.service_id.clone(),
-                action: "list",
-                applied: false,
-                base: None,
-                notes: vec![],
-                previews: lines,
-            },
-            PreviewAction::Delete(a) => {
-                delete(ctx, d, &rec, &revisions, &svc, lines, a, &basis).await?
-            }
-            PreviewAction::Prune(a) => {
-                let info = info.as_ref().expect("read for prune");
-                prune(ctx, d, &rec, &revisions, &svc, lines, a, info, &basis).await?
-            }
-        });
-    }
-    for d in selected.iter().filter(|d| d.is_job()) {
-        let r = preview_jobs(ctx, d, &jobs, &action, info.as_ref(), &basis).await?;
-        if !r.previews.is_empty() || !several {
-            reports.push(r);
+    // Deleting previews shares the stage with other previews (each removes
+    // only its own tags) and waits for deploys and traffic changes.
+    let lock = match &action {
+        PreviewAction::Delete(a) if a.yes => Some((&a.lock, "delete")),
+        PreviewAction::Prune(a) if a.yes => Some((&a.lock, "prune")),
+        _ => None,
+    };
+    let lease = match lock {
+        None => crate::lease::Guard::none(),
+        Some((lock, verb)) => {
+            crate::commands::take_lease(
+                &resolved,
+                &services,
+                Some(&jobs),
+                crate::lease::Mode::Shared,
+                &format!("runway preview {verb} --stage {stage}"),
+                lock,
+                &ctx.progress,
+            )
+            .await?
         }
+    };
+    let held = lease.held();
+    let outcome = async {
+        let mut reports = Vec::new();
+        for d in selected.iter().filter(|d| !d.is_job()) {
+            held.check()?;
+            let svc = match rec.get(&d.service_name()).await? {
+                Some(svc) => svc,
+                None if several => {
+                    ctx.progress
+                        .info(format!("{} is not deployed", d.service_id));
+                    continue;
+                }
+                None => return Err(not_deployed(&d.service_id, &d.stage)),
+            };
+            check_ownership(&svc, &d.app, &d.stage, false)?;
+            let lines = tagged_lines(&svc, &revisions).await?;
+            reports.push(match &action {
+                PreviewAction::List(_) => PreviewReport {
+                    service: d.service_id.clone(),
+                    action: "list",
+                    applied: false,
+                    base: None,
+                    notes: vec![],
+                    previews: lines,
+                },
+                PreviewAction::Delete(a) => {
+                    delete(ctx, d, &rec, &revisions, &svc, lines, a, &basis).await?
+                }
+                PreviewAction::Prune(a) => {
+                    let info = info.as_ref().expect("read for prune");
+                    prune(ctx, d, &rec, &revisions, &svc, lines, a, info, &basis).await?
+                }
+            });
+        }
+        for d in selected.iter().filter(|d| d.is_job()) {
+            held.check()?;
+            let r = preview_jobs(ctx, d, &jobs, &action, info.as_ref(), &basis).await?;
+            if !r.previews.is_empty() || !several {
+                reports.push(r);
+            }
+        }
+        match (ctx.output, reports.len()) {
+            (OutputFormat::Json, 1) => print_json(&reports[0]),
+            (OutputFormat::Json, _) => print_json(&reports),
+            (OutputFormat::Text, _) => reports.iter().for_each(print_text),
+        }
+        Ok(())
     }
-    match (ctx.output, reports.len()) {
-        (OutputFormat::Json, 1) => print_json(&reports[0]),
-        (OutputFormat::Json, _) => print_json(&reports),
-        (OutputFormat::Text, _) => reports.iter().for_each(print_text),
-    }
-    Ok(())
+    .await;
+    lease.release(&ctx.progress).await;
+    outcome
 }
 
 /// Preview copies of a job (`deploy --preview` creates `{job}-{tag}`), as

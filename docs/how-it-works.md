@@ -193,6 +193,63 @@ happen in batches every few seconds.
 each as `=` done, `+` pending or `?` unknown (for example, when the deployer
 cannot read a policy).
 
+## Several runs at once
+
+Two pipelines, or a pipeline and a person, may run runway on the same stage
+at the same time. runway coordinates them without a lock file or any extra
+resource: the stage's own Cloud Run service (the main one, else the first
+service, else the first job) carries a **lease** (annotation
+`runway.dev/lease`), written with the service's etag so that two runs can
+never both take it.
+
+| Run | Lease | Waits for |
+|---|---|---|
+| `deploy`, `deploy --traffic N` (canary) | exclusive | any other run on the stage |
+| `traffic --promote / --set / --remove-tag` | exclusive | any other run |
+| `undeploy --yes` | exclusive | any other run |
+| `deploy --preview NAME`, `preview delete/prune --yes`, `undeploy --preview NAME --yes` | shared | exclusive runs only: previews of different branches run together |
+| `plan`, `info`, `logs`, `describe`, `explain`, `doctor`, `run-job`, dry runs | none | nothing |
+
+Different stages and different apps never wait for each other.
+
+- A run that finds the stage busy waits, and says for whom:
+  `waiting for the exclusive lease on shop-prod (1m10s so far): exclusive lease held by gitlab job 4711 (main @ 3f2a1c) …`.
+  `--wait-timeout 30m` (default; also `RUNWAY_WAIT_TIMEOUT`) bounds the wait,
+  `--no-wait` fails at once (exit code 7, conflict).
+- A lease counts once its write has completed and the service carries it.
+- The lease is renewed every 30 seconds and expires 2 minutes after the last
+  renewal: a killed runner blocks the stage for at most 2 minutes.
+  `runway unlock --stage S` shows who holds it, `--yes` removes it (only on a
+  service runway manages for this app and stage).
+- A run that loses its lease (removed by `unlock`, or not renewed in time
+  and taken over) is told so before its next change (every provisioning step,
+  rollout, job update and deletion checks first) and stops; a lost lease is
+  never taken back silently.
+- A first deploy has no service yet: it creates the service with its lease.
+  If another run creates it first, this run takes the lease on it (or waits),
+  then reads the stage again (what that run deployed, the commit it recorded)
+  before changing anything; the rollout of the holder never overwrites a lease
+  another run holds.
+- A teardown deletes the service holding the lease last, after accounts and
+  images: the lease keeps other runs out until the cleanup is over.
+- `plan` says when the stage is busy.
+
+**Older commits are refused.** A deploy records the commit it comes from on
+the same service (`runway.dev/source`). A deploy (or canary) of an older
+commit than the one already serving is refused, so that two pipelines
+finishing out of order cannot roll production back:
+
+```text
+error: refusing to deploy commit 1a2b3c4d5e6f of 2026-10-08 21:02:11 UTC to stage prod: it is older than the deployed commit 9f8e7d6c5b4a of 2026-10-08 21:40:05 UTC (1a2b3c4d5e6f is an ancestor of the deployed commit)
+  hint: deploy the newer commit (for example after pulling), or pass `--allow-older` to roll back on purpose
+```
+
+"Older" means an ancestor of the deployed commit when the checkout knows both
+commits, else an earlier commit date. Previews are never refused (they do not
+change what serves). Outside a git checkout, set `RUNWAY_SOURCE_COMMIT` and
+`RUNWAY_SOURCE_TIME` (RFC 3339 or Unix seconds); without either, the check is
+skipped and runway says so. `plan` says whether the deploy would be refused.
+
 ## Failure handling and recovery
 
 There is no cross-service transaction; every step is safe to retry and

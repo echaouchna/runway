@@ -42,6 +42,8 @@ pub struct DeployResult {
     pub revision: String,
     pub image: String,
     pub change: ServiceChange,
+    /// Every field the rollout changed (all of them for a new service).
+    pub changes: Vec<crate::plan::FieldChange>,
     pub public: bool,
     pub access_change: AccessChange,
     pub iap: bool,
@@ -74,10 +76,23 @@ pub fn effective_retry(d: &Deployment, args: &DeployArgs) -> RetryConfig {
     r
 }
 
+/// A provisioning step as it completes: what it is, then what it did
+/// (several changes on lines of their own). Nothing is left out.
 pub(crate) fn report_step(p: &Progress, r: &StepResult) {
+    let (first, rest) = match r.detail.split_once('\n') {
+        Some((a, b)) => (a, Some(b)),
+        None => (r.detail.as_str(), None),
+    };
+    let line = match first.is_empty() {
+        true => r.step.clone(),
+        false => format!("{}: {first}", r.step),
+    };
     match r.outcome {
-        StepOutcome::Changed => p.success(format!("{}: {}", r.step, r.detail)),
-        StepOutcome::Unchanged => p.info(format!("= {} (already done)", r.step)),
+        StepOutcome::Changed => p.success(line),
+        StepOutcome::Unchanged => p.info(format!("= {line}")),
+    }
+    if let Some(rest) = rest {
+        p.details(rest);
     }
 }
 
@@ -271,6 +286,20 @@ async fn run_single(
     for n in version_notes {
         p.info(n);
     }
+
+    // The stage's lease: other deploys, canaries, traffic changes and
+    // teardowns of the stage wait for this run (previews share it).
+    let mut lease = crate::commands::take_lease(
+        resolved,
+        &run_client,
+        None,
+        crate::commands::lease_mode(&mode),
+        &command_line(&d.stage, &mode),
+        &args.lock,
+        p,
+    )
+    .await?;
+    let outcome = async {
     // `--tag` with release candidates: the candidate's image, nothing built.
     // Only looked up here (the APIs are enabled); it is copied into the
     // stage's release repository by the release step, once provisioned.
@@ -294,7 +323,7 @@ async fn run_single(
 
     // 2. Inspect: read the live service while hashing the source and resolving
     //    the image (all read-only). Ownership is checked before any change.
-    let (existing, decision) = with_retry(&retry, p, "inspect current state", |_| async {
+    let (mut existing, decision) = with_retry(&retry, p, "inspect current state", |_| async {
         let mut notes = Vec::new();
         let (existing, decision) = tokio::join!(
             reconciler.get(&name),
@@ -305,6 +334,52 @@ async fn run_single(
     .await?;
     if let Some(svc) = &existing {
         check_ownership(svc, &d.app, &d.stage, args.adopt)?;
+    }
+    // A first deploy whose service another run created since: take the lease
+    // on it (or wait) before changing anything.
+    if lease
+        .confirm(&d.app, &d.stage, args.lock.wait(), p)
+        .await?
+    {
+        // It was created (and maybe deployed) while this run waited: what was
+        // read before is stale (its recorded commit, grants, domains).
+        p.info(format!(
+            "{} was created by another run meanwhile: reading it again",
+            d.service_id
+        ));
+        existing = with_retry(&retry, p, "inspect current state", |_| reconciler.get(&name))
+            .await?;
+        if let Some(svc) = &existing {
+            check_ownership(svc, &d.app, &d.stage, args.adopt)?;
+        }
+    }
+    let held = lease.held();
+    provisioner.hold(held.clone());
+    // A deploy of an older commit than the one serving is refused (previews
+    // do not change what serves).
+    let source = crate::commands::this_source(ctx);
+    let records_source = !matches!(mode, crate::traffic::Mode::Preview { .. });
+    if records_source {
+        let live = existing
+            .as_ref()
+            .filter(|svc| run::ownership(svc, &d.app, &d.stage) == run::Ownership::Owned)
+            .and_then(|svc| {
+                crate::source::Source::decode(
+                    svc.annotations
+                        .get(crate::source::ANNOTATION_SOURCE)
+                        .map(String::as_str),
+                )
+            });
+        if let Some(l) = &live {
+            p.info(format!("deployed: {l}"));
+        }
+        crate::source::check(
+            &crate::commands::config_dir(ctx),
+            source.as_ref(),
+            live.as_ref(),
+            &d.stage,
+            args.allow_older,
+        )?;
     }
     // Grants recorded on the service by earlier deploys (see `managed_grants`).
     let recorded = existing
@@ -490,6 +565,11 @@ async fn run_single(
     // 5. Service.
     // Release tag on the image, once its digest is known.
     let mut annotations = decision.annotations.clone();
+    // The rollout carries this run's lease: it creates the service with it
+    // (a first deploy), and an update never overwrites another run's.
+    if let Some((k, v)) = lease.annotation() {
+        annotations.insert(k, v);
+    }
     // The grants runway granted (never those it found in place), and those
     // removed from runway.yaml, which stay recorded until they are revoked.
     let desired_grants = managed_grants(d);
@@ -556,15 +636,20 @@ async fn run_single(
             "create the service"
         };
         with_retry(&retry, p, what, |attempt| {
-            roll_out(
-                &reconciler,
-                d,
-                &name,
-                &placeholder,
-                if attempt == 1 { Some(None) } else { None },
-                false,
-                p,
-            )
+            let (held, reconciler, name, placeholder) = (&held, &reconciler, &name, &placeholder);
+            async move {
+                held.check()?;
+                roll_out(
+                    reconciler,
+                    d,
+                    name,
+                    placeholder,
+                    if attempt == 1 { Some(None) } else { None },
+                    false,
+                    p,
+                )
+                .await
+            }
         })
         .await?;
         existing = reconciler.get(&name).await?;
@@ -614,9 +699,11 @@ async fn run_single(
     });
     let (reconciler_ref, name_ref, spec_ref) = (&reconciler, &name, &base_spec);
     let adopt = args.adopt;
-    let (applied, svc) = with_retry(&retry, p, "deploy service", |attempt| {
+    let held_ref = &held;
+    let (applied, svc, changes) = with_retry(&retry, p, "deploy service", |attempt| {
         let known = if attempt == 1 { Some(existing.clone()) } else { None };
         async move {
+            held_ref.check()?;
             roll_out(reconciler_ref, d, name_ref, spec_ref, known, adopt, p)
                 .await
                 .map_err(|mut e| {
@@ -725,11 +812,26 @@ async fn run_single(
     }
 
     // 7. Public access.
-    let access_change = with_retry(&retry, p, "invoker access", |_| {
-        reconciler.ensure_access(&name, d.service.public)
+    let access_change = with_retry(&retry, p, "invoker access", |_| async {
+        held.check()?;
+        reconciler.ensure_access(&name, d.service.public).await
     })
     .await
     .map_err(|e| after_rollout(e, d, url.as_deref()))?;
+
+    // What serves now comes from this commit: a later deploy of an older one
+    // is refused.
+    if records_source && let Some(src) = &source {
+        let value = src.encode();
+        with_retry(&retry, p, "record the deployed commit", |_| async {
+            held.check()?;
+            reconciler
+                .set_annotation(&name, crate::source::ANNOTATION_SOURCE, &value)
+                .await
+        })
+        .await
+        .map_err(|e| after_rollout(e, d, url.as_deref()))?;
+    }
 
     let result = DeployResult {
         app: d.app.clone(),
@@ -745,6 +847,7 @@ async fn run_single(
             .unwrap_or_else(|| run::short_revision(&svc.latest_ready_revision).to_string()),
         image,
         change: applied.change,
+        changes,
         public: d.service.public,
         access_change,
         iap: d.service.iap.enabled,
@@ -772,6 +875,22 @@ async fn run_single(
         ));
     }
     Ok(())
+    }
+    .await;
+    lease.release(p).await;
+    outcome
+}
+
+/// `runway deploy --stage S [--preview T | --traffic N]`, for leases.
+pub(crate) fn command_line(stage: &str, mode: &crate::traffic::Mode) -> String {
+    format!(
+        "runway deploy --stage {stage}{}",
+        match mode {
+            crate::traffic::Mode::Full => String::new(),
+            crate::traffic::Mode::Preview { tag } => format!(" --preview {tag}"),
+            crate::traffic::Mode::Canary { percent } => format!(" --traffic {percent}"),
+        }
+    )
 }
 
 /// [`Reconciler::save_grant_record`], warning when it fails: before a failure
@@ -804,7 +923,7 @@ pub(crate) async fn roll_out(
     known: Option<Option<Service>>,
     adopt: bool,
     p: &Progress,
-) -> Result<(Applied, Service)> {
+) -> Result<(Applied, Service, Vec<crate::plan::FieldChange>)> {
     let existing = match known {
         Some(e) => e,
         None => reconciler.get(name).await?,
@@ -856,16 +975,20 @@ pub(crate) async fn roll_out(
         );
         force = true;
     }
-    if let Some(svc) = &existing {
-        for c in run::pending_changes(svc, &spec) {
-            match (&c.before, &c.after) {
-                (Some(b), Some(a)) => p.info(format!("~ {}: {b} -> {a}", c.field)),
-                (None, Some(a)) => p.info(format!("+ {}: {a}", c.field)),
-                (Some(b), None) => p.info(format!("- {}: {b}", c.field)),
-                (None, None) => {}
-            }
-        }
-    }
+    // Every field this rollout changes (all of them for a new service).
+    let changes: Vec<crate::plan::FieldChange> = match &existing {
+        Some(svc) => run::pending_changes(svc, &spec),
+        None => spec
+            .flatten()
+            .into_iter()
+            .map(|(field, v)| crate::plan::FieldChange {
+                field,
+                before: None,
+                after: Some(v),
+            })
+            .collect(),
+    };
+    p.details(&change_lines(&changes));
     let parent = d.parent();
     let target = Target {
         parent: &parent,
@@ -890,7 +1013,22 @@ pub(crate) async fn roll_out(
             reconciler.wait_ready(name, &applied).await?
         }
     };
-    Ok((applied, svc))
+    Ok((applied, svc, changes))
+}
+
+/// `+ field: value`, `~ field: before -> after`, `- field: before`, one per
+/// line.
+pub(crate) fn change_lines(changes: &[crate::plan::FieldChange]) -> String {
+    changes
+        .iter()
+        .filter_map(|c| match (&c.before, &c.after) {
+            (Some(b), Some(a)) => Some(format!("~ {}: {b} -> {a}", c.field)),
+            (None, Some(a)) => Some(format!("+ {}: {a}", c.field)),
+            (Some(b), None) => Some(format!("- {}: {b}", c.field)),
+            (None, None) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What a first `bootstrap` run creates: by default the real service with the
@@ -934,7 +1072,14 @@ pub fn bootstrap_spec(
         vpc: None,
         cloud_sql: Vec::new(),
         custom_audiences: Vec::new(),
-        annotations: [("runway.dev/bootstrap".to_string(), image.clone())].into(),
+        // The creation lease of a first deploy goes with the placeholder.
+        annotations: std::iter::once(("runway.dev/bootstrap".to_string(), image.clone()))
+            .chain(
+                real.annotations
+                    .get(crate::lease::ANNOTATION_LEASE)
+                    .map(|v| (crate::lease::ANNOTATION_LEASE.to_string(), v.clone())),
+            )
+            .collect(),
         revision_annotations: Default::default(),
         traffic: Default::default(),
     }
@@ -949,65 +1094,68 @@ pub(crate) fn tagged_url(svc: &google_cloud_run_v2::model::Service, tag: &str) -
 }
 
 fn print_text(p: &Progress, r: &DeployResult) {
-    let verb = match r.change {
-        ServiceChange::Created => "created",
-        ServiceChange::Updated => "updated",
-        ServiceChange::Unchanged => "unchanged",
-    };
-    p.success(format!("{} {verb} in {}s", r.service, r.duration_seconds));
+    use crate::commands::summary as sm;
     let c = crate::style::out();
-    println!("Service:  {}", c.bold(&r.service));
-    println!(
-        "URL:      {}",
-        c.bold_cyan(r.url.as_deref().unwrap_or("(none)"))
-    );
-    println!("Revision: {}", r.revision);
+    p.success(format!(
+        "{} {} in {}",
+        r.service,
+        sm::service_change(r.change),
+        crate::lease::short_duration(std::time::Duration::from_secs(r.duration_seconds))
+    ));
+    let mut s = sm::heading(&c, &format!("Service {}", r.service));
+    s.push_str(&sm::field(&c, "Change", sm::service_change(r.change)));
+    s.push_str(&sm::field(
+        &c,
+        "URL",
+        &c.bold_cyan(r.url.as_deref().unwrap_or("(none)")),
+    ));
+    s.push_str(&sm::field(&c, "Revision", &r.revision));
     match (&r.traffic_mode, &r.revision_url) {
-        (crate::traffic::Mode::Preview { tag }, url) => println!(
-            "Preview:  {} (tag {tag}, no traffic)",
-            c.bold_cyan(url.as_deref().unwrap_or("(URL not reported yet)"))
-        ),
-        (crate::traffic::Mode::Canary { percent }, url) => println!(
-            "Canary:   {} ({percent}% of the traffic; `runway traffic --promote` to finish)",
-            c.bold_cyan(url.as_deref().unwrap_or("(URL not reported yet)"))
-        ),
+        (crate::traffic::Mode::Preview { tag }, url) => s.push_str(&sm::field(
+            &c,
+            "Preview",
+            &format!(
+                "{} (tag {tag}, no traffic)",
+                c.bold_cyan(url.as_deref().unwrap_or("(URL not reported yet)"))
+            ),
+        )),
+        (crate::traffic::Mode::Canary { percent }, url) => s.push_str(&sm::field(
+            &c,
+            "Canary",
+            &format!(
+                "{} ({percent}% of the traffic; `runway traffic --promote` finishes it)",
+                c.bold_cyan(url.as_deref().unwrap_or("(URL not reported yet)"))
+            ),
+        )),
         _ => {}
     }
-    if r.traffic.len() > 1 {
-        crate::commands::info::print_traffic(&r.traffic);
-    }
-    println!("Image:    {}", r.image);
+    s.push_str(&sm::field(&c, "Image", &r.image));
     if let Some(rel) = &r.release {
-        println!("Release:  {}", c.bold_green(&rel.tag));
+        s.push_str(&sm::field(&c, "Release", &c.bold_green(&rel.tag)));
     }
-    let access = match (r.iap, r.public) {
-        (true, _) => "Identity-Aware Proxy (signed-in members only)",
-        (false, true) => "public (allUsers can invoke)",
-        (false, false) => "private (requires an identity token with roles/run.invoker)",
-    };
-    println!("Access:   {access}");
-    if !r.steps.is_empty() {
-        let changed = r
-            .steps
-            .iter()
-            .filter(|s| s.outcome == StepOutcome::Changed)
-            .count();
-        println!(
-            "Steps:    {} provisioning step(s), {} changed, {} already done",
-            r.steps.len(),
-            c.green(&changed.to_string()),
-            r.steps.len() - changed
-        );
-    }
+    s.push_str(&sm::field(
+        &c,
+        "Access",
+        &sm::access(&c, r.iap, r.public, &r.access_change),
+    ));
+    s.push_str(&sm::field(&c, "Traffic", ""));
+    s.push_str(&sm::traffic(&c, &r.traffic, "    "));
+    s.push_str(&sm::heading(
+        &c,
+        &format!("Changes to {} ({})", r.service, r.changes.len()),
+    ));
+    s.push_str(&sm::changes(&c, &r.changes, "  "));
+    s.push_str(&sm::steps(&c, &r.steps));
     if !r.public
         && !r.iap
         && let Some(u) = &r.url
     {
-        println!();
-        println!(
-            "Try it:   curl -H \"Authorization: Bearer $(gcloud auth print-identity-token)\" {u}"
-        );
+        s.push_str(&format!(
+            "\n{} curl -H \"Authorization: Bearer $(gcloud auth print-identity-token)\" {u}\n",
+            c.bold("Try it:")
+        ));
     }
+    print!("{s}");
 }
 
 #[cfg(test)]

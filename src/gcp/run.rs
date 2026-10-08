@@ -127,6 +127,29 @@ pub(crate) fn app_container_and_volumes(spec: &ServiceSpec) -> (Container, Vec<V
     (container, volumes)
 }
 
+/// Annotations a rollout keeps from the live resource: the lease (only the
+/// lease code changes it, with the etag; see [`crate::lease`]) and the
+/// recorded source commit (unless the spec sets it).
+pub fn keep_live(
+    annotations: &mut BTreeMap<String, String>,
+    live: &std::collections::HashMap<String, String>,
+) {
+    match live.get(crate::lease::ANNOTATION_LEASE) {
+        Some(v) => {
+            annotations.insert(crate::lease::ANNOTATION_LEASE.into(), v.clone());
+        }
+        // Released (or removed) since the spec was built: not brought back.
+        None => {
+            annotations.remove(crate::lease::ANNOTATION_LEASE);
+        }
+    }
+    if let Some(v) = live.get(crate::source::ANNOTATION_SOURCE) {
+        annotations
+            .entry(crate::source::ANNOTATION_SOURCE.into())
+            .or_insert_with(|| v.clone());
+    }
+}
+
 pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service>) -> Service {
     let mut labels: BTreeMap<String, String> = existing
         .map(|s| {
@@ -149,6 +172,9 @@ pub fn desired_service(spec: &ServiceSpec, name: &str, existing: Option<&Service
         })
         .unwrap_or_default();
     annotations.extend(spec.annotations.clone());
+    if let Some(s) = existing {
+        keep_live(&mut annotations, &s.annotations);
+    }
 
     let (container, volumes) = app_container_and_volumes(spec);
     let container = container.set_ports([ContainerPort::new()
@@ -540,7 +566,15 @@ pub fn spec_for_live(spec: &ServiceSpec, svc: Option<&Service>) -> ServiceSpec {
 pub fn annotations_current(svc: &Service, spec: &ServiceSpec) -> bool {
     spec.annotations
         .iter()
+        .filter(|(k, _)| !is_coordination(k))
         .all(|(k, v)| svc.annotations.get(k) == Some(v))
+}
+
+/// Annotations that coordinate runs, not configuration: the lease (its
+/// expiry changes with every renewal) and the recorded commit. They never
+/// count as a change of the service or job.
+pub fn is_coordination(key: &str) -> bool {
+    key == crate::lease::ANNOTATION_LEASE || key == crate::source::ANNOTATION_SOURCE
 }
 
 /// What a deploy changes on the live service. When a revision behind the
@@ -790,7 +824,7 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
     for (k, v) in svc
         .annotations
         .iter()
-        .filter(|(k, _)| k.starts_with("runway.dev/"))
+        .filter(|(k, _)| k.starts_with("runway.dev/") && !is_coordination(k))
     {
         m.insert(format!("annotations.{k}"), v.clone());
     }
@@ -840,10 +874,10 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
         .filter(|c| c.ports.is_empty() && template.containers.len() > 1)
     {
         if c.name != crate::config::OTEL_COLLECTOR_NAME {
-            m.insert(
-                format!("sidecars.{}", c.name),
-                crate::plan::sidecar_fingerprint(&observed_sidecar(c, &app_deps)),
-            );
+            m.extend(crate::plan::sidecar_flat(
+                &c.name,
+                &observed_sidecar(c, &app_deps),
+            ));
             continue;
         }
         let limits = c
@@ -860,15 +894,12 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
                 _ => None,
             })
             .unwrap_or_default();
-        m.insert(
-            format!("sidecars.{}", c.name),
-            crate::plan::sidecar_display(
-                &c.image,
-                limits.get("cpu").map(String::as_str).unwrap_or("1"),
-                limits.get("memory").map(String::as_str).unwrap_or("512Mi"),
-                &config,
-            ),
-        );
+        m.extend(crate::plan::collector_flat(
+            &c.image,
+            limits.get("cpu").map(String::as_str).unwrap_or("1"),
+            limits.get("memory").map(String::as_str).unwrap_or("512Mi"),
+            &config,
+        ));
     }
     let ingress = template
         .containers
@@ -1361,6 +1392,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn coordination_annotations_are_no_change() {
+        let (lease, source) = (
+            crate::lease::ANNOTATION_LEASE,
+            crate::source::ANNOTATION_SOURCE,
+        );
+        let mut s = spec();
+        let mut live = desired_service(&s, "n", None);
+        // The rollout carries a lease with a fresh expiry; the service has an
+        // older one and the commit recorded by the last deploy.
+        s.annotations.insert(lease.into(), "renewed-now".into());
+        live.annotations
+            .insert(lease.into(), "renewed-earlier".into());
+        live.annotations.insert(source.into(), "commit".into());
+        let d = crate::plan::diff(&observed_flat(&live), &s.flatten());
+        assert!(d.is_empty(), "{d:?}");
+        assert!(annotations_current(&live, &s));
+    }
+
+    #[test]
+    fn a_rollout_keeps_the_lease_and_the_recorded_commit() {
+        let (lease, source) = (
+            crate::lease::ANNOTATION_LEASE,
+            crate::source::ANNOTATION_SOURCE,
+        );
+        let existing = Service::new()
+            .set_name("projects/p/locations/r/services/hello-dev")
+            .set_annotations([(lease, "live-lease"), (source, "old-commit")]);
+        let mut s = spec();
+        s.annotations
+            .insert(lease.into(), "stale-creation-lease".into());
+        let svc = desired_service(&s, &existing.name, Some(&existing));
+        assert_eq!(
+            svc.annotations[lease], "live-lease",
+            "only the lease code changes it"
+        );
+        assert_eq!(
+            svc.annotations[source], "old-commit",
+            "kept until a deploy records another"
+        );
+
+        s.annotations.insert(source.into(), "new-commit".into());
+        let svc = desired_service(&s, &existing.name, Some(&existing));
+        assert_eq!(svc.annotations[source], "new-commit");
+
+        let released = Service::new().set_name("projects/p/locations/r/services/hello-dev");
+        let svc = desired_service(&s, &released.name, Some(&released));
+        assert!(
+            !svc.annotations.contains_key(lease),
+            "a released lease is not brought back"
+        );
+        let created = desired_service(&s, &released.name, None);
+        assert_eq!(
+            created.annotations[lease], "stale-creation-lease",
+            "a creation carries it"
+        );
+    }
+
+    #[test]
     fn health_check_becomes_http_probes_and_round_trips() {
         let mut s = spec();
         s.health_check = Some(crate::config::HealthCheck {
@@ -1439,7 +1528,7 @@ pub(crate) mod tests {
         assert!(
             changes
                 .iter()
-                .any(|c| c.field == "sidecars.otel-collector" && c.after.is_none()),
+                .any(|c| c.field == "sidecars.otel-collector.image" && c.after.is_none()),
             "{changes:?}"
         );
     }
@@ -1802,18 +1891,34 @@ pub(crate) mod tests {
         let d = crate::plan::diff(&obs, &s.flatten());
         assert!(d.is_empty(), "{d:?}");
 
-        // Any change to a sidecar shows up on its own line.
+        // A change to a sidecar shows up as that setting, nothing hidden.
         let mut changed = s.clone();
         changed.sidecars.get_mut("sql").unwrap().start_before_app = true;
         let d = crate::plan::diff(&obs, &changed.flatten());
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].field, "sidecars.sql");
+        assert_eq!(d[0].field, "sidecars.sql.start_before_app");
+        assert_eq!(
+            (d[0].before.as_deref(), d[0].after.as_deref()),
+            (Some("false"), Some("true"))
+        );
+        let mut env = s.clone();
+        env.sidecars
+            .get_mut("proxy")
+            .unwrap()
+            .env
+            .insert("TRACE_SAMPLING".into(), "0.1".into());
+        let d = crate::plan::diff(&obs, &env.flatten());
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].field, "sidecars.proxy.env.TRACE_SAMPLING");
+        assert_eq!(d[0].after.as_deref(), Some("0.1"));
+        assert!(obs.contains_key("sidecars.proxy.startup_check"), "{obs:?}");
+        assert!(obs.contains_key("sidecars.proxy.mounts.cache"), "{obs:?}");
         let mut removed = s.clone();
         removed.sidecars.remove("sql");
         let d = crate::plan::diff(&obs, &removed.flatten());
         assert!(
             d.iter()
-                .any(|c| c.field == "sidecars.sql" && c.after.is_none()),
+                .any(|c| c.field == "sidecars.sql.image" && c.after.is_none()),
             "{d:?}"
         );
     }
