@@ -9,7 +9,7 @@ use crate::build_client;
 use crate::cli::{Context, DeployArgs};
 use crate::commands::plan::decide_image;
 use crate::commands::{load, registry_client};
-use crate::config::{Artifact, Deployment};
+use crate::config::{Artifact, Deployment, ReleaseFlag};
 use crate::deploy::{AccessChange, Applied, Reconciler, ServiceChange, Target, check_ownership};
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::run::{self, Readiness};
@@ -100,12 +100,69 @@ pub(crate) fn after_rollout(e: Error, d: &Deployment, url: Option<&str>) -> Erro
 pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
     let started = Instant::now();
     let overrides = crate::commands::plan::overrides(args.image.clone(), &args.stage.only);
-    let resolved = load(ctx, &args.stage.stage, &overrides)?;
+    let flag = match (args.tag, args.tag_rc) {
+        (true, _) => Some(ReleaseFlag::Tag),
+        (_, true) => Some(ReleaseFlag::TagRc),
+        _ => None,
+    };
+    let stage = deploy_stage(
+        &crate::config::load(&ctx.config)?,
+        args.stage.stage.as_deref(),
+        flag,
+    )?;
+    if let Some(f) = flag {
+        ctx.progress
+            .info(format!("--{}: stage {stage}", f.as_str()));
+    }
+    let cfg = crate::config::load(&ctx.config)?;
+    if args.tag && args.force_build && crate::commands::release::promotes(&cfg) {
+        return Err(Error::config(
+            "--tag deploys the latest release candidate's image (a stage is mapped to tag-rc): --force-build would release an untested build",
+        ));
+    }
+    let resolved = load(ctx, &stage, &overrides)?;
     let selected = resolved.select(&args.stage.only)?;
     if crate::commands::plan::is_single(&resolved) {
-        return run_single(ctx, args, &resolved, started).await;
+        return run_single(ctx, args, &resolved, started, &cfg).await;
     }
-    crate::commands::deploy_stack::run(ctx, &args, &resolved, &selected, started).await
+    crate::commands::deploy_stack::run(ctx, &args, &resolved, &selected, started, &cfg).await
+}
+
+/// The stage to deploy: `--stage`, or with `--tag`/`--tag-rc` the stage
+/// runway.yaml maps to the flag. Once a stage is mapped to a flag, the flag
+/// deploys no other stage; without a mapping, `--stage` is required (as
+/// before release stages existed).
+pub fn deploy_stage(
+    cfg: &crate::config::LoadedConfig,
+    stage: Option<&str>,
+    flag: Option<ReleaseFlag>,
+) -> Result<String> {
+    let mapped = flag.map(|f| cfg.release_stages(f)).unwrap_or_default();
+    let option = flag.map_or("", |f| f.as_str());
+    match (stage, mapped.as_slice()) {
+        (Some(s), []) => Ok(s.to_string()),
+        (None, []) => Err(Error::config("--stage is required").hint(match flag {
+            Some(f) => format!(
+                "or map a stage to --{} in runway.yaml: `stages.<name>.release.flag: {}`",
+                f.as_str(),
+                f.as_str()
+            ),
+            None => "pass --stage NAME (or set RUNWAY_STAGE)".into(),
+        })),
+        (None, [one]) => Ok(one.clone()),
+        (None, many) => Err(Error::config(format!(
+            "several stages are mapped to --{option} ({}): choose one with --stage",
+            many.join(", ")
+        ))),
+        (Some(s), many) if many.iter().any(|m| m == s) => Ok(s.to_string()),
+        (Some(s), many) => Err(Error::config(format!(
+            "--{option} deploys stage {} only (stages.<name>.release.flag), not `{s}`",
+            many.join(", ")
+        ))
+        .hint(format!(
+            "deploy `{s}` without --{option}, or map it with `stages.{s}.release.flag: {option}`"
+        ))),
+    }
 }
 
 /// A stage with one service (and no jobs or schedules), deployed as before
@@ -115,6 +172,7 @@ async fn run_single(
     args: DeployArgs,
     resolved: &crate::config::Resolved,
     started: Instant,
+    cfg: &crate::config::LoadedConfig,
 ) -> Result<()> {
     let d = resolved.first();
     let p = &ctx.progress;
@@ -174,6 +232,9 @@ async fn run_single(
         }
     ));
     let session = crate::commands::connect(ctx, d).await?;
+    // The deployment keeps its build settings (its repositories are
+    // provisioned); a promoted release only replaces the image it deploys.
+    let build_d = d.clone();
     let run_client = build_client!(Services, session)?;
     let revisions = build_client!(Revisions, session)?;
     let reconciler = Reconciler {
@@ -210,6 +271,26 @@ async fn run_single(
     for n in version_notes {
         p.info(n);
     }
+    // `--tag` with release candidates: the candidate's image, nothing built.
+    // Only looked up here (the APIs are enabled); it is copied into the
+    // stage's release repository by the release step, once provisioned.
+    let promoted = match &release_request {
+        Some((crate::build::release::ReleaseKind::Release, version, _))
+            if crate::commands::release::promotes(cfg) =>
+        {
+            let ar = build_client!(
+                google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+                session
+            )?;
+            let image = with_retry(&retry, p, "find the release candidate", |_| {
+                crate::commands::release::find_candidate(&ar, cfg, &build_d, version)
+            })
+            .await?;
+            p.info(format!("releasing {image} (no build)"));
+            Some(crate::commands::release::with_image(d, &image)?)
+        }
+        _ => None,
+    };
 
     // 2. Inspect: read the live service while hashing the source and resolving
     //    the image (all read-only). Ownership is checked before any change.
@@ -217,7 +298,7 @@ async fn run_single(
         let mut notes = Vec::new();
         let (existing, decision) = tokio::join!(
             reconciler.get(&name),
-            decide_image(d, Some(&registry), &mut notes)
+            decide_image(promoted.as_ref().unwrap_or(d), Some(&registry), &mut notes)
         );
         Ok((existing?, decision?))
     })
@@ -233,6 +314,7 @@ async fn run_single(
 
     // 3. Image: a build, or an existing image (checked before any change).
     let rebuild = match (&d.artifact, &decision.image) {
+        _ if promoted.is_some() => None,
         (Artifact::Build(cfg), img)
             if args.force_build || cfg.rebuild_always || !img.is_exact() =>
         {
@@ -393,7 +475,7 @@ async fn run_single(
         p.warn(n);
     }
     let d = &pinned_secrets;
-    let image = match (&built, existing_image) {
+    let mut image = match (&built, existing_image) {
         (Some(out), _) => out.pinned.clone(),
         (None, Some(reference)) => reference,
         (None, None) => return Err(Error::internal("no image to deploy")),
@@ -411,26 +493,21 @@ async fn run_single(
         annotations.insert(ANNOTATION_GRANTS.to_string(), encode_grants(&record));
     }
     let mut release = None;
-    if let (Some((kind, version, path)), Artifact::Build(b)) = (&release_request, &d.artifact) {
-        let digest = image
-            .rsplit_once('@')
-            .map(|(_, dg)| dg.to_string())
-            .ok_or_else(|| Error::internal("the built image has no digest"))?;
+    if let Some((kind, version, path)) = &release_request {
         let ar = build_client!(
             google_cloud_artifactregistry_v1::client::ArtifactRegistry,
             session
         )?;
-        let package = d.image_package();
-        let pkg = crate::build::release::Package {
-            project: &d.project,
-            location: &b.artifact_location,
-            repository: &b.artifact_repository,
-            package: &package,
-        };
-        let r = with_retry(&retry, p, "tag the release", |_| {
-            crate::build::release::apply(&ar, &pkg, &digest, *kind, version, path)
+        let registry = registry_client(&session).await?;
+        // Published to the stage's release repository (copied when the
+        // image is elsewhere), then tagged; the published image is deployed.
+        let (deployed, r) = with_retry(&retry, p, "publish the release", |_| {
+            crate::commands::release::publish(
+                &ar, &registry, &build_d, &image, *kind, version, path,
+            )
         })
         .await?;
+        image = deployed;
         if r.created {
             p.success(format!("tagged {}", r.image));
         } else {
@@ -900,6 +977,57 @@ fn print_text(p: &Progress, r: &DeployResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release_config(stages: &str) -> (tempfile::TempDir, crate::config::LoadedConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(
+            &p,
+            format!(
+                "version: 1\napp: shop\nprovider: {{project: my-gcp-project, region: europe-west1}}\nservice:\n  image: nginx:1\n  service_account: rt@my-gcp-project.iam.gserviceaccount.com\nstages:\n{stages}"
+            ),
+        )
+        .unwrap();
+        let cfg = crate::config::load(&p).unwrap();
+        (dir, cfg)
+    }
+
+    #[test]
+    fn release_flags_pick_and_guard_their_stage() {
+        use ReleaseFlag::{Tag, TagRc};
+        let (_d, cfg) = release_config(
+            "  dev: {}\n  staging: {release: {flag: tag-rc}}\n  prod: {release: {flag: tag}}\n",
+        );
+        assert_eq!(deploy_stage(&cfg, None, Some(Tag)).unwrap(), "prod");
+        assert_eq!(deploy_stage(&cfg, None, Some(TagRc)).unwrap(), "staging");
+        assert_eq!(deploy_stage(&cfg, Some("prod"), Some(Tag)).unwrap(), "prod");
+        let e = deploy_stage(&cfg, Some("dev"), Some(Tag)).unwrap_err();
+        assert!(
+            e.message.contains("--tag deploys stage prod only"),
+            "{}",
+            e.message
+        );
+        assert!(
+            deploy_stage(&cfg, None, None).is_err(),
+            "no flag: --stage is required"
+        );
+        assert_eq!(deploy_stage(&cfg, Some("dev"), None).unwrap(), "dev");
+
+        let (_d, cfg) =
+            release_config("  eu: {release: {flag: tag}}\n  us: {release: {flag: tag}}\n");
+        assert!(
+            deploy_stage(&cfg, None, Some(Tag))
+                .unwrap_err()
+                .message
+                .contains("several stages")
+        );
+        assert_eq!(deploy_stage(&cfg, Some("us"), Some(Tag)).unwrap(), "us");
+
+        // A file without release stages: as before.
+        let (_d, cfg) = release_config("  dev: {}\n  prod: {}\n");
+        assert_eq!(deploy_stage(&cfg, Some("dev"), Some(Tag)).unwrap(), "dev");
+        assert!(deploy_stage(&cfg, None, Some(Tag)).is_err());
+    }
     use clap::Parser;
 
     #[test]

@@ -1068,6 +1068,7 @@ mod tests {
             apis: Default::default(),
             impersonate: None,
             scheduler_region: "europe-west1".into(),
+            release: Default::default(),
             project_tags: Default::default(),
             buckets: Default::default(),
             secrets: Default::default(),

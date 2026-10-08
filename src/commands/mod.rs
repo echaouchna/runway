@@ -10,6 +10,7 @@ pub mod init;
 pub mod logs;
 pub mod plan;
 pub mod preview;
+pub mod release;
 pub mod run_job;
 pub mod traffic;
 pub mod undeploy;

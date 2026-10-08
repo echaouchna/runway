@@ -194,6 +194,26 @@ pub struct StageArg {
     pub only: Vec<String>,
 }
 
+/// `deploy`'s stage: optional with `--tag`/`--tag-rc` when runway.yaml maps
+/// a stage to the flag (`stages.<name>.release.flag`).
+#[derive(Debug, Args, Clone)]
+pub struct DeployStageArg {
+    /// Stage to deploy (must be defined under `stages`). Optional with
+    /// `--tag`/`--tag-rc` when runway.yaml maps a stage to the flag.
+    #[arg(
+        short,
+        long,
+        env = "RUNWAY_STAGE",
+        required_unless_present_any = ["tag", "tag_rc"]
+    )]
+    pub stage: Option<String>,
+    /// Only these services or jobs: names (the main service is named after
+    /// the app), or paths that select what is built inside them. Repeat or
+    /// separate with commas.
+    #[arg(long, value_delimiter = ',', env = "RUNWAY_ONLY")]
+    pub only: Vec<String>,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create runway.yaml and a small runnable example without overwriting files.
@@ -458,7 +478,7 @@ pub struct PlanArgs {
 #[derive(Debug, Args)]
 pub struct DeployArgs {
     #[command(flatten)]
-    pub stage: StageArg,
+    pub stage: DeployStageArg,
     /// Deploy this image instead of the configured image or source build.
     #[arg(long)]
     pub image: Option<String>,

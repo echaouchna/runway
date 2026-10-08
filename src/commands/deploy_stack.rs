@@ -152,6 +152,7 @@ pub async fn run(
     r: &Resolved,
     selected: &[&Deployment],
     started: Instant,
+    cfg: &crate::config::LoadedConfig,
 ) -> Result<()> {
     let p = &ctx.progress;
     let first = r.first();
@@ -238,6 +239,39 @@ pub async fn run(
     for n in notes {
         p.info(n);
     }
+    // `--tag` with release candidates: each build's candidate, nothing built.
+    // Only looked up here (the APIs are enabled); the release step copies it
+    // into the stage's release repository, once provisioned.
+    let mut promoted: Vec<(String, String)> = Vec::new();
+    if let Some((crate::build::release::ReleaseKind::Release, version, _)) = &release_request
+        && crate::commands::release::promotes(cfg)
+    {
+        let ar = build_client!(
+            google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+            session
+        )?;
+        for d in selected {
+            let owner = r.build_owner(d);
+            if let Some(k) = owner.build_key()
+                && !promoted.iter().any(|(x, _)| *x == k)
+            {
+                let image = with_retry(&retry, p, "find the release candidate", |_| {
+                    crate::commands::release::find_candidate(&ar, cfg, owner, version)
+                })
+                .await?;
+                p.info(format!("releasing {image} for {} (no build)", owner.what()));
+                promoted.push((k, image));
+            }
+        }
+    }
+    let promoted_image = |o: &Deployment| {
+        o.build_key().and_then(|k| {
+            promoted
+                .iter()
+                .find(|(x, _)| *x == k)
+                .map(|(_, i)| i.clone())
+        })
+    };
 
     // 2. Inspect: every workload, one image decision per distinct build, and
     //    the grants recorded on the holder. Ownership is checked first.
@@ -265,7 +299,14 @@ pub async fn run(
                     Some(i) => i,
                     None => {
                         let mut notes = Vec::new();
-                        decisions.push(decide_image(owner, Some(&registry), &mut notes).await?);
+                        let decision = match promoted_image(owner) {
+                            Some(img) => {
+                                let o = crate::commands::release::with_image(owner, &img)?;
+                                decide_image(&o, Some(&registry), &mut notes).await?
+                            }
+                            None => decide_image(owner, Some(&registry), &mut notes).await?,
+                        };
+                        decisions.push(decision);
                         owners.push(owner);
                         decisions.len() - 1
                     }
@@ -299,6 +340,7 @@ pub async fn run(
         .iter()
         .zip(&owners)
         .map(|(dec, owner)| match (&owner.artifact, &dec.image) {
+            _ if promoted_image(owner).is_some() => None,
             (Artifact::Build(cfg), img)
                 if args.force_build || cfg.rebuild_always || !img.is_exact() =>
             {
@@ -496,7 +538,9 @@ pub async fn run(
             (None, None) => Err(Error::internal("no image to deploy")),
         })
         .collect::<Result<_>>()?;
-    let releases = apply_releases(&session, &retry, p, &release_request, &owners, &images).await?;
+    let mut images = images;
+    let releases =
+        apply_releases(&session, &retry, p, &release_request, &owners, &mut images).await?;
 
     // 5. Services, then jobs.
     let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
@@ -911,7 +955,7 @@ async fn apply_releases(
         std::path::PathBuf,
     )>,
     owners: &[&Deployment],
-    images: &[String],
+    images: &mut [String],
 ) -> Result<Vec<(usize, crate::build::release::ReleaseTag)>> {
     let Some((kind, version, path)) = request else {
         return Ok(Vec::new());
@@ -920,26 +964,21 @@ async fn apply_releases(
         google_cloud_artifactregistry_v1::client::ArtifactRegistry,
         session
     )?;
+    let registry = registry_client(session).await?;
     let mut out = Vec::new();
     for (i, owner) in owners.iter().enumerate() {
-        let Artifact::Build(b) = &owner.artifact else {
+        if !matches!(owner.artifact, Artifact::Build(_)) {
             continue;
-        };
-        let digest = images[i]
-            .rsplit_once('@')
-            .map(|(_, dg)| dg.to_string())
-            .ok_or_else(|| Error::internal("the built image has no digest"))?;
-        let package = owner.image_package();
-        let pkg = crate::build::release::Package {
-            project: &owner.project,
-            location: &b.artifact_location,
-            repository: &b.artifact_repository,
-            package: &package,
-        };
-        let r = with_retry(retry, p, "tag the release", |_| {
-            crate::build::release::apply(&ar, &pkg, &digest, *kind, version, path)
+        }
+        // Published to the stage's release repository (copied when the
+        // image is elsewhere), then tagged; the published image is deployed.
+        let (deployed, r) = with_retry(retry, p, "publish the release", |_| {
+            crate::commands::release::publish(
+                &ar, &registry, owner, &images[i], *kind, version, path,
+            )
         })
         .await?;
+        images[i] = deployed;
         if r.created {
             p.success(format!("tagged {}", r.image));
         } else {

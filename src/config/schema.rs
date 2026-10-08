@@ -32,6 +32,8 @@ pub struct RawConfig {
     pub schedules: BTreeMap<String, Option<RawSchedule>>,
     /// The account Cloud Scheduler uses to call its targets.
     pub scheduler: Option<RawScheduler>,
+    /// Release images (`deploy --tag`, `--tag-rc`): where they are published.
+    pub release: Option<RawRelease>,
     #[serde(default)]
     pub stages: BTreeMap<String, Option<RawStage>>,
     /// Per-step retry policy for deployments.
@@ -136,6 +138,31 @@ pub struct RawStage {
     #[serde(default)]
     pub schedules: BTreeMap<String, Option<RawSchedule>>,
     pub scheduler: Option<RawScheduler>,
+    /// `flag` maps the stage to `deploy --tag` or `--tag-rc`; `repository`
+    /// replaces the global one.
+    pub release: Option<RawRelease>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRelease {
+    /// In a stage: `tag` (deployed by `deploy --tag`) or `tag-rc`.
+    pub flag: Option<String>,
+    /// In a `tag` stage: the `tag-rc` stage whose candidates it releases.
+    pub from: Option<String>,
+    /// Where released images are published (copied, same digest).
+    pub repository: Option<RawReleaseRepository>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawReleaseRepository {
+    /// Default: `provider.project`.
+    pub project: Option<String>,
+    /// Default: the build repository's location (`provider.artifact_location`,
+    /// else `provider.region`).
+    pub location: Option<String>,
+    pub repository: String,
 }
 
 /// A Cloud Run job: the runtime settings of a service that apply to jobs,
