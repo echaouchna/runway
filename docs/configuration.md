@@ -49,6 +49,8 @@ service:
   # builder: gcr.io/buildpacks/builder:latest   # force buildpacks with this builder
   rebuild: on-change          # default: rebuild when the source or a base image changes; `always` = every deploy
   # image: europe-west1-docker.pkg.dev/my-gcp-project/applications/hello:1.2.3   # instead of source
+  # command: [gunicorn]       # entrypoint (default: the image's)
+  # args: [--workers, "2"]    # its arguments
   port: 8080                  # default 8080; injected as $PORT
   cpu: "1"                    # 1, 2, 4, 6, 8 or 0.08-1 (also "500m"; below 1 needs concurrency 1); default 1
   memory: 512Mi               # 128Mi-32Gi; default 512Mi
@@ -137,6 +139,13 @@ service:
   cloud_sql: [db]             # PROJECT:REGION:INSTANCE, or an instance in this project and region;
                               # socket at /cloudsql/PROJECT:REGION:INSTANCE
   custom_audiences: [https://api.example.com]   # extra ID token audiences (service-level)
+
+# More services, Cloud Run jobs and Cloud Scheduler jobs: see
+# "Several services, jobs and schedules" below.
+# defaults: {}                # what every service and job inherits
+# services: {web: {...}}      # <app>-<name>-<stage>
+# jobs: {migrate: {...}}      # <app>-<name>-<stage>
+# schedules: {nightly: {schedule: "0 3 * * *", job: migrate}}
 
 retry:                        # per-step retries for deploy (top level only)
   attempts: 3                 # total attempts per step, 1-20; default 3
@@ -249,6 +258,130 @@ instead.
 are accepted, besides the `run.app` URL (for a custom domain or a load
 balancer). This is a service setting: changing it creates no revision.
 runway owns it: audiences set outside runway are removed.
+
+## Several services, jobs and schedules
+
+A file can deploy more than the main `service`: other services, Cloud Run
+jobs, and Cloud Scheduler jobs that run a job or call a service. Files with
+only `service:` work as before: the same service name, labels, images and
+plans.
+
+```yaml
+defaults:                     # every service and job inherits these
+  service_account: shop-runtime@my-gcp-project.iam.gserviceaccount.com
+  identity: { create: true }
+  env: { LOG_LEVEL: info }
+
+service:                      # shop-<stage>, as before
+  source: .
+  public: true
+
+services:
+  web:                        # shop-web-<stage>
+    source: apps/web          # its own folder, Dockerfile and image
+    memory: 1Gi
+
+jobs:
+  migrate:                    # shop-migrate-<stage>
+    source: .                 # same build as `service`: built once
+    command: [python, manage.py, migrate]
+    tasks: 1                  # tasks per execution (default 1)
+    parallelism: 0            # at once (default 0: as many as possible)
+    max_retries: 1            # per task (default 3)
+    timeout_seconds: 1800     # per task (default 600, up to 168 hours)
+    # cpu and memory: at least 1 CPU and 512Mi for a job
+
+schedules:
+  nightly:
+    schedule: "0 3 * * *"     # unix cron
+    time_zone: Europe/Paris   # default Etc/UTC
+    job: migrate              # run a job...
+  warm:
+    schedule: "*/10 * * * *"
+    service: web              # ...or call a service (the main one is named after the app)
+    path: /tasks/warm         # default /
+    method: POST              # default POST; also body, headers
+    # retries: 2              # 0-5, default 0
+    # attempt_deadline_seconds: 300   # 15-1800, default 180
+    # paused: true
+
+scheduler:                    # optional
+  service_account: ...        # default: <app>-<stage>-sched@PROJECT, created by runway
+  region: europe-west1        # default: provider.region
+
+stages:
+  prod:
+    defaults: { env: { LOG_LEVEL: warning } }
+    services: { web: { min_instances: 1 } }
+    jobs: { migrate: { tasks: 2 } }
+  dev:
+    services: { web: null }   # not in this stage
+    schedules: { warm: null }
+```
+
+**Names.** The main service is `<app>-<stage>`; the others and jobs are
+`<app>-<name>-<stage>` (services up to 49 characters, jobs up to 63). Names
+are lowercase letters, digits and hyphens; a service and a job cannot share
+one, and none can be the app name (it names the main service). Named
+services and jobs carry a `runway-name` label; the main service does not, so
+services deployed before named ones existed are unchanged.
+
+**Precedence.** Lowest first: `defaults`, `stages.S.defaults`, the service or
+job, `stages.S.<its block>`. Maps (`env`, `secrets`, `volumes`, …) merge key
+by key and `null` removes an inherited key. Jobs take from `defaults` only
+what jobs have: build or image, `command`/`args`, CPU and memory, `env`,
+`secrets`, `volumes`, `service_account` and `identity`, `vpc`, `cloud_sql`,
+`execution_environment` and `sandbox` (not `timeout_seconds`: a request
+timeout is not a task timeout). A stage schedule replaces the inherited one.
+
+**Images.** Each build has its own package: `<app>` for the main service (as
+before), `<app>-<name>` otherwise. Services and jobs with the same build
+(same folder, Dockerfile or builder) share one image, built once, in the
+package of the first of them in the file.
+
+**Identity.** Put `service_account` and `identity` in `defaults` for one
+runtime account, or set them on a service or job for its own. An account
+used by several is created once and gets every role they need.
+
+**Schedules.** A job is run through the Cloud Run Admin API with an OAuth
+token; a service is called at its URL plus `path`, with an ID token for its
+URL. Both use one account per app and stage (`scheduler.service_account`),
+which gets `roles/run.invoker` on each target only, and runway enables
+`cloudscheduler.googleapis.com`. Scheduler jobs are named
+`<app>-<name>-<stage>` and marked as runway's in their description (they have
+no labels). A schedule removed from runway.yaml is deleted by the next full
+deploy, and its grant revoked.
+
+**Selecting.** `--only` (on `plan`, `deploy`, `describe`, `doctor`,
+`undeploy`, `info`, `logs`, `traffic`, `preview`) takes names, or paths: a
+path selects what is built from inside it (`--only apps` for every app in
+`apps/`), or else what is built from the most specific folder containing it
+(`--only apps/web/src/main.py` selects `web`, not a service built from the
+root). In a monorepo, CI can deploy only the app a change touched.
+`--image` needs `--only` with one name when there are several services and
+jobs.
+
+**Previews and canaries.** `--preview NAME` gives every service a tagged URL
+(one tag for all) and deploys each job as a copy, `<job>-<tag>`, never
+scheduled; `preview delete` and `preview prune` delete these copies with
+their preview. `--traffic N` canaries every service and leaves jobs and
+schedules unchanged. Jobs and schedules change with a full deploy.
+
+**Removals.** Revocations and the removal of unlisted access (see below)
+happen after a full deploy of every service and job (no `--only`), once every
+service serves one revision. runway records its grants on one workload: the
+main service, else the first service, else the first job; if runway does not
+own it (for example an unmanaged main service while `--only` deploys a job),
+nothing is recorded or read there. A service or job removed from
+runway.yaml is not deleted by deploy, which lists it; remove it with
+`runway undeploy --stage S --orphans`. Removing the last schedule works too:
+the next full deploy deletes it (in `scheduler.region` if it is still set).
+
+**Undeploy.** Services and jobs go first, then runtime accounts, then
+images, so an account shared by two services is only deleted once neither
+runs, after the roles each of them declared are revoked. An account is kept while any live service or job (listed in
+runway.yaml or not) runs as it. With `--only`, a schedule calling what is
+removed is deleted only if runway created it.
 
 ## Removing access
 

@@ -72,7 +72,7 @@ async fn remote_plan_costs_one_round_trip_not_three() {
 
     let started = Instant::now();
     let (plan, _) = compute(
-        &resolved.deployment,
+        &resolved.deployments[0].clone(),
         Some(Remote {
             run: &run,
             revisions: None,
@@ -81,6 +81,7 @@ async fn remote_plan_costs_one_round_trip_not_three() {
         }),
         &Default::default(),
         &progress,
+        None,
     )
     .await
     .unwrap();
@@ -122,7 +123,8 @@ stages: {dev: {}}
     config::load_and_resolve(&p, "dev", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

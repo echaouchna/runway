@@ -35,7 +35,7 @@ fn print_line(l: &LogLine, format: OutputFormat) {
 
 pub async fn run(ctx: &Context, args: LogsArgs) -> Result<()> {
     let resolved = load(ctx, &args.stage.stage, &Overrides::default())?;
-    let d = &resolved.deployment;
+    let d = crate::commands::one(&resolved, &args.stage.only, true)?;
     if args.limit == 0 || args.limit > 10_000 {
         return Err(Error::config("--limit must be between 1 and 10000"));
     }
@@ -62,6 +62,7 @@ pub async fn run(ctx: &Context, args: LogsArgs) -> Result<()> {
         project: d.project.clone(),
         region: d.region.clone(),
         service_id: d.service_id.clone(),
+        job: d.is_job(),
         since: logging::parse_since(&args.since)?,
         limit: args.limit,
         include_requests: args.include_requests,

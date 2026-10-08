@@ -17,8 +17,22 @@ use google_cloud_run_v2::model::Service;
 
 pub async fn run(ctx: &Context, args: TrafficArgs) -> Result<()> {
     let resolved = load(ctx, &args.stage.stage, &Overrides::default())?;
-    let d = &resolved.deployment;
-    let session = crate::commands::connect(ctx, d).await?;
+    let services: Vec<&Deployment> = resolved
+        .select(&args.stage.only)?
+        .into_iter()
+        .filter(|d| !d.is_job())
+        .collect();
+    let Some(first) = services.first() else {
+        return Err(Error::config("no service selected (jobs have no traffic)"));
+    };
+    if !args.set.is_empty() && services.len() > 1 {
+        let names: Vec<&str> = services.iter().map(|d| d.name()).collect();
+        return Err(Error::config(format!(
+            "--set names revisions of one service: choose it with --only ({})",
+            names.join(", ")
+        )));
+    }
+    let session = crate::commands::connect(ctx, first).await?;
     let client = build_client!(Services, session)?;
     let rec = Reconciler {
         run: &client,
@@ -27,6 +41,48 @@ pub async fn run(ctx: &Context, args: TrafficArgs) -> Result<()> {
         poll: PollConfig::default(),
         timeout: args.timeout,
     };
+    let several = services.len() > 1;
+    let mut all = Vec::new();
+    let mut promoted = false;
+    for d in &services {
+        let (done, lines) = one_service(ctx, &args, d, &rec, several).await?;
+        promoted |= done.is_some();
+        all.push((d, lines));
+    }
+    if args.promote && !promoted {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            "no service has a canary revision (tag `canary`)",
+        )
+        .hint("deploy one with `runway deploy --stage <stage> --traffic 10`"));
+    }
+    match (ctx.output, several) {
+        (OutputFormat::Json, false) => print_json(&all[0].1),
+        (OutputFormat::Json, true) => print_json(
+            &all.iter()
+                .map(|(d, l)| (d.service_id.clone(), l))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        ),
+        (OutputFormat::Text, _) => {
+            for (d, lines) in &all {
+                if several {
+                    println!("{}", crate::style::out().bold(&d.service_id));
+                }
+                crate::commands::info::print_traffic(lines);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The traffic change on one service; `None` when `--promote` found no canary.
+async fn one_service(
+    ctx: &Context,
+    args: &TrafficArgs,
+    d: &Deployment,
+    rec: &Reconciler<'_>,
+    several: bool,
+) -> Result<(Option<()>, Vec<run::TrafficLine>)> {
     let name = d.service_name();
     let svc = rec
         .get(&name)
@@ -36,13 +92,22 @@ pub async fn run(ctx: &Context, args: TrafficArgs) -> Result<()> {
     let cur = run::current_traffic(&svc);
 
     let wanted = if args.promote {
-        Some(traffic::promote(&cur).ok_or_else(|| {
-            Error::new(
-                ErrorKind::NotFound,
-                "there is no canary revision (tag `canary`)",
-            )
-            .hint("deploy one with `runway deploy --stage <stage> --traffic 10`")
-        })?)
+        match traffic::promote(&cur) {
+            Some(entries) => Some(entries),
+            // With several services, those without a canary are left alone.
+            None if several => {
+                ctx.progress
+                    .info(format!("{} has no canary revision", d.service_id));
+                return Ok((None, run::status(&svc, &d.app, &d.stage).traffic));
+            }
+            None => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "there is no canary revision (tag `canary`)",
+                )
+                .hint("deploy one with `runway deploy --stage <stage> --traffic 10`"));
+            }
+        }
     } else if !args.set.is_empty() {
         let mut split = Vec::new();
         for s in &args.set {
@@ -75,7 +140,7 @@ pub async fn run(ctx: &Context, args: TrafficArgs) -> Result<()> {
         Some(entries) if traffic::flat(&entries) != traffic::flat(&cur.entries) => {
             ctx.progress
                 .step(format!("Updating traffic of {}", d.service_id));
-            update_traffic(&rec, &svc, &entries).await?
+            update_traffic(rec, &svc, &entries).await?
         }
         Some(_) => {
             ctx.progress.info("traffic is already as requested");
@@ -83,12 +148,7 @@ pub async fn run(ctx: &Context, args: TrafficArgs) -> Result<()> {
         }
         None => svc,
     };
-    let lines = run::status(&svc, &d.app, &d.stage).traffic;
-    match ctx.output {
-        OutputFormat::Json => print_json(&lines),
-        OutputFormat::Text => crate::commands::info::print_traffic(&lines),
-    }
-    Ok(())
+    Ok((Some(()), run::status(&svc, &d.app, &d.stage).traffic))
 }
 
 /// The tag a user named: exact, or the tag `--preview NAME` would produce.
@@ -181,7 +241,8 @@ pub async fn remove_preview(
     rec: &Reconciler<'_>,
     raw: &str,
     apply: bool,
-) -> Result<()> {
+    json: bool,
+) -> Result<PreviewRemoval> {
     let svc = rec
         .get(&d.service_name())
         .await?
@@ -199,7 +260,8 @@ pub async fn remove_preview(
         update_traffic(rec, &svc, &traffic::remove_tag(&cur, tag)).await?;
     }
     match ctx.output {
-        OutputFormat::Json => print_json(&report),
+        OutputFormat::Json if json => print_json(&report),
+        OutputFormat::Json => {}
         OutputFormat::Text => match (report.action, &report.tag) {
             ("removed", Some(tag)) => ctx.progress.success(format!("preview `{tag}` removed")),
             ("would_remove", Some(tag)) => println!(
@@ -209,7 +271,7 @@ pub async fn remove_preview(
             _ => println!("{} has no preview `{raw}`; nothing to do", d.service_id),
         },
     }
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]

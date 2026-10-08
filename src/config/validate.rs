@@ -589,6 +589,37 @@ pub fn service_account_project(email: &str) -> Option<&str> {
         .strip_suffix(".iam.gserviceaccount.com")
 }
 
+/// A unix-cron expression (five fields), as Cloud Scheduler accepts it.
+pub fn cron(s: &str) -> Result<(), String> {
+    let fields: Vec<&str> = s.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(format!(
+            "`{s}` must have 5 fields (minute hour day-of-month month day-of-week), for example `0 3 * * *`"
+        ));
+    }
+    if let Some(f) = fields.iter().find(|f| {
+        !f.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "*,-/".contains(c))
+    }) {
+        return Err(format!("`{f}` is not a cron field"));
+    }
+    Ok(())
+}
+
+/// An IANA time zone name such as `Europe/Paris` or `Etc/UTC`.
+pub fn time_zone(s: &str) -> Result<(), String> {
+    let ok = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/_+-".contains(c))
+        && (s.contains('/') || s == "UTC" || s == "GMT");
+    match ok {
+        true => Ok(()),
+        false => Err(format!(
+            "`{s}` is not an IANA time zone (for example `Europe/Paris` or `Etc/UTC`)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

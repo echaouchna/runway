@@ -52,7 +52,8 @@ stages: {{prod: {{}}}}
     config::load_and_resolve(&p, "prod", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 fn endpoints(uri: &str) -> Endpoints {
@@ -65,6 +66,8 @@ fn endpoints(uri: &str) -> Endpoints {
         secret_manager: Some(uri.into()),
         service_usage: Some(uri.into()),
         artifact_registry: Some(uri.into()),
+        run: Some(uri.into()),
+        scheduler: Some(uri.into()),
     }
 }
 
@@ -486,7 +489,8 @@ stages: {prod: {}}
     config::load_and_resolve(&p, "prod", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 #[tokio::test]
@@ -670,7 +674,8 @@ stages: {prod: {}}
     config::load_and_resolve(&p, "prod", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 #[tokio::test]
@@ -835,6 +840,7 @@ fn removed_from_config() -> Vec<runway::provision::ManagedGrant> {
             role: "roles/iap.httpsResourceAccessor".into(),
             target: None,
             runtime: false,
+            service: None,
         },
         ManagedGrant {
             member: format!("serviceAccount:{SA}"),
@@ -843,6 +849,7 @@ fn removed_from_config() -> Vec<runway::provision::ManagedGrant> {
                 project: "billing-data-1234".into(),
             }),
             runtime: true,
+            service: None,
         },
     ]
 }
@@ -1218,6 +1225,7 @@ async fn grants_made_before_a_failure_are_recorded() {
                 project: "locked-project".into(),
             }),
             runtime: false,
+            service: None,
         }),
     ];
     let retry = RetryConfig {
@@ -1303,7 +1311,8 @@ stages: {{prod: {{}}}}
     config::load_and_resolve(&p, "prod", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 /// Live state with access runway.yaml does not list, in each scope; the
@@ -1554,6 +1563,7 @@ fn removals_found_twice_are_planned_once() {
                 dataset: "billingdata".into(),
             }),
             runtime: true,
+            service: None,
         })
     };
     let recorded = vec![grant("group:Devs@example.com", "WRITER")];
@@ -1646,6 +1656,7 @@ async fn revoking_a_dataset_role_keeps_conditional_entries() {
             dataset: "billingdata".into(),
         }),
         runtime: true,
+        service: None,
     });
     let r = prov.apply(&step).await.unwrap();
     assert_eq!(r.outcome, StepOutcome::Changed, "{r:?}");

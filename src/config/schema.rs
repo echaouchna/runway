@@ -2,7 +2,8 @@
 //!
 //! Every struct uses `deny_unknown_fields`, so typos are reported instead of
 //! silently ignored. All service fields are optional here: the same type is used
-//! for the base `service` block and for `stages.<name>.service` overrides.
+//! for `service`, `defaults`, each `services.NAME` and their `stages.<name>.…`
+//! overrides. Jobs use [`RawJob`].
 //! Defaults and validation are applied in [`crate::config::resolve`].
 
 use serde::Deserialize;
@@ -16,8 +17,21 @@ pub struct RawConfig {
     /// Application name; used to derive resource names.
     pub app: String,
     pub provider: RawProvider,
+    /// The main service, named `<app>-<stage>`.
+    pub service: Option<RawService>,
+    /// Settings every service and job inherits (jobs only those they have).
+    pub defaults: Option<RawService>,
+    /// More services, by name: `<app>-<name>-<stage>`.
     #[serde(default)]
-    pub service: RawService,
+    pub services: BTreeMap<String, Option<RawService>>,
+    /// Cloud Run jobs, by name: `<app>-<name>-<stage>`.
+    #[serde(default)]
+    pub jobs: BTreeMap<String, Option<RawJob>>,
+    /// Cloud Scheduler jobs that run a job or call a service, by name.
+    #[serde(default)]
+    pub schedules: BTreeMap<String, Option<RawSchedule>>,
+    /// The account Cloud Scheduler uses to call its targets.
+    pub scheduler: Option<RawScheduler>,
     #[serde(default)]
     pub stages: BTreeMap<String, Option<RawStage>>,
     /// Per-step retry policy for deployments.
@@ -110,14 +124,158 @@ pub struct RawStage {
     pub vars: BTreeMap<String, String>,
     #[serde(default)]
     pub provider: RawProvider,
+    pub service: Option<RawService>,
+    pub defaults: Option<RawService>,
+    /// Field overrides of named services; `null` removes one from the stage.
     #[serde(default)]
-    pub service: RawService,
+    pub services: BTreeMap<String, Option<RawService>>,
+    /// Field overrides of jobs; `null` removes one from the stage.
+    #[serde(default)]
+    pub jobs: BTreeMap<String, Option<RawJob>>,
+    /// A schedule here replaces the inherited one; `null` removes it.
+    #[serde(default)]
+    pub schedules: BTreeMap<String, Option<RawSchedule>>,
+    pub scheduler: Option<RawScheduler>,
+}
+
+/// A Cloud Run job: the runtime settings of a service that apply to jobs,
+/// plus how its executions run.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawJob {
+    pub source: Option<String>,
+    pub dockerfile: Option<String>,
+    pub builder: Option<String>,
+    pub rebuild: Option<String>,
+    pub image: Option<String>,
+    /// Entrypoint and arguments of the container (default: the image's).
+    pub command: Option<Vec<String>>,
+    pub args: Option<Vec<String>>,
+    pub cpu: Option<Scalar>,
+    pub memory: Option<String>,
+    /// Timeout of each task, in seconds (default 600, up to 168 hours).
+    pub timeout_seconds: Option<i64>,
+    /// Tasks per execution (default 1).
+    pub tasks: Option<i64>,
+    /// Tasks running at once (default: as many as possible).
+    pub parallelism: Option<i64>,
+    /// Retries of a failed task (default 3).
+    pub max_retries: Option<i64>,
+    pub service_account: Option<String>,
+    pub env: Option<BTreeMap<String, Option<Scalar>>>,
+    pub secrets: Option<BTreeMap<String, Option<RawSecretRef>>>,
+    pub volumes: Option<BTreeMap<String, Option<RawVolume>>>,
+    pub identity: Option<RawIdentity>,
+    pub execution_environment: Option<String>,
+    pub sandbox: Option<bool>,
+    pub vpc: Option<RawVpc>,
+    pub cloud_sql: Option<Vec<String>>,
+}
+
+impl RawJob {
+    /// The service fields a job has (the rest stay unset).
+    pub fn as_service(&self) -> RawService {
+        RawService {
+            source: self.source.clone(),
+            dockerfile: self.dockerfile.clone(),
+            builder: self.builder.clone(),
+            rebuild: self.rebuild.clone(),
+            image: self.image.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            cpu: self.cpu.clone(),
+            memory: self.memory.clone(),
+            timeout_seconds: self.timeout_seconds,
+            service_account: self.service_account.clone(),
+            env: self.env.clone(),
+            secrets: self.secrets.clone(),
+            volumes: self.volumes.clone(),
+            identity: self.identity.clone(),
+            execution_environment: self.execution_environment.clone(),
+            sandbox: self.sandbox,
+            vpc: self.vpc.clone(),
+            cloud_sql: self.cloud_sql.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl RawService {
+    /// What a job inherits from `defaults`: the fields jobs have, except the
+    /// timeout (a request timeout is not a task timeout).
+    pub fn for_job(&self) -> RawService {
+        RawJob {
+            source: self.source.clone(),
+            dockerfile: self.dockerfile.clone(),
+            builder: self.builder.clone(),
+            rebuild: self.rebuild.clone(),
+            image: self.image.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            cpu: self.cpu.clone(),
+            memory: self.memory.clone(),
+            service_account: self.service_account.clone(),
+            env: self.env.clone(),
+            secrets: self.secrets.clone(),
+            volumes: self.volumes.clone(),
+            identity: self.identity.clone(),
+            execution_environment: self.execution_environment.clone(),
+            sandbox: self.sandbox,
+            vpc: self.vpc.clone(),
+            cloud_sql: self.cloud_sql.clone(),
+            ..Default::default()
+        }
+        .as_service()
+    }
+}
+
+/// A Cloud Scheduler job. Exactly one target: `job` or `service`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSchedule {
+    /// Cron expression, e.g. `0 3 * * *`.
+    pub schedule: String,
+    /// IANA time zone (default `Etc/UTC`).
+    pub time_zone: Option<String>,
+    /// Runs this job (a key of `jobs`).
+    pub job: Option<String>,
+    /// Calls this service (a key of `services`, or the app name for the main
+    /// service) with an ID token.
+    pub service: Option<String>,
+    /// Path on the service (default `/`).
+    pub path: Option<String>,
+    /// HTTP method for a service (default `POST`).
+    pub method: Option<String>,
+    /// Request body for a service.
+    pub body: Option<String>,
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Retries of a failed attempt (default 0, up to 5).
+    pub retries: Option<i64>,
+    /// How long an attempt may take, in seconds (15-1800, default 180).
+    pub attempt_deadline_seconds: Option<i64>,
+    /// Created paused.
+    pub paused: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawScheduler {
+    /// The account Cloud Scheduler calls targets with. Default:
+    /// `<app>-<stage>-sched@PROJECT.iam.gserviceaccount.com`, created by runway.
+    pub service_account: Option<String>,
+    /// Create the account (default: true for the default account).
+    pub create: Option<bool>,
+    /// Cloud Scheduler region (default: `provider.region`).
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawService {
     pub source: Option<String>,
+    /// Entrypoint and arguments of the app container (default: the image's).
+    pub command: Option<Vec<String>>,
+    pub args: Option<Vec<String>>,
     pub dockerfile: Option<String>,
     /// Buildpacks builder image. Without a Dockerfile, buildpacks are used
     /// automatically with `gcr.io/buildpacks/builder:latest`.

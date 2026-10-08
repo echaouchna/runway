@@ -7,10 +7,12 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
 
 **Scope**
 
-- One Cloud Run HTTP service per configuration (one copy per stage). No
-  Cloud Run jobs or worker pools, no custom domains or load balancers, no
-  Serverless VPC Access connectors (Direct VPC egress only). See the
-  [roadmap](roadmap.md).
+- Cloud Run services, jobs and Cloud Scheduler jobs. No worker pools, no
+  Workflows, no custom domains or load balancers, no Serverless VPC Access
+  connectors (Direct VPC egress only). See the [roadmap](roadmap.md).
+- Jobs have no sidecars, OpenTelemetry Collector or health checks. Schedules
+  run a job or call a service over HTTP (no Pub/Sub target).
+- Services and jobs are deployed one after another (not concurrently).
 - Not supported yet on the service: GPUs, NFS and in-memory volumes, session
   affinity, manual scaling.
 - runway owns the revision template: settings added outside runway
@@ -124,6 +126,10 @@ account.
   `preview delete`.
 - Removing access: revocation of recorded grants, removal of access and tags
   `runway.yaml` does not list, and their timing (main deploys only).
+- Several services, jobs and schedules per file: jobs (create, update,
+  `run-job`, preview copies), Cloud Scheduler jobs (create, update, pause,
+  delete), the invoker grant, `undeploy --orphans`, and whether Cloud Run
+  returns job fields exactly as runway sends them.
 - Direct VPC egress, Cloud SQL connections, custom audiences, billing
   (`billing`, `startup_cpu_boost`), `execution_environment` and `sandbox`
   (including whether Cloud Run accepts `sandboxLauncher` sent through the v2

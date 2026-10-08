@@ -9,7 +9,7 @@ use crate::build_client;
 use crate::cli::{Context, DeployArgs};
 use crate::commands::plan::decide_image;
 use crate::commands::{load, registry_client};
-use crate::config::{Artifact, Deployment, Overrides};
+use crate::config::{Artifact, Deployment};
 use crate::deploy::{AccessChange, Applied, Reconciler, ServiceChange, Target, check_ownership};
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::run::{self, Readiness};
@@ -74,7 +74,7 @@ pub fn effective_retry(d: &Deployment, args: &DeployArgs) -> RetryConfig {
     r
 }
 
-fn report_step(p: &Progress, r: &StepResult) {
+pub(crate) fn report_step(p: &Progress, r: &StepResult) {
     match r.outcome {
         StepOutcome::Changed => p.success(format!("{}: {}", r.step, r.detail)),
         StepOutcome::Unchanged => p.info(format!("= {} (already done)", r.step)),
@@ -82,7 +82,7 @@ fn report_step(p: &Progress, r: &StepResult) {
 }
 
 /// Wraps a failure that happens after the service is live.
-fn after_rollout(e: Error, d: &Deployment, url: Option<&str>) -> Error {
+pub(crate) fn after_rollout(e: Error, d: &Deployment, url: Option<&str>) -> Error {
     let mut out = Error::new(
         e.kind,
         format!(
@@ -99,11 +99,24 @@ fn after_rollout(e: Error, d: &Deployment, url: Option<&str>) -> Error {
 
 pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
     let started = Instant::now();
-    let overrides = Overrides {
-        image: args.image.clone(),
-    };
+    let overrides = crate::commands::plan::overrides(args.image.clone(), &args.stage.only);
     let resolved = load(ctx, &args.stage.stage, &overrides)?;
-    let d = &resolved.deployment;
+    let selected = resolved.select(&args.stage.only)?;
+    if crate::commands::plan::is_single(&resolved) {
+        return run_single(ctx, args, &resolved, started).await;
+    }
+    crate::commands::deploy_stack::run(ctx, &args, &resolved, &selected, started).await
+}
+
+/// A stage with one service (and no jobs or schedules), deployed as before
+/// named services and jobs existed.
+async fn run_single(
+    ctx: &Context,
+    args: DeployArgs,
+    resolved: &crate::config::Resolved,
+    started: Instant,
+) -> Result<()> {
+    let d = resolved.first();
     let p = &ctx.progress;
     let name = d.service_name();
     let retry = effective_retry(d, &args);
@@ -345,10 +358,11 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
             progress: p,
             poll: PollConfig::default(),
         };
+        let package = d.image_package();
         let inputs = BuildInputs {
             project: &d.project,
             region: &d.region,
-            app: &d.app,
+            app: &package,
             stage: &d.stage,
             config: cfg,
             source,
@@ -406,11 +420,12 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
             google_cloud_artifactregistry_v1::client::ArtifactRegistry,
             session
         )?;
+        let package = d.image_package();
         let pkg = crate::build::release::Package {
             project: &d.project,
             location: &b.artifact_location,
             repository: &b.artifact_repository,
-            package: &d.app,
+            package: &package,
         };
         let r = with_retry(&retry, p, "tag the release", |_| {
             crate::build::release::apply(&ar, &pkg, &digest, *kind, version, path)
@@ -548,7 +563,21 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
         for what in &unlisted.unchecked {
             p.warn(format!("could not check for {what}; nothing removed there"));
         }
-        merge_removals(revokes.clone(), unlisted.steps)
+        let mut removals = merge_removals(revokes.clone(), unlisted.steps);
+        // Schedules left after the last one was removed from runway.yaml.
+        // Without permission to list them (a stage that never had any),
+        // nothing is said.
+        match provisioner.orphan_schedules().await {
+            Ok(left) => removals.extend(left),
+            Err(e) if e.kind == ErrorKind::Prerequisite => {
+                tracing::debug!(error = %e.message, "schedules not checked");
+            }
+            Err(e) => p.warn(format!(
+                "could not check for schedules runway created ({}); none deleted",
+                e.message
+            )),
+        }
+        removals
     } else {
         Vec::new()
     };
@@ -634,7 +663,7 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
 
 /// [`Reconciler::save_grant_record`], warning when it fails: before a failure
 /// is reported, saving is best effort (the failure is what matters).
-async fn save_grants(
+pub(crate) async fn save_grants(
     reconciler: &Reconciler<'_>,
     name: &str,
     live: Option<&Service>,
@@ -654,7 +683,7 @@ async fn save_grants(
 
 /// One idempotent roll-out attempt: re-reads the service (except on the first
 /// attempt), checks ownership, applies changes and waits for readiness.
-async fn roll_out(
+pub(crate) async fn roll_out(
     reconciler: &Reconciler<'_>,
     d: &Deployment,
     name: &str,
@@ -787,6 +816,8 @@ pub fn bootstrap_spec(
         startup_cpu_boost: false,
         execution_environment: None,
         sandbox: false,
+        command: Vec::new(),
+        args: Vec::new(),
         vpc: None,
         cloud_sql: Vec::new(),
         custom_audiences: Vec::new(),
@@ -797,7 +828,7 @@ pub fn bootstrap_spec(
 }
 
 /// URL of a tagged revision, once Cloud Run reports it.
-fn tagged_url(svc: &google_cloud_run_v2::model::Service, tag: &str) -> Option<String> {
+pub(crate) fn tagged_url(svc: &google_cloud_run_v2::model::Service, tag: &str) -> Option<String> {
     svc.traffic_statuses
         .iter()
         .find(|t| t.tag == tag && !t.uri.is_empty())
@@ -883,7 +914,8 @@ mod tests {
         let d = crate::config::load_and_resolve(&p, "dev", &Default::default())
             .unwrap()
             .1
-            .deployment;
+            .deployments[0]
+            .clone();
         let real = ServiceSpec::from_deployment(&d, "nginx@sha256:aaaa", Default::default());
 
         // Default: the real app, with only the ingress restricted.
@@ -933,7 +965,8 @@ mod tests {
         let d = crate::config::load_and_resolve(&p, "dev", &Default::default())
             .unwrap()
             .1
-            .deployment;
+            .deployments[0]
+            .clone();
         let parse = |args: &[&str]| match crate::cli::Cli::parse_from(args).command {
             crate::cli::Command::Deploy(a) => a,
             _ => unreachable!(),

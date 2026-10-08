@@ -12,6 +12,40 @@ migration notes.
 
 ### Added
 
+- **Several services, jobs and schedules per file.** `services:` and `jobs:`
+  (named `<app>-<name>-<stage>`) next to the main `service`, `schedules:`
+  that run a job or call a service, and `defaults:` that every service and
+  job inherits (precedence: `defaults`, stage `defaults`, the workload, its
+  stage block). Files with only `service:` work as before: same names,
+  labels, images, grants record and plans.
+  - Jobs: build or image, `command`/`args`, `tasks`, `parallelism`,
+    `max_retries`, a task `timeout_seconds` (default 600), and the runtime
+    settings services have (at least 1 CPU and 512Mi, as Cloud Run requires). `runway run-job NAME [--wait]` runs one;
+    `runway logs --only NAME` reads its logs.
+  - Schedules: cron, time zone, retries, deadline, paused; one invoker
+    account per app and stage (created by runway by default) with
+    `roles/run.invoker` on each target only. Removed schedules are deleted
+    and their grants revoked by the next full deploy.
+  - `--only NAME|PATH` on every command with `--stage`: a path selects what
+    is built from inside it, or else from the most specific folder
+    containing it, so CI in a monorepo can deploy only the app a change
+    touched.
+  - Builds that are the same run once; each build has its own image package
+    (`<app>` for the main service, `<app>-<name>` otherwise).
+  - Previews tag every service and deploy jobs as unscheduled copies
+    (`<job>-<tag>`), deleted with the preview; canaries leave jobs and
+    schedules alone.
+  - `undeploy --orphans` removes services and jobs runway.yaml no longer
+    lists; `undeploy` also removes the stage's schedules and scheduler
+    account.
+- `service.command` and `service.args` set the app container's entrypoint.
+- `undeploy` deletes a runtime account shared by several services or jobs
+  once all of them are gone, after revoking the roles each of them declared
+  (also those of a workload with `identity.create: false`); the plan lists
+  the account as deleted and every role as revoked.
+- `undeploy` keeps a runtime account while any live job runs as it, even one
+  runway.yaml no longer lists (it now lists jobs: `run.jobs.list`, in
+  `roles/run.developer`; without it the account is kept).
 - Service options:
   - `billing` (`request-based` or `instance-based`) and `startup_cpu_boost`;
   - `execution_environment` (`gen1`, `gen2`);

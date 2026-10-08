@@ -2,6 +2,7 @@
 
 pub mod completions;
 pub mod deploy;
+pub mod deploy_stack;
 pub mod describe;
 pub mod doctor;
 pub mod info;
@@ -9,6 +10,7 @@ pub mod init;
 pub mod logs;
 pub mod plan;
 pub mod preview;
+pub mod run_job;
 pub mod traffic;
 pub mod undeploy;
 pub mod validate;
@@ -29,6 +31,35 @@ pub(crate) fn print_warnings(progress: &Progress, warnings: &[Issue]) {
 }
 
 /// Loads and resolves the configuration for a stage, printing warnings.
+/// The one service (or job, with `jobs`) a command is about: the only one,
+/// or the one `--only` selects.
+pub(crate) fn one<'a>(
+    r: &'a Resolved,
+    only: &[String],
+    jobs: bool,
+) -> Result<&'a crate::config::Deployment> {
+    let picked: Vec<_> = r
+        .select(only)?
+        .into_iter()
+        .filter(|d| jobs || !d.is_job())
+        .collect();
+    match picked.as_slice() {
+        [d] => Ok(d),
+        [] => Err(crate::error::Error::config(
+            "no service selected (jobs have no URL or traffic)",
+        )),
+        many => Err(crate::error::Error::config(format!(
+            "this stage has several {}: choose one with --only ({})",
+            if jobs {
+                "services and jobs"
+            } else {
+                "services"
+            },
+            many.iter().map(|d| d.name()).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
 pub(crate) fn load(ctx: &Context, stage: &str, overrides: &Overrides) -> Result<Resolved> {
     let (_, resolved) = config::load_and_resolve(&ctx.config, stage, overrides)?;
     print_warnings(&ctx.progress, &resolved.warnings);
@@ -154,6 +185,27 @@ pub(crate) async fn resolve_secret_versions(
 }
 
 /// Traffic mode from `--preview` / `--traffic`.
+/// The service ID preview tags are sized for: the longest of the stage, so
+/// that one tag fits every service (and does not depend on `--only`).
+pub(crate) fn preview_basis(r: &Resolved) -> String {
+    r.services()
+        .map(|d| d.service_id.clone())
+        .max_by_key(|id| id.len())
+        .unwrap_or_else(|| crate::naming::service_id(&r.first().app, &r.first().stage))
+}
+
+/// Preview copy of a job: `{job_id}-{tag}`, within Cloud Run's limit.
+pub(crate) fn preview_job_id(job_id: &str, tag: &str) -> Result<String> {
+    let id = format!("{job_id}-{tag}");
+    if id.len() > crate::naming::MAX_JOB_NAME_LEN {
+        return Err(crate::error::Error::config(format!(
+            "--preview: the preview job `{id}` is longer than {} characters; use a shorter preview name",
+            crate::naming::MAX_JOB_NAME_LEN
+        )));
+    }
+    Ok(id)
+}
+
 pub(crate) fn traffic_mode(
     preview: Option<&str>,
     percent: Option<u32>,

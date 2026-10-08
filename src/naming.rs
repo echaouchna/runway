@@ -10,6 +10,11 @@ pub const LABEL_MANAGED_BY: &str = "managed-by";
 pub const LABEL_MANAGED_BY_VALUE: &str = "runway";
 pub const LABEL_APP: &str = "runway-app";
 pub const LABEL_STAGE: &str = "runway-stage";
+/// Name of a service or job under `services:`/`jobs:`. The main `service`
+/// has none, so services deployed before named ones existed keep their labels.
+pub const LABEL_NAME: &str = "runway-name";
+/// On the preview copy of a job: the preview tag.
+pub const LABEL_PREVIEW: &str = "runway-preview";
 
 /// Annotation recording the human-readable image reference (tag) that was resolved.
 pub const ANNOTATION_IMAGE_REF: &str = "runway.dev/image-ref";
@@ -22,6 +27,30 @@ pub const ANNOTATION_BASE_IMAGES: &str = "runway.dev/base-images";
 
 /// Maximum length of a Cloud Run service ID.
 pub const MAX_SERVICE_NAME_LEN: usize = 49;
+/// Maximum length of a Cloud Run job ID.
+pub const MAX_JOB_NAME_LEN: usize = 63;
+
+/// `{app}-{stage}` for the main service, `{app}-{name}-{stage}` otherwise.
+pub fn workload_id(app: &str, name: Option<&str>, stage: &str) -> String {
+    match name {
+        None => service_id(app, stage),
+        Some(n) => format!("{app}-{n}-{stage}"),
+    }
+}
+
+/// Default account ID (6-30 characters) of the Cloud Scheduler invoker:
+/// `{app}-{stage}-sched`, shortened with a hash when too long.
+pub fn scheduler_account_id(app: &str, stage: &str) -> String {
+    let full = format!("{app}-{stage}-sched");
+    if full.len() <= 30 {
+        return full;
+    }
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(full.as_bytes());
+    let hex: String = hash.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    let head: String = full.chars().take(23).collect();
+    format!("{}-{hex}", head.trim_end_matches('-'))
+}
 
 /// Cloud Run service ID: `{app}-{stage}`.
 pub fn service_id(app: &str, stage: &str) -> String {

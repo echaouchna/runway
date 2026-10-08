@@ -43,7 +43,8 @@ stages: {{prod: {{}}}}
     config::load_and_resolve(&p, "prod", &Overrides::default())
         .unwrap()
         .1
-        .deployment
+        .deployments[0]
+        .clone()
 }
 
 #[test]

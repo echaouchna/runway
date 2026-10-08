@@ -175,10 +175,6 @@ backend = "core:rust"
 [tools.rust.options]
 components = "clippy,rustfmt"
 
-[[tools.rust]]
-version = "1.99.0"
-backend = "core:rust"
-
 [[tools.shellcheck]]
 version = "0.11.0"
 backend = "aqua:koalaman/shellcheck"

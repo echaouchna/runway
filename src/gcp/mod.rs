@@ -8,9 +8,11 @@
 
 pub mod bucket;
 pub mod iam;
+pub mod jobs;
 pub mod logging;
 pub mod registry;
 pub mod run;
+pub mod scheduler;
 
 use crate::error::{Error, ErrorKind};
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as CredBuilder, Credentials};

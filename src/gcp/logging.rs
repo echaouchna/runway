@@ -12,7 +12,9 @@ use std::time::Duration;
 pub struct LogQuery {
     pub project: String,
     pub region: String,
+    /// The service, or the job when `job` is set.
     pub service_id: String,
+    pub job: bool,
     pub since: Duration,
     pub limit: usize,
     pub include_requests: bool,
@@ -27,8 +29,14 @@ pub fn service_filter(q: &LogQuery, now: DateTime<Utc>) -> String {
 
 fn service_filter_after(q: &LogQuery, ts: &str) -> String {
     let mut f = vec![
-        r#"resource.type="cloud_run_revision""#.to_string(),
-        format!(r#"resource.labels.service_name="{}""#, q.service_id),
+        match q.job {
+            false => r#"resource.type="cloud_run_revision""#.to_string(),
+            true => r#"resource.type="cloud_run_job""#.to_string(),
+        },
+        match q.job {
+            false => format!(r#"resource.labels.service_name="{}""#, q.service_id),
+            true => format!(r#"resource.labels.job_name="{}""#, q.service_id),
+        },
         format!(r#"resource.labels.location="{}""#, q.region),
         format!(r#"timestamp>="{ts}""#),
     ];
@@ -233,6 +241,7 @@ mod tests {
             project: "p".into(),
             region: "europe-west1".into(),
             service_id: "hello-dev".into(),
+            job: false,
             since: Duration::from_secs(600),
             limit: 100,
             include_requests: false,
