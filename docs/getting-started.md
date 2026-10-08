@@ -267,4 +267,5 @@ and 5 and the build-related bindings in step 6.
 - Use secrets: [Secrets](secrets.md).
 - Deploy from CI: [CI/CD](ci-cd.md).
 - Release what you tested: [Releases](releases.md).
-- Every option: [Configuration](configuration.md).
+- Every option: [Configuration](configuration.md), or `runway explain` in
+  your terminal to browse them next to your own file.

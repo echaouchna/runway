@@ -71,6 +71,9 @@ Cloud Run application** in one file and one tool:
   touched (`--only apps/web`). `runway run-job migrate --wait` runs a job.
 - **No state file, no cluster.** runway reads the live project, changes only
   what differs, and is safe to re-run. An interrupted deploy resumes.
+- **Learn as you go.** `runway explain` browses every key of `runway.yaml`
+  in your terminal (what it does, example, rules), with what your file sets
+  and its value in each stage.
 - **Exact plans.** `runway plan` shows field-level changes to the service,
   the image, the traffic split and every grant before anything happens.
 - **A URL per branch, canaries on main.** `--preview $BRANCH` deploys without

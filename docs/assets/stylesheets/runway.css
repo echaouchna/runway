@@ -1,0 +1,515 @@
+/* The look of runway.echaouchna.dev for the documentation (Material for
+   MkDocs): its colors, fonts, glow, cards and terminal-style code. Dark is
+   the default, as on the homepage; the light scheme keeps the brand header
+   and code blocks. */
+
+:root {
+  --rw-bg: #070b18;
+  --rw-card: #111a3a;
+  --rw-card2: #16214a;
+  --rw-line: #26335f;
+  --rw-text: #e7ecff;
+  --rw-muted: #9aa6d1;
+  --rw-dim: #6b77a6;
+  --rw-term: #050816;
+  --rw-cyan: #22d3ee;
+  --rw-violet: #a78bfa;
+  --rw-pink: #f472b6;
+  --rw-green: #34d399;
+  --rw-amber: #fbbf24;
+  --rw-grad: linear-gradient(92deg, var(--rw-cyan), var(--rw-violet) 55%, var(--rw-pink));
+
+  --md-text-font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --md-code-font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  /* Header and code are dark in both schemes, like the homepage. */
+  --md-primary-fg-color: var(--rw-bg);
+  --md-primary-fg-color--light: var(--rw-card2);
+  --md-primary-fg-color--dark: var(--rw-term);
+  --md-primary-bg-color: var(--rw-text);
+  --md-primary-bg-color--light: var(--rw-muted);
+  --md-code-bg-color: var(--rw-term);
+  --md-code-fg-color: #cfd7ff;
+  --md-code-hl-color: rgba(34, 211, 238, .14);
+  --md-code-hl-keyword-color: var(--rw-violet);
+  --md-code-hl-name-color: var(--rw-cyan);
+  --md-code-hl-function-color: var(--rw-cyan);
+  --md-code-hl-string-color: var(--rw-green);
+  --md-code-hl-number-color: var(--rw-amber);
+  --md-code-hl-constant-color: var(--rw-amber);
+  --md-code-hl-special-color: var(--rw-pink);
+  --md-code-hl-comment-color: var(--rw-dim);
+  --md-code-hl-generic-color: var(--rw-muted);
+  --md-code-hl-variable-color: #c7d2fe;
+  --md-code-hl-operator-color: var(--rw-muted);
+  --md-code-hl-punctuation-color: var(--rw-muted);
+  --md-footer-bg-color: var(--rw-term);
+  --md-footer-bg-color--dark: var(--rw-term);
+  --md-footer-fg-color: var(--rw-text);
+  --md-footer-fg-color--light: var(--rw-muted);
+  --md-footer-fg-color--lighter: var(--rw-dim);
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 230;
+  --md-default-bg-color: var(--rw-bg);
+  --md-default-bg-color--light: rgba(7, 11, 24, .7);
+  --md-default-bg-color--lighter: rgba(7, 11, 24, .3);
+  --md-default-bg-color--lightest: rgba(7, 11, 24, .12);
+  --md-default-fg-color: var(--rw-text);
+  --md-default-fg-color--light: var(--rw-muted);
+  --md-default-fg-color--lighter: var(--rw-dim);
+  --md-default-fg-color--lightest: var(--rw-line);
+  --md-typeset-color: var(--rw-text);
+  --md-typeset-a-color: var(--rw-cyan);
+  --md-accent-fg-color: var(--rw-cyan);
+  --md-accent-fg-color--transparent: rgba(34, 211, 238, .1);
+  --md-accent-bg-color: var(--rw-term);
+  --md-admonition-bg-color: var(--rw-card);
+  --md-admonition-fg-color: var(--rw-text);
+  --md-shadow-z1: 0 4px 16px rgba(0, 0, 0, .25);
+  --md-shadow-z2: 0 10px 30px rgba(0, 0, 0, .35);
+  --md-shadow-z3: 0 30px 80px rgba(0, 0, 0, .45);
+  --rw-surface: linear-gradient(180deg, var(--rw-card2), var(--rw-card));
+  --rw-inline-code: #c7d2fe;
+  --rw-inline-bg: rgba(167, 139, 250, .12);
+}
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: #f7f8fc;
+  --md-default-fg-color: #0b1020;
+  --md-default-fg-color--light: #3c4670;
+  --md-default-fg-color--lighter: #6b77a6;
+  --md-default-fg-color--lightest: #dfe3f3;
+  --md-typeset-color: #0b1020;
+  --md-typeset-a-color: #0891b2;
+  --md-accent-fg-color: #7c3aed;
+  --md-accent-fg-color--transparent: rgba(124, 58, 237, .08);
+  --md-admonition-bg-color: #ffffff;
+  --md-admonition-fg-color: #0b1020;
+  --rw-surface: #ffffff;
+  --rw-line: #dfe3f3;
+  --rw-inline-code: #5b21b6;
+  --rw-inline-bg: rgba(124, 58, 237, .08);
+}
+
+/* ------------------------------------------------------------ page */
+
+[data-md-color-scheme="slate"] body,
+body[data-md-color-scheme="slate"] {
+  background:
+    radial-gradient(1100px 700px at 85% -10%, rgba(167, 139, 250, .18), transparent 60%),
+    radial-gradient(900px 600px at -10% 30%, rgba(34, 211, 238, .10), transparent 60%),
+    var(--rw-bg);
+  background-attachment: fixed;
+}
+
+body[data-md-color-scheme="default"] {
+  background:
+    radial-gradient(1100px 700px at 85% -10%, rgba(167, 139, 250, .14), transparent 60%),
+    radial-gradient(900px 600px at -10% 30%, rgba(34, 211, 238, .08), transparent 60%),
+    #f7f8fc;
+  background-attachment: fixed;
+}
+
+.md-main,
+.md-container,
+.md-content,
+.md-sidebar {
+  background: transparent;
+}
+
+::selection {
+  background: rgba(34, 211, 238, .28);
+}
+
+/* ------------------------------------------------------------ header */
+
+.md-header {
+  background: rgba(7, 11, 24, .78);
+  backdrop-filter: saturate(140%) blur(14px);
+  -webkit-backdrop-filter: saturate(140%) blur(14px);
+  border-bottom: 1px solid rgba(38, 51, 95, .8);
+  box-shadow: none;
+}
+
+.md-header--shadow {
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .35);
+}
+
+/* The wordmark replaces the site name. */
+.md-header__button.md-logo {
+  margin: .2rem .4rem .2rem .2rem;
+  padding: .3rem;
+}
+
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  height: 1.55rem;
+  width: auto;
+}
+
+.md-header__title .md-header__topic:first-child {
+  visibility: hidden;
+}
+
+.md-header__title--active .md-header__topic:first-child {
+  visibility: visible;
+}
+
+.md-header__source,
+.md-source {
+  color: var(--rw-muted);
+}
+
+.md-tabs {
+  background: transparent;
+  border-bottom: 1px solid rgba(38, 51, 95, .6);
+}
+
+/* Search: a card, like the homepage's install box. */
+.md-search__form {
+  background: rgba(255, 255, 255, .04);
+  border: 1px solid var(--rw-line);
+  border-radius: 10px;
+}
+
+.md-search__form:hover {
+  background: rgba(255, 255, 255, .07);
+}
+
+[data-md-toggle="search"]:checked ~ .md-header .md-search__form {
+  background: var(--rw-term);
+  border-radius: 10px 10px 0 0;
+}
+
+.md-search__output {
+  border-radius: 0 0 12px 12px;
+}
+
+[data-md-color-scheme="slate"] .md-search__scrollwrap,
+[data-md-color-scheme="slate"] .md-search-result {
+  background: var(--rw-term);
+}
+
+/* ------------------------------------------------------------ sidebars */
+
+.md-nav {
+  font-size: .72rem;
+}
+
+.md-nav__link {
+  color: var(--md-default-fg-color--light);
+  transition: color .15s;
+}
+
+.md-nav__link:hover,
+.md-nav__link:focus {
+  color: var(--md-default-fg-color);
+}
+
+.md-nav__link--active,
+.md-nav__item .md-nav__link--active {
+  color: var(--rw-cyan);
+  font-weight: 650;
+}
+
+[data-md-color-scheme="default"] .md-nav__link--active {
+  color: #0891b2;
+}
+
+/* Section titles in the homepage's kicker style. */
+.md-nav--primary > .md-nav__list > .md-nav__item--section > .md-nav__link {
+  font: 600 .6rem/1.4 var(--md-code-font-family);
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--rw-cyan);
+  margin-top: 1.4em;
+}
+
+[data-md-color-scheme="default"]
+  .md-nav--primary > .md-nav__list > .md-nav__item--section > .md-nav__link {
+  color: #0891b2;
+}
+
+.md-nav--secondary .md-nav__title,
+.md-nav--primary .md-nav__title {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------ text */
+
+.md-typeset {
+  font-size: .8rem;
+  line-height: 1.7;
+}
+
+.md-typeset h1 {
+  font-weight: 850;
+  letter-spacing: -.035em;
+  line-height: 1.08;
+  font-size: 2.2em;
+  margin-bottom: .8em;
+  background: var(--rw-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.md-typeset h2 {
+  font-weight: 800;
+  letter-spacing: -.025em;
+  color: var(--md-default-fg-color);
+  padding-top: .6em;
+  border-top: 1px solid var(--rw-line);
+}
+
+.md-typeset h3 {
+  font-weight: 700;
+  letter-spacing: -.015em;
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset h4 {
+  font: 600 .7rem/1.4 var(--md-code-font-family);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--rw-cyan);
+}
+
+.md-typeset a {
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color .15s, color .15s;
+}
+
+.md-typeset a:hover {
+  border-bottom-color: currentColor;
+}
+
+.md-typeset .headerlink {
+  border-bottom: none;
+  color: var(--rw-dim);
+}
+
+.md-typeset hr {
+  border-bottom-color: var(--rw-line);
+}
+
+.md-typeset blockquote {
+  border-left: 3px solid var(--rw-violet);
+  color: var(--md-default-fg-color--light);
+}
+
+/* Inline code, as in the homepage cards. */
+.md-typeset :not(pre) > code {
+  color: var(--rw-inline-code);
+  background: var(--rw-inline-bg);
+  border-radius: 6px;
+  padding: .1em .38em;
+  box-shadow: none;
+  font-size: .86em;
+}
+
+.md-typeset a > code {
+  color: inherit;
+}
+
+/* Code blocks: the homepage's terminal. */
+.md-typeset pre {
+  border-radius: 14px;
+}
+
+.md-typeset pre > code {
+  background: var(--rw-term);
+  color: var(--md-code-fg-color);
+  border: 1px solid var(--rw-line);
+  border-radius: 14px;
+  padding: 1.1em 1.25em;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rw-line) transparent;
+}
+
+[data-md-color-scheme="default"] .md-typeset pre > code {
+  border-color: #1b2547;
+  box-shadow: 0 14px 40px rgba(11, 16, 32, .18);
+}
+
+[data-md-color-scheme="slate"] .md-typeset pre > code {
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .35);
+}
+
+.md-typeset .highlight .filename,
+.md-typeset .highlight span.filename {
+  background: #0b1128;
+  color: var(--rw-dim);
+  border: 1px solid var(--rw-line);
+  border-bottom: none;
+  border-radius: 14px 14px 0 0;
+  font: .7rem var(--md-code-font-family);
+}
+
+/* Console sessions get the terminal's title bar dots. */
+.md-typeset .language-console pre > code,
+.md-typeset .language-shell pre > code,
+.md-typeset .language-sh pre > code,
+.md-typeset .language-bash pre > code {
+  padding-top: 2.4em;
+  background:
+    radial-gradient(circle at 1.1em 1.05em, #ff5f57 .3em, transparent .32em),
+    radial-gradient(circle at 1.9em 1.05em, #febc2e .3em, transparent .32em),
+    radial-gradient(circle at 2.7em 1.05em, #28c840 .3em, transparent .32em),
+    linear-gradient(#0b1128, #0b1128) top / 100% 2.1em no-repeat,
+    var(--rw-term);
+}
+
+.md-typeset .highlight .gp,
+.md-typeset .highlight .go {
+  user-select: none;
+}
+
+.md-typeset .highlight .gp {
+  color: var(--rw-cyan);
+}
+
+.md-typeset .highlight .go {
+  color: var(--rw-muted);
+}
+
+.md-clipboard {
+  color: var(--rw-dim);
+}
+
+.md-clipboard:hover {
+  color: var(--rw-cyan);
+}
+
+/* Tables: the homepage's comparison table, in a card. */
+.md-typeset table:not([class]) {
+  background: var(--rw-surface);
+  border: 1px solid var(--rw-line);
+  border-radius: 16px;
+  overflow: hidden;
+  font-size: .74rem;
+  box-shadow: none;
+}
+
+.md-typeset table:not([class]) th {
+  background: rgba(255, 255, 255, .03);
+  color: var(--md-default-fg-color);
+  font-weight: 700;
+  border-bottom: 1px solid var(--rw-line);
+}
+
+[data-md-color-scheme="default"] .md-typeset table:not([class]) th {
+  background: rgba(11, 16, 32, .03);
+}
+
+.md-typeset table:not([class]) td {
+  border-top: 1px solid var(--rw-line);
+  color: var(--md-default-fg-color--light);
+  vertical-align: top;
+}
+
+.md-typeset table:not([class]) td:first-child {
+  color: var(--md-default-fg-color);
+  font-weight: 600;
+}
+
+.md-typeset table:not([class]) tr:hover td {
+  background: rgba(34, 211, 238, .03);
+}
+
+/* Admonitions: cards with a colored edge. */
+.md-typeset .admonition,
+.md-typeset details {
+  background: var(--rw-surface);
+  border: 1px solid var(--rw-line);
+  border-left: 3px solid var(--rw-cyan);
+  border-radius: 14px;
+  box-shadow: none;
+  font-size: .76rem;
+}
+
+.md-typeset .admonition > .admonition-title,
+.md-typeset details > summary {
+  background: transparent;
+  font-weight: 700;
+}
+
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+  border-left-color: var(--rw-amber);
+}
+
+.md-typeset .admonition.danger,
+.md-typeset .admonition.failure,
+.md-typeset details.danger {
+  border-left-color: var(--rw-pink);
+}
+
+.md-typeset .admonition.tip,
+.md-typeset .admonition.success,
+.md-typeset details.tip {
+  border-left-color: var(--rw-green);
+}
+
+.md-typeset .admonition.note,
+.md-typeset .admonition.info,
+.md-typeset details.note {
+  border-left-color: var(--rw-violet);
+}
+
+/* Buttons: the homepage's primary and ghost buttons. */
+.md-typeset .md-button {
+  border-radius: 12px;
+  border: 1px solid var(--rw-line);
+  color: var(--md-default-fg-color);
+  background: rgba(255, 255, 255, .03);
+  font-weight: 650;
+}
+
+.md-typeset .md-button--primary {
+  background: linear-gradient(92deg, var(--rw-cyan), var(--rw-violet));
+  color: #07101f;
+  border: none;
+}
+
+.md-typeset .md-button:hover,
+.md-typeset .md-button:focus {
+  filter: brightness(1.08);
+  color: inherit;
+}
+
+/* ------------------------------------------------------------ footer */
+
+.md-footer {
+  border-top: 1px solid var(--rw-line);
+}
+
+.md-footer-meta {
+  background: var(--rw-term);
+}
+
+.md-footer__link {
+  opacity: .9;
+}
+
+.md-footer__title {
+  color: var(--rw-text);
+}
+
+.md-top {
+  background: var(--rw-card2);
+  color: var(--rw-text);
+  border: 1px solid var(--rw-line);
+}
+
+/* ------------------------------------------------------------ scrollbars */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rw-line) transparent;
+}

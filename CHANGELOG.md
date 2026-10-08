@@ -12,6 +12,19 @@ migration notes.
 
 ### Added
 
+- **`runway explain`.** Learn `runway.yaml` in the terminal: a full-screen
+  browser of every key (what it does, default, example, rules, docs link),
+  with service keys grouped by topic, search (`/`), and guide topics (stages
+  and precedence, variables, names). Next to a `runway.yaml`, it marks the
+  keys the file sets and its problems, and shows where each key is set and
+  its resolved value per stage (`f`: only your keys, `n`: next problem).
+  `→`/`Enter` move to the explanation to scroll it with `↑`/`↓`, `←`/`Esc`
+  come back. `--agent` prints the reference as Markdown for LLMs and coding
+  agents (with the current file's values and problems; with a key, that key
+  and the keys below it).
+  `runway explain KEY` prints one key (written as in the file, with "did you
+  mean" suggestions); in a pipe it lists every key; `-o json` for scripts.
+
 - **Custom domains.** `service.domains` (and `services.<name>.domains`) lists
   hosts, host paths (`example.com/api`) and Cloud Run custom URLs
   (`NAME.cloud.run`); a stage-wide `domains` block chooses how they are
