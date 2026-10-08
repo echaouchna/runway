@@ -7,8 +7,8 @@
 
 **Cloud Run deployments from one file and one command.**
 
-Build, identity, secrets, traffic and guardrails for Google Cloud Run,
-described in a `runway.yaml` next to your code.
+Services, jobs, schedules, builds, identity, secrets, traffic and releases
+for Google Cloud Run, described in a `runway.yaml` next to your code.
 
 [![CI](https://github.com/echaouchna/runway/actions/workflows/ci.yml/badge.svg)](https://github.com/echaouchna/runway/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -62,19 +62,27 @@ URL:      https://hello-dev-…-ew.a.run.app
 Deploying to Cloud Run is easy once. Doing it well, every day, across
 stages, usually means CI YAML for builds, Terraform for the service, IAM and
 secrets, and shell glue between them. runway puts the **whole lifecycle of a
-Cloud Run service** in one file and one tool:
+Cloud Run application** in one file and one tool:
 
 - **One file, one command.** Image build, runtime identity and least-privilege
   grants, secrets, buckets, probes, scaling, IAP, tags and traffic.
+- **Services, jobs and schedules.** Several services, Cloud Run jobs and Cloud
+  Scheduler jobs in one file; in a monorepo, deploy only what a change
+  touched (`--only apps/web`). `runway run-job migrate --wait` runs a job.
 - **No state file, no cluster.** runway reads the live project, changes only
   what differs, and is safe to re-run. An interrupted deploy resumes.
 - **Exact plans.** `runway plan` shows field-level changes to the service,
   the image, the traffic split and every grant before anything happens.
 - **A URL per branch, canaries on main.** `--preview $BRANCH` deploys without
   traffic; `--traffic 10` starts a canary; `runway traffic --promote` finishes it.
+- **Release what you tested.** `--tag-rc` deploys a release candidate to
+  staging, `--tag` releases that exact image to production (no rebuild), in
+  the Artifact Registry repository of your choice.
 - **Secrets without the dance.** Declare a secret, runway creates it empty,
   grants who may fill it, and stops the deploy (with the exact command) until
   it has a value.
+- **Networks and databases.** Direct VPC egress (Shared VPC too), Cloud SQL
+  connections, and Cloud Run sandboxes for untrusted code.
 - **Built for real organizations.** Org-policy-friendly first deploys,
   service tags, IAP, impersonation and Workload Identity Federation for CI.
 

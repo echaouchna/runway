@@ -66,6 +66,20 @@ access, tags) and grants come from the branch's `runway.yaml` like any deploy.
 The first deploy of a stage serves the deployed revision whatever the flag
 (there is nothing else to serve).
 
+## Several services and jobs
+
+With [several services and jobs](services-and-jobs.md) in one file:
+
+- `--preview NAME` gives every selected service a URL with the same tag, and
+  deploys each job as a copy, `<job>-<tag>`, never scheduled.
+  `preview delete` and `preview prune` remove the URLs and delete these
+  copies.
+- `--traffic N` canaries every selected service; `runway traffic --promote`
+  promotes the canary of each service that has one. Jobs and schedules
+  change with a full deploy only.
+- `runway traffic` shows every service's split; `--set` names revisions, so
+  it needs `--only` with one service.
+
 ## Managing previews
 
 ```console

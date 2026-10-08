@@ -35,7 +35,7 @@ const OPTIONAL_SERVICE: &str = r#"
   # custom_audiences: [https://api.example.com]               # extra ID token audiences
 
 # More services, Cloud Run jobs and schedules (services:, jobs:, schedules:):
-# https://runway.echaouchna.dev/docs/configuration/#several-services-jobs-and-schedules
+# https://runway.echaouchna.dev/docs/services-and-jobs/
 "#;
 
 fn source_config(app: &str, project: &str, region: &str) -> String {
