@@ -34,6 +34,8 @@ pub struct RawConfig {
     pub scheduler: Option<RawScheduler>,
     /// Release images (`deploy --tag`, `--tag-rc`): where they are published.
     pub release: Option<RawRelease>,
+    /// How custom domains are served (a stage block replaces it).
+    pub domains: Option<RawDomains>,
     #[serde(default)]
     pub stages: BTreeMap<String, Option<RawStage>>,
     /// Per-step retry policy for deployments.
@@ -141,6 +143,40 @@ pub struct RawStage {
     /// `flag` maps the stage to `deploy --tag` or `--tag-rc`; `repository`
     /// replaces the global one.
     pub release: Option<RawRelease>,
+    pub domains: Option<RawDomains>,
+}
+
+/// How a stage serves its services' custom domains.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDomains {
+    /// `load-balancer` (default), `existing-load-balancer` or `domain-mapping`.
+    pub mode: Option<String>,
+    /// Cloud DNS zone for the records (else they are printed).
+    pub dns: Option<RawDnsZone>,
+    /// The load balancer runway adds its routes to (`existing-load-balancer`).
+    pub load_balancer: Option<RawExistingLoadBalancer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDnsZone {
+    /// Managed zone name (not its DNS name).
+    pub zone: String,
+    /// Default: `provider.project`.
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawExistingLoadBalancer {
+    /// URL map of the load balancer, in the deployment project.
+    pub url_map: String,
+    /// Certificate map the load balancer's HTTPS proxy uses: runway adds
+    /// certificates for its hosts. Without it, certificates are not runway's.
+    pub certificate_map: Option<String>,
+    /// The load balancer's IP address, for DNS records.
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -367,6 +403,12 @@ pub struct RawService {
     pub cloud_sql: Option<Vec<String>>,
     /// Extra audiences accepted in ID tokens (besides the `run.app` URL).
     pub custom_audiences: Option<Vec<String>>,
+    /// Custom domains: `shop.example.com`, `example.com/api` (a path, with a
+    /// load balancer), or `shop.cloud.run` (a Cloud Run custom URL).
+    pub domains: Option<Vec<String>>,
+    /// Preview URLs on a domain: `*.preview.example.com` routes
+    /// `<tag>.preview.example.com` to each preview (load balancer modes).
+    pub preview_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

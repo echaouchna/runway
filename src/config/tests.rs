@@ -1824,3 +1824,171 @@ fn a_release_stage_can_name_its_candidate_stage() {
         "{e:#?}"
     );
 }
+
+const DOMAINS_BASE: &str = r#"
+version: 1
+app: shop
+provider: {project: my-gcp-project, region: europe-west1}
+defaults:
+  image: europe-west1-docker.pkg.dev/my-gcp-project/apps/shop:1
+  service_account: rt@my-gcp-project.iam.gserviceaccount.com
+"#;
+
+fn domains_cfg(tail: &str) -> (tempfile::TempDir, LoadedConfig) {
+    load_str(&format!(
+        "{DOMAINS_BASE}{tail}\nstages: {{prod: {{}}, dev: {{}}}}\n"
+    ))
+}
+
+#[test]
+fn custom_domains_resolve_per_service_and_per_stage() {
+    let (_d, cfg) = domains_cfg(
+        r#"
+domains:
+  dns: {zone: example-com, project: my-dns-project}
+service:
+  domains: [Shop.Example.com, Example.com/API/*, my-shop.cloud.run]
+  preview_domain: "*.preview.example.com"
+"#,
+    );
+    let r = resolve_ok(&cfg, "prod");
+    let d = r.first();
+    assert_eq!(d.domains.mode, DomainMode::LoadBalancer);
+    assert_eq!(
+        d.domains.dns,
+        Some(DnsZone {
+            zone: "example-com".into(),
+            project: "my-dns-project".into()
+        })
+    );
+    let shown: Vec<String> = d.service.domains.iter().map(|e| e.to_string()).collect();
+    assert_eq!(
+        shown,
+        ["shop.example.com", "example.com/API/*", "my-shop.cloud.run"]
+    );
+    assert!(d.service.domains[2].is_cloud_run_url());
+    assert_eq!(
+        d.service.preview_domain.as_deref(),
+        Some("*.preview.example.com")
+    );
+    assert!(
+        !crate::commands::plan::is_single(&r),
+        "a stage with domains takes the stack path"
+    );
+}
+
+#[test]
+fn a_stage_domains_block_replaces_the_global_one() {
+    let (_d, cfg) = load_str(&format!(
+        "{DOMAINS_BASE}domains: {{mode: load-balancer}}\nservice: {{domains: [shop.example.com]}}\nstages:\n  prod: {{}}\n  dev:\n    domains:\n      mode: existing-load-balancer\n      load_balancer: {{url_map: shared-lb, address: 203.0.113.10}}\n"
+    ));
+    assert_eq!(resolve_ok(&cfg, "prod").first().domains.existing, None);
+    let dev = resolve_ok(&cfg, "dev");
+    let s = &dev.first().domains;
+    assert_eq!(s.mode, DomainMode::ExistingLoadBalancer);
+    let e = s.existing.as_ref().unwrap();
+    assert_eq!(
+        (e.url_map.as_str(), e.address.as_deref()),
+        ("shared-lb", Some("203.0.113.10"))
+    );
+}
+
+#[test]
+fn custom_domain_mistakes_are_reported_with_their_path() {
+    let (_d, cfg) = domains_cfg(
+        r#"
+service:
+  domains: [not_a_host, example.com/a b, shop.cloud.run, example.com]
+  preview_domain: preview.example.com
+services:
+  api:
+    domains: [example.com]
+"#,
+    );
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "service.domains", "is not a host name"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.domains", "is not a path prefix"),
+        "{e:#?}"
+    );
+    assert!(has_error(&e, "service.domains", "6 to 63"), "{e:#?}");
+    assert!(
+        has_error(&e, "service.preview_domain", "must be a wildcard"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "services.api.domains", "is also a domain of service"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn domain_mappings_need_a_supported_region_and_whole_hosts() {
+    let (_d, cfg) = load_str(
+        &format!("{DOMAINS_BASE}domains: {{mode: domain-mapping}}\nservice:\n  domains: [example.com/api]\n  preview_domain: \"*.preview.example.com\"\nstages: {{prod: {{}}}}\n")
+            .replace("europe-west1}", "europe-west3}"),
+    );
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "domains.mode", "not available in europe-west3"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.domains", "maps a whole host"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "service.preview_domain", "need a load balancer"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn an_existing_load_balancer_must_be_named() {
+    let (_d, cfg) = domains_cfg(
+        "domains: {mode: existing-load-balancer}\nservice: {domains: [shop.example.com]}",
+    );
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "domains.load_balancer", "needs `load_balancer"),
+        "{e:#?}"
+    );
+
+    let (_d, cfg) = domains_cfg(
+        "domains: {load_balancer: {url_map: shared, address: not-an-ip}, dns: {zone: Example.com}}\nservice: {domains: [shop.example.com]}",
+    );
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(
+            &e,
+            "domains.load_balancer",
+            "only with `mode: existing-load-balancer`"
+        ),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "domains.load_balancer.address", "not an IPv4 address"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "domains.dns.zone", "managed zone name"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn a_default_domain_is_for_services_not_jobs() {
+    let (_d, cfg) = load_str(&format!(
+        "{}  domains: [shop.example.com]\nservice: {{}}\njobs:\n  migrate: {{}}\nstages: {{prod: {{}}}}\n",
+        DOMAINS_BASE.trim_start()
+    ));
+    let r = resolve_ok(&cfg, "prod");
+    assert_eq!(r.services().next().unwrap().service.domains.len(), 1);
+    assert!(
+        r.jobs().next().unwrap().service.domains.is_empty(),
+        "a default domain is for services"
+    );
+}

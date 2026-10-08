@@ -311,6 +311,12 @@ async fn run_single(
         .as_ref()
         .map(|svc| recorded_grants(&svc.annotations))
         .unwrap_or_default();
+    // Custom domains set up by an earlier deploy (runway.yaml has none now,
+    // or the stage would not be deployed here): removed by a full deploy.
+    let domains_previous = existing
+        .as_ref()
+        .filter(|svc| run::ownership(svc, &d.app, &d.stage) == run::Ownership::Owned)
+        .and_then(|svc| crate::commands::plan::domains_record(&svc.annotations));
 
     // 3. Image: a build, or an existing image (checked before any change).
     let rebuild = match (&d.artifact, &decision.image) {
@@ -491,6 +497,12 @@ async fn run_single(
     let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
     if !record.is_empty() || !recorded.is_empty() {
         annotations.insert(ANNOTATION_GRANTS.to_string(), encode_grants(&record));
+    }
+    if let Some(prev) = &domains_previous {
+        annotations.insert(
+            crate::domains::ANNOTATION_DOMAINS.to_string(),
+            prev.encode(),
+        );
     }
     let mut release = None;
     if let Some((kind, version, path)) = &release_request {
@@ -686,6 +698,30 @@ async fn run_single(
         })
         .await
         .map_err(|e| after_rollout(e, d, url.as_deref()))?;
+    }
+    if let Some(previous) = domains_previous.filter(|_| mode == crate::traffic::Mode::Full) {
+        p.step("Removing custom domains runway.yaml no longer has");
+        let step = crate::provision::Step::Domains {
+            want: Box::new(crate::domains::desired_of(d, &[])),
+            previous,
+            removals: true,
+        };
+        let holder = crate::commands::deploy_stack::Holder {
+            d,
+            adopting: args.adopt,
+        };
+        let done = crate::commands::deploy_stack::apply_domains(
+            &provisioner,
+            &reconciler,
+            &holder,
+            &step,
+            &retry,
+            p,
+            &report,
+        )
+        .await
+        .map_err(|e| after_rollout(e, d, url.as_deref()))?;
+        steps.extend(done);
     }
 
     // 7. Public access.

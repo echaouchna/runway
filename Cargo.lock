@@ -1013,6 +1013,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "google-cloud-certificatemanager-v1"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdcd8b0830a398d187de136c6771e55c913de276b5978f8c71b8f541ddbdb275"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "google-cloud-gax",
+ "google-cloud-gax-internal",
+ "google-cloud-location",
+ "google-cloud-longrunning",
+ "google-cloud-lro",
+ "google-cloud-wkt",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tracing",
+]
+
+[[package]]
+name = "google-cloud-compute-v1"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15d6377a989817e405d340abd453e4ae33377bf0e06804d7302d39dda40d2d3e"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "google-cloud-gax",
+ "google-cloud-gax-internal",
+ "google-cloud-lro",
+ "google-cloud-rpc",
+ "google-cloud-wkt",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tracing",
+]
+
+[[package]]
+name = "google-cloud-dns-v1"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b286e4389fae082a0ef9bafc47c88cfb0b02fe47997d30940d50150480ca87a"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "google-cloud-gax",
+ "google-cloud-gax-internal",
+ "google-cloud-lro",
+ "google-cloud-wkt",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tracing",
+]
+
+[[package]]
 name = "google-cloud-gax"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2570,6 +2627,9 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-bigquery-v2",
  "google-cloud-build-v1",
+ "google-cloud-certificatemanager-v1",
+ "google-cloud-compute-v1",
+ "google-cloud-dns-v1",
  "google-cloud-gax",
  "google-cloud-iam-admin-v1",
  "google-cloud-iam-v1",

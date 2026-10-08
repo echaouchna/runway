@@ -38,12 +38,15 @@ upvote an issue if something matters to you.
   and the deployer's bindings, with a plan/confirm step.
 - **Builds**: configurable machine types and private pools, build-time
   environment for buildpacks.
-- **Custom domains / load balancer integration**, for organizations whose
-  ingress policies require it.
 - **Automatic rollout of rotated secrets** (Secret Manager notifications).
 - Server-side validation (`validateOnly`) during `plan`.
 
 ## Done since 0.1
+
+- Custom domains: a load balancer runway creates, routes in an existing load
+  balancer, or Cloud Run domain mappings and `*.cloud.run` custom URLs, with
+  Certificate Manager certificates, Cloud DNS records and preview URLs on
+  your domain.
 
 - Several services, Cloud Run jobs and Cloud Scheduler jobs per file, with
   `defaults`, `--only` (names or folders, for monorepos), `runway run-job`,

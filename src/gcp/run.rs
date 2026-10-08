@@ -520,10 +520,15 @@ pub fn spec_for_live(spec: &ServiceSpec, svc: Option<&Service>) -> ServiceSpec {
     }
     // The grant record does not describe the image: a spec that does not set
     // it (plan) keeps it.
-    if let Some(v) = svc.annotations.get(crate::provision::ANNOTATION_GRANTS) {
-        s.annotations
-            .entry(crate::provision::ANNOTATION_GRANTS.to_string())
-            .or_insert_with(|| v.clone());
+    for key in [
+        crate::provision::ANNOTATION_GRANTS,
+        crate::domains::ANNOTATION_DOMAINS,
+    ] {
+        if let Some(v) = svc.annotations.get(key) {
+            s.annotations
+                .entry(key.to_string())
+                .or_insert_with(|| v.clone());
+        }
     }
     s
 }

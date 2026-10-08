@@ -17,6 +17,7 @@ pub mod commands;
 pub mod config;
 pub mod deploy;
 pub mod describe;
+pub mod domains;
 pub mod error;
 pub mod gcp;
 pub mod image_ref;

@@ -68,6 +68,9 @@ fn endpoints(uri: &str) -> Endpoints {
         artifact_registry: Some(uri.into()),
         run: Some(uri.into()),
         scheduler: Some(uri.into()),
+        compute: Some(uri.into()),
+        certificate_manager: Some(uri.into()),
+        dns: Some(uri.into()),
     }
 }
 

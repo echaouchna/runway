@@ -139,6 +139,8 @@ service:
   cloud_sql: [db]             # PROJECT:REGION:INSTANCE, or an instance in this project and region;
                               # socket at /cloudsql/PROJECT:REGION:INSTANCE
   custom_audiences: [https://api.example.com]   # extra ID token audiences (service-level)
+  domains: [shop.example.com, example.com/api, my-shop.cloud.run]   # see "Custom domains" below
+  preview_domain: "*.preview.example.com"   # previews on your domain (load balancer modes)
 
 # More services, Cloud Run jobs and Cloud Scheduler jobs: see
 # "Several services, jobs and schedules" below.
@@ -261,6 +263,41 @@ instead.
 are accepted, besides the `run.app` URL (for a custom domain or a load
 balancer). This is a service setting: changing it creates no revision.
 runway owns it: audiences set outside runway are removed.
+
+## Custom domains
+
+Domains belong to services; the stage-wide `domains` block says how they are
+served (a stage's block replaces the global one). See
+[Custom domains](domains.md) for the guide.
+
+```yaml
+domains:
+  mode: load-balancer         # load-balancer (default) | existing-load-balancer | domain-mapping
+  dns:                        # optional: runway writes the records in this Cloud DNS zone
+    zone: example-com         # the managed zone's name, not its DNS name
+    project: my-dns-project   # default: provider.project
+  load_balancer:              # existing-load-balancer only
+    url_map: shared-lb        # required; in the deployment project
+    certificate_map: shared-certs   # optional: runway adds its certificates to it
+    address: 203.0.113.10     # optional: the IP the hosts' A records point to
+
+service:
+  domains:
+    - shop.example.com        # a whole host
+    - example.com/api         # a path prefix: /api and /api/* (load balancer modes)
+    - my-shop.cloud.run       # a Cloud Run custom URL (any mode; 6 to 63 characters)
+  preview_domain: "*.preview.example.com"   # <tag>.preview.example.com for each preview
+```
+
+| Rule | Why |
+|---|---|
+| A host or host and path belongs to one service | the load balancer routes it to one backend |
+| `domain-mapping` needs a [supported region](https://cloud.google.com/run/docs/mapping-custom-domains#limitations), whole hosts, no `preview_domain` | domain mappings map a host to a service |
+| `load_balancer` only with `mode: existing-load-balancer`, which requires it | it names the load balancer runway adds routes to |
+| Jobs have no domains; a `domains` default applies to services only | jobs have no URL |
+
+Domains change with a full deploy (not a preview or canary); removing one is
+done by a full deploy of everything, or by `undeploy`.
 
 ## Several services, jobs and schedules
 

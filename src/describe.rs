@@ -89,6 +89,52 @@ fn runtime_edges(d: &Deployment) -> Vec<(String, String)> {
     out
 }
 
+/// How the service's custom domains are served.
+fn domain_lines(d: &Deployment) -> Vec<String> {
+    use crate::config::DomainMode;
+    let s = &d.service;
+    let mut out = Vec::new();
+    let how = match (&d.domains.mode, &d.domains.existing) {
+        (DomainMode::LoadBalancer, _) => format!(
+            "through the load balancer runway creates for the stage (`{}-lb`), with a managed certificate",
+            naming::service_id(&d.app, &d.stage)
+        ),
+        (DomainMode::ExistingLoadBalancer, Some(e)) => format!(
+            "through URL map `{}` (runway adds and removes only its own routes)",
+            e.url_map
+        ),
+        (DomainMode::ExistingLoadBalancer, None) => "through an existing load balancer".into(),
+        (DomainMode::DomainMapping, _) => "through Cloud Run domain mappings".into(),
+    };
+    let (urls, domains): (Vec<_>, Vec<_>) = s.domains.iter().partition(|e| e.is_cloud_run_url());
+    if !domains.is_empty() {
+        let list: Vec<String> = domains.iter().map(|e| format!("`{e}`")).collect();
+        out.push(format!("Custom domains {} {how}.", list.join(", ")));
+    }
+    for u in urls {
+        out.push(format!("Cloud Run custom URL `https://{u}`."));
+    }
+    if let Some(w) = &s.preview_domain {
+        out.push(format!(
+            "Previews also answer on `<tag>.{}`.",
+            w.trim_start_matches("*.")
+        ));
+    }
+    if !out.is_empty() {
+        out.push(match &d.domains.dns {
+            Some(z) => format!(
+                "DNS records are written to Cloud DNS zone `{}` (project `{}`).",
+                z.zone, z.project
+            ),
+            None => {
+                "DNS records are printed by `plan` and `deploy`, to create at your DNS provider."
+                    .into()
+            }
+        });
+    }
+    out
+}
+
 // ---------------------------------------------------------------- ASCII --
 
 /// Maximum width of a line inside a box.
@@ -622,6 +668,7 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
             s.custom_audiences.join(", ")
         ));
     }
+    network.extend(domain_lines(d));
     if !network.is_empty() {
         out.push(Section {
             title: "Networking".into(),

@@ -81,6 +81,9 @@ fn endpoints(uri: &str) -> Endpoints {
     Endpoints {
         run: Some(uri.into()),
         scheduler: Some(uri.into()),
+        compute: Some(uri.into()),
+        certificate_manager: Some(uri.into()),
+        dns: Some(uri.into()),
         iam: Some(uri.into()),
         resource_manager: Some(uri.into()),
         tag_bindings: Some(uri.into()),

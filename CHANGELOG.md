@@ -12,6 +12,23 @@ migration notes.
 
 ### Added
 
+- **Custom domains.** `service.domains` (and `services.<name>.domains`) lists
+  hosts, host paths (`example.com/api`) and Cloud Run custom URLs
+  (`NAME.cloud.run`); a stage-wide `domains` block chooses how they are
+  served: `load-balancer` (default: a global external Application Load
+  Balancer runway creates for the app and stage, with an HTTP-to-HTTPS
+  redirect), `existing-load-balancer` (runway adds its NEGs, backends and
+  host rules to a URL map it does not own, and removes only those) or
+  `domain-mapping` (Cloud Run domain mappings). Certificates are Certificate
+  Manager certificates with DNS authorization, issued before the domain
+  points at the load balancer. With `domains.dns`, runway writes the A and
+  authorization records in a Cloud DNS zone (any project); without it, or
+  without permission, `plan` and `deploy` print the records to create
+  elsewhere. `preview_domain: "*.preview.example.com"` serves each preview on
+  `<tag>.preview.example.com`. Domains removed from runway.yaml are cleaned
+  up by the next full deploy; `undeploy` removes them first and keeps
+  `*.cloud.run` URLs unless `--release-urls` is given. DNS records are only
+  changed or deleted when their data is what runway set.
 - **Release repositories and promotion.** A `release` block (global, and per
   stage) publishes released images to a chosen Artifact Registry repository:
   runway copies the image there with the same digest (registry protocol,

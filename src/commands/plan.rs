@@ -397,6 +397,7 @@ pub async fn compute(
     let recorded = live_svc
         .map(|svc| recorded_grants(&svc.annotations))
         .unwrap_or_default();
+    let domains_previous = live_svc.and_then(|svc| domains_record(&svc.annotations));
     // Only a main deploy revokes (once one revision serves all traffic): a
     // preview or canary leaves them for the next main deploy.
     let mut revokes = match stack {
@@ -567,6 +568,16 @@ pub async fn compute(
                         e.message
                     )),
                 }
+                // Custom domains runway.yaml no longer has.
+                if let Some(previous) = domains_previous {
+                    let step = Step::Domains {
+                        want: Box::new(crate::domains::desired_of(d, &[])),
+                        previous,
+                        removals: true,
+                    };
+                    unlisted.push(prov.check(&step, true).await);
+                }
+                notes.extend(prov.take_notes());
             }
             let (mut early, mut late) = (early_checks.into_iter(), late.into_iter());
             all_steps
@@ -637,7 +648,10 @@ pub(crate) fn overrides(image: Option<String>, only: &[String]) -> Overrides {
 
 /// A stage planned as before named services and jobs existed: one service.
 pub(crate) fn is_single(r: &Resolved) -> bool {
-    r.deployments.len() == 1 && !r.first().is_job() && r.schedules.is_empty()
+    r.deployments.len() == 1
+        && !r.first().is_job()
+        && r.schedules.is_empty()
+        && !crate::domains::configured(r)
 }
 
 pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
@@ -805,6 +819,19 @@ pub async fn holder_record(
     run: &Services,
     jobs: &Jobs,
 ) -> Result<Vec<crate::provision::ManagedGrant>> {
+    Ok(holder_records(r, run, jobs).await?.0)
+}
+
+/// Grants and the custom domains record (see
+/// [`crate::domains::ANNOTATION_DOMAINS`]) on the stage's holder.
+pub async fn holder_records(
+    r: &Resolved,
+    run: &Services,
+    jobs: &Jobs,
+) -> Result<(
+    Vec<crate::provision::ManagedGrant>,
+    Option<crate::domains::Recorded>,
+)> {
     let h = r.holder();
     let (labels, annotations) = match h.is_job() {
         false => match run.get_service().set_name(h.service_name()).send().await {
@@ -820,9 +847,17 @@ pub async fn holder_record(
     };
     // Annotations on a resource runway does not own are not its record.
     if run::ownership_of(&labels, &h.app, &h.stage) != Ownership::Owned {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
-    Ok(recorded_grants(&annotations))
+    Ok((recorded_grants(&annotations), domains_record(&annotations)))
+}
+
+pub fn domains_record(
+    annotations: &std::collections::HashMap<String, String>,
+) -> Option<crate::domains::Recorded> {
+    annotations
+        .get(crate::domains::ANNOTATION_DOMAINS)
+        .map(|v| crate::domains::Recorded::decode(v))
 }
 
 /// Stage-wide steps (once) and removals, then each selected service and
@@ -874,9 +909,11 @@ async fn stack_plan(
                 false => services.push(compute(d, None, mode, progress, Some(r)).await?.0),
             }
         }
+        let domains = crate::provision::domains_step(r, None, false).filter(|_| full);
         let steps = stage_steps
             .iter()
             .chain(schedule_steps.iter())
+            .chain(domains.iter())
             .map(|s| StepCheck {
                 step: s.describe(first),
                 state: StepState::Unknown,
@@ -934,7 +971,13 @@ async fn stack_plan(
         futures::future::join_all(schedule_steps.iter().map(|s| prov.check(s, true))).await,
     );
     // Removals: only a full deploy of every service and job makes them.
-    let recorded = holder_record(r, &run, &jobs).await?;
+    let (recorded, domains_previous) = holder_records(r, &run, &jobs).await?;
+    // Custom domains change with a full deploy (removals: of everything).
+    match crate::provision::domains_step(r, domains_previous, only.is_empty()) {
+        Some(s) if full => steps.push(prov.check(&s, true).await),
+        Some(_) => notes.push("custom domains change with a full deploy".into()),
+        None => {}
+    }
     let revokes = crate::provision::stack_revoke_steps(&recorded, r);
     if full && only.is_empty() {
         steps.extend(futures::future::join_all(revokes.iter().map(|s| prov.check(s, true))).await);
@@ -975,6 +1018,7 @@ async fn stack_plan(
             revokes.len()
         ));
     }
+    notes.extend(prov.take_notes());
     Ok(stack_result(r, true, services, job_plans, steps, notes))
 }
 

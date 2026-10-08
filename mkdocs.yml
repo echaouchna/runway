@@ -45,6 +45,7 @@ nav:
       - Services, jobs and schedules: services-and-jobs.md
       - Previews, canaries and traffic: traffic.md
       - Releases: releases.md
+      - Custom domains: domains.md
       - Secrets: secrets.md
       - CI/CD: ci-cd.md
       - Permissions: permissions.md
