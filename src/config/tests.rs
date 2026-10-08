@@ -1721,3 +1721,106 @@ fn the_scheduler_region_outlives_the_schedules() {
         "europe-west1"
     );
 }
+
+#[test]
+fn release_repositories_are_global_or_per_stage() {
+    let yaml = FULL
+        .replace(
+            "stages:\n",
+            "release:\n  repository: {repository: releases}\nstages:\n  staging:\n    release: {flag: tag-rc}\n",
+        )
+        .replace(
+            "  prod:\n    service:\n",
+            "  prod:\n    release:\n      flag: tag\n      repository: {project: my-prod-project, location: europe-west4, repository: prod-releases}\n    service:\n",
+        );
+    let (_d, cfg) = load_str(&yaml);
+    let dev = resolve_ok(&cfg, "dev").first().release.clone();
+    assert_eq!(dev.flag, None);
+    assert_eq!(
+        dev.repository,
+        Some(ReleaseRepository {
+            project: "my-gcp-project".into(),
+            location: "europe-west1".into(),
+            repository: "releases".into()
+        }),
+        "the global one, in the deployment project and the build location"
+    );
+    let prod = resolve_ok(&cfg, "prod").first().release.clone();
+    assert_eq!(prod.flag, Some(ReleaseFlag::Tag));
+    assert_eq!(prod.repository.unwrap().project, "my-prod-project");
+    assert_eq!(cfg.release_stages(ReleaseFlag::TagRc), ["staging"]);
+    assert_eq!(cfg.release_stages(ReleaseFlag::Tag), ["prod"]);
+
+    // Without a release block: as before.
+    let (_d, cfg) = load_str(FULL);
+    assert_eq!(
+        resolve_ok(&cfg, "dev").first().release,
+        ReleaseSettings::default()
+    );
+}
+
+#[test]
+fn release_settings_are_validated() {
+    let yaml = FULL
+        .replace(
+            "stages:\n",
+            "release:\n  flag: tag\n  repository: {repository: Bad_Repo}\nstages:\n",
+        )
+        .replace(
+            "  dev:\n    service:\n",
+            "  dev:\n    release: {flag: release}\n    service:\n",
+        );
+    let (_d, cfg) = load_str(&yaml);
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "release.flag", "stages.<name>.release.flag"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "stages.dev.release.flag", "`tag` or `tag-rc`"),
+        "{e:#?}"
+    );
+    assert!(has_error(&e, "release.repository.repository", ""), "{e:#?}");
+}
+
+#[test]
+fn a_release_stage_can_name_its_candidate_stage() {
+    let base = FULL.replace(
+        "stages:\n",
+        "stages:\n  staging:\n    release: {flag: tag-rc}\n  qa: {}\n",
+    );
+    let ok = base.replace(
+        "  prod:\n    service:\n",
+        "  prod:\n    release: {flag: tag, from: staging}\n    service:\n",
+    );
+    let (_d, cfg) = load_str(&ok);
+    assert_eq!(
+        resolve_ok(&cfg, "prod").first().release.from.as_deref(),
+        Some("staging")
+    );
+
+    let bad = base
+        .replace(
+            "  prod:\n    service:\n",
+            "  prod:\n    release: {flag: tag, from: qa}\n    service:\n",
+        )
+        .replace(
+            "  dev:\n    service:\n",
+            "  dev:\n    release: {from: staging}\n    service:\n",
+        );
+    let (_d, cfg) = load_str(&bad);
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "stages.prod.release.from", "`qa` is not a stage with"),
+        "{e:#?}"
+    );
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(
+            &e,
+            "stages.dev.release.from",
+            "only for a stage with `flag: tag`"
+        ),
+        "{e:#?}"
+    );
+}

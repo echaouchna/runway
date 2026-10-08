@@ -147,6 +147,9 @@ service:
 # jobs: {migrate: {...}}      # <app>-<name>-<stage>
 # schedules: {nightly: {schedule: "0 3 * * *", job: migrate}}
 
+# release:                    # `deploy --tag` / `--tag-rc`: see "Releases" below
+#   repository: {project: my-release-project, repository: releases}
+
 retry:                        # per-step retries for deploy (top level only)
   attempts: 3                 # total attempts per step, 1-20; default 3
   delay: 5s                   # initial delay, doubles each attempt; default 5s
@@ -382,6 +385,62 @@ images, so an account shared by two services is only deleted once neither
 runs, after the roles each of them declared are revoked. An account is kept while any live service or job (listed in
 runway.yaml or not) runs as it. With `--only`, a schedule calling what is
 removed is deleted only if runway created it.
+
+## Releases
+
+`deploy --tag` tags the deployed image with the changelog version, and
+`deploy --tag-rc` with `X.Y.Z-RC<n>` (see
+[How it works](how-it-works.md)). A `release` block chooses where released
+images are published and which stage each flag deploys. Without it, nothing
+changes: `--stage` is required and the image is tagged in the build
+repository.
+
+```yaml
+release:                      # global (optional)
+  repository:                 # where released images are published
+    project: my-release-project   # default: provider.project
+    location: europe-west1        # default: the build repository's location
+    repository: releases
+
+stages:
+  staging:
+    release:
+      flag: tag-rc            # `runway deploy --tag-rc` deploys this stage
+  prod:
+    release:
+      flag: tag               # `runway deploy --tag` deploys this stage
+      from: staging           # optional: the tag-rc stage whose candidates it releases
+      repository: {project: my-prod-project, repository: releases}   # replaces the global one
+```
+
+**Stages.** A stage mapped to a flag is the flag's default: `runway deploy
+--tag` needs no `--stage`. Once a stage is mapped to a flag, the flag deploys
+no other stage. With several stages mapped to the same flag, `--stage` picks
+one of them.
+
+**Publishing.** A stage's released images go to its `release.repository`,
+else the global one, else its build repository. An image built elsewhere is
+copied there with the same digest (layers already present are skipped, and on
+the same registry host they are mounted rather than transferred), tagged, and
+deployed from there: a production project can pull from its own repository.
+The copy happens after provisioning: with `provider.create_build_resources:
+true`, runway also creates the release repository when it is missing.
+
+**Promotion.** Once a stage is mapped to `tag-rc`, `deploy --tag` builds
+nothing: it deploys the latest `X.Y.Z-RC<n>` of the changelog version, copied
+into its own repository when it is elsewhere, and tags it `X.Y.Z`. The
+candidate comes from `release.from`'s repository, or else from the stage's
+own repository and those of every `tag-rc` stage. Each repository numbers its
+candidates on its own, so candidates found in several repositories must be
+the same image; otherwise the deploy lists them and asks for `from`. What
+was tested is what is released, whatever changed since (the changelog itself,
+or a base image updated upstream). Re-running reuses the `X.Y.Z` tag. Without
+a candidate for the version, the deploy fails and says how to make one.
+`--force-build` is refused with `--tag` then.
+
+Typical flow: merge, bump the changelog, `runway deploy --tag-rc` (staging,
+`1.2.0-RC1`), test, `runway deploy --tag` (prod releases RC1's image as
+`1.2.0`).
 
 ## Removing access
 

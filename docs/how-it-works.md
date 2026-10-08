@@ -44,7 +44,10 @@ in Artifact Registry, refusing to move a version that already tags another
 image. `deploy --tag-rc` tags `X.Y.Z-RC<n>`, `n` being one more than the
 highest existing `X.Y.Z-RC*` tag; an image that already has an RC tag for that
 version keeps it (re-running a deploy does not create RC2, RC3…). The tag is
-shown by `deploy` and `info` (annotation `runway.dev/release`).
+shown by `deploy` and `info` (annotation `runway.dev/release`). Release
+repositories, stages mapped to `--tag`/`--tag-rc` and the promotion of release
+candidates (no rebuild) are described in
+[Configuration](configuration.md#releases).
 
 1. *Scan* the build context and hash a deterministic tar stream (sorted
    entries, fixed timestamps and owners), so identical source gives an

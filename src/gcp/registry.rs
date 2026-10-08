@@ -182,6 +182,226 @@ impl RegistryClient {
     }
 }
 
+/// Media types of manifests that list other manifests (multi-platform).
+const INDEX_TYPES: &[&str] = &[
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+];
+
+impl RegistryClient {
+    fn base(&self, image: &ImageRef) -> String {
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| format!("https://{}", image.api_host()))
+    }
+
+    fn authed(
+        &self,
+        req: reqwest::RequestBuilder,
+        image: &ImageRef,
+        url: &str,
+    ) -> reqwest::RequestBuilder {
+        match self.google_token_for(image, url) {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
+    /// Copies an image between Artifact Registry repositories, keeping its
+    /// digest: its manifest (each platform's, for a multi-platform index),
+    /// config and layers. Layers the destination has are skipped; on the same
+    /// registry host they are mounted (no transfer), otherwise streamed
+    /// through runway (one monolithic upload each, as Artifact Registry
+    /// requires). `src` has a digest; `dst` names the destination package.
+    pub async fn copy(&self, src: &ImageRef, dst: &ImageRef) -> Result<(), ResolveError> {
+        let digest = src
+            .digest
+            .clone()
+            .ok_or_else(|| ResolveError::Other("the image to copy has no digest".into()))?;
+        if !src.is_google_registry() || !dst.is_google_registry() {
+            return Err(ResolveError::Other(
+                "images are copied between Artifact Registry repositories only".into(),
+            ));
+        }
+        Box::pin(self.copy_manifest(src, dst, &digest)).await
+    }
+
+    async fn copy_manifest(
+        &self,
+        src: &ImageRef,
+        dst: &ImageRef,
+        digest: &str,
+    ) -> Result<(), ResolveError> {
+        let url = format!(
+            "{}/v2/{}/manifests/{digest}",
+            self.base(src),
+            src.repository
+        );
+        let resp = self
+            .authed(
+                self.http.get(&url).header(ACCEPT, MANIFEST_ACCEPT),
+                src,
+                &url,
+            )
+            .send()
+            .await
+            .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;
+        let resp = check(resp, "reading the manifest").await?;
+        let media_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/vnd.oci.image.manifest.v1+json")
+            .to_string();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| ResolveError::Other(format!("reading the manifest: {e}")))?;
+        let actual = format!("sha256:{}", hex(&Sha256::digest(&body)));
+        if actual != digest {
+            return Err(ResolveError::Other(format!(
+                "the registry returned a manifest with digest {actual}, not {digest}"
+            )));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| ResolveError::Other(format!("invalid manifest: {e}")))?;
+        let digests = |key: &str| -> Vec<String> {
+            match &json[key] {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x["digest"].as_str().map(String::from))
+                    .collect(),
+                serde_json::Value::Object(o) => o
+                    .get("digest")
+                    .and_then(|d| d.as_str())
+                    .map(String::from)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        if INDEX_TYPES.contains(&media_type.as_str()) {
+            for child in digests("manifests") {
+                Box::pin(self.copy_manifest(src, dst, &child)).await?;
+            }
+        } else {
+            for blob in digests("config").into_iter().chain(digests("layers")) {
+                self.copy_blob(src, dst, &blob).await?;
+            }
+        }
+        // The same bytes under the same digest: the digest does not change.
+        let put = format!(
+            "{}/v2/{}/manifests/{digest}",
+            self.base(dst),
+            dst.repository
+        );
+        let resp = self
+            .authed(
+                self.http
+                    .put(&put)
+                    .header(reqwest::header::CONTENT_TYPE, media_type)
+                    .body(body),
+                dst,
+                &put,
+            )
+            .send()
+            .await
+            .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;
+        check(resp, "writing the manifest").await.map(|_| ())
+    }
+
+    async fn copy_blob(
+        &self,
+        src: &ImageRef,
+        dst: &ImageRef,
+        digest: &str,
+    ) -> Result<(), ResolveError> {
+        let base = self.base(dst);
+        let head = format!("{base}/v2/{}/blobs/{digest}", dst.repository);
+        let resp = self
+            .authed(self.http.head(&head), dst, &head)
+            .send()
+            .await
+            .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        // Same host: ask the registry to mount the layer it already stores.
+        let start = match src.registry == dst.registry {
+            true => format!(
+                "{base}/v2/{}/blobs/uploads/?mount={digest}&from={}",
+                dst.repository, src.repository
+            ),
+            false => format!("{base}/v2/{}/blobs/uploads/", dst.repository),
+        };
+        let resp = self
+            .authed(self.http.post(&start), dst, &start)
+            .send()
+            .await
+            .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;
+        if resp.status() == StatusCode::CREATED {
+            return Ok(());
+        }
+        let resp = check(resp, "starting a layer upload").await?;
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ResolveError::Other("the registry gave no upload location".into()))?;
+        let mut upload = match location.starts_with("http") {
+            true => location.to_string(),
+            false => format!("{base}{location}"),
+        };
+        upload.push(if upload.contains('?') { '&' } else { '?' });
+        upload.push_str(&format!("digest={digest}"));
+        let get = format!("{}/v2/{}/blobs/{digest}", self.base(src), src.repository);
+        let layer = self
+            .authed(self.http.get(&get), src, &get)
+            .send()
+            .await
+            .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;
+        let layer = check(layer, "reading a layer").await?;
+        let mut put = self
+            .http
+            .put(&upload)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(len) = layer.content_length() {
+            put = put.header(reqwest::header::CONTENT_LENGTH, len);
+        }
+        let resp = self
+            .authed(
+                put.body(reqwest::Body::wrap_stream(layer.bytes_stream())),
+                dst,
+                &upload,
+            )
+            .send()
+            .await
+            .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;
+        check(resp, "uploading a layer").await.map(|_| ())
+    }
+}
+
+/// The response, or an error naming what failed.
+async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response, ResolveError> {
+    match resp.status() {
+        s if s.is_success() => Ok(resp),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ResolveError::Unauthorized(
+            format!("HTTP {} {what}", resp.status()),
+        )),
+        s => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ResolveError::Other(format!(
+                "registry returned HTTP {s} {what}: {}",
+                body.chars().take(200).collect::<String>()
+            )))
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn parse_challenge(s: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut rest = s.trim();

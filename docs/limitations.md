@@ -126,6 +126,9 @@ account.
   `preview delete`.
 - Removing access: revocation of recorded grants, removal of access and tags
   `runway.yaml` does not list, and their timing (main deploys only).
+- Release repositories and promotion: copying images between repositories
+  (layer mounts and streamed uploads against Artifact Registry), and `--tag`
+  releasing a candidate published by a `tag-rc` stage.
 - Several services, jobs and schedules per file: jobs (create, update,
   `run-job`, preview copies), Cloud Scheduler jobs (create, update, pause,
   delete), the invoker grant, `undeploy --orphans`, and whether Cloud Run

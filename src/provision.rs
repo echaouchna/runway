@@ -76,8 +76,10 @@ pub enum Step {
     },
     /// Stop the deployment until every secret runway created has a value.
     SecretValues(Vec<String>),
-    /// Create the Artifact Registry Docker repository.
+    /// Create an Artifact Registry Docker repository (the build repository,
+    /// or a stage's release repository).
     CreateRepository {
+        project: String,
         location: String,
         repository: String,
     },
@@ -300,10 +302,15 @@ impl Step {
                     .join(", ")
             ),
             Step::CreateRepository {
+                project,
                 location,
                 repository,
             } => {
-                format!("Artifact Registry repository {location}/{repository}")
+                if *project == d.project {
+                    format!("Artifact Registry repository {location}/{repository}")
+                } else {
+                    format!("Artifact Registry repository {project}/{location}/{repository}")
+                }
             }
             Step::CreateServiceAccount { email, .. } => format!("service account {email}"),
             Step::Grant { email, binding } => {
@@ -550,9 +557,22 @@ pub fn pre_steps(d: &Deployment) -> Vec<Step> {
             labels: Default::default(),
         }));
         steps.push(Step::CreateRepository {
+            project: d.project.clone(),
             location: b.artifact_location.clone(),
             repository: b.artifact_repository.clone(),
         });
+        // Released images are copied to the stage's release repository.
+        if let Some(r) = &d.release.repository
+            && (r.project != d.project
+                || r.location != b.artifact_location
+                || r.repository != b.artifact_repository)
+        {
+            steps.push(Step::CreateRepository {
+                project: r.project.clone(),
+                location: r.location.clone(),
+                repository: r.repository.clone(),
+            });
+        }
         accounts.push(Step::CreateServiceAccount {
             email: b.build_service_account.clone(),
             display_name: format!("runway builds ({})", d.app),
@@ -1628,9 +1648,10 @@ impl<'a> Provisioner<'a> {
                 ),
             },
             Step::CreateRepository {
+                project,
                 location,
                 repository,
-            } => match self.get_repository(location, repository).await {
+            } => match self.get_repository(project, location, repository).await {
                 Ok(r) if r.format == Format::Docker => {
                     (StepState::InSync, format!("{location}/{repository} exists"))
                 }
@@ -2039,9 +2060,13 @@ impl<'a> Provisioner<'a> {
             }
             Step::SecretValues(names) => self.require_secret_values(names).await?,
             Step::CreateRepository {
+                project,
                 location,
                 repository,
-            } => self.ensure_repository(location, repository).await?,
+            } => {
+                self.ensure_repository(project, location, repository)
+                    .await?
+            }
             Step::CreateServiceAccount {
                 email,
                 display_name,
@@ -3446,14 +3471,14 @@ impl<'a> Provisioner<'a> {
 
     async fn get_repository(
         &self,
+        project: &str,
         location: &str,
         repository: &str,
     ) -> std::result::Result<Repository, GaxError> {
         missing_gax(&self.clients.artifact)?
             .get_repository()
             .set_name(format!(
-                "projects/{}/locations/{location}/repositories/{repository}",
-                self.d.project
+                "projects/{project}/locations/{location}/repositories/{repository}"
             ))
             .send()
             .await
@@ -3461,10 +3486,11 @@ impl<'a> Provisioner<'a> {
 
     async fn ensure_repository(
         &self,
+        project: &str,
         location: &str,
         repository: &str,
     ) -> Result<(StepOutcome, String)> {
-        match self.get_repository(location, repository).await {
+        match self.get_repository(project, location, repository).await {
             Ok(r) if r.format == Format::Docker => {
                 return Ok((
                     StepOutcome::Unchanged,
@@ -3481,7 +3507,7 @@ impl<'a> Provisioner<'a> {
         }
         let op = missing(&self.clients.artifact, "ArtifactRegistry")?
             .create_repository()
-            .set_parent(format!("projects/{}/locations/{location}", self.d.project))
+            .set_parent(format!("projects/{project}/locations/{location}"))
             .set_repository_id(repository)
             .set_repository(
                 Repository::new()
@@ -4080,6 +4106,34 @@ stages: { prod: {} }
         let read = recorded_grants(&[(ANNOTATION_GRANTS.to_string(), old.to_string())].into());
         assert_eq!(read[0].service, None);
         assert_eq!(encode_grants(&read), old, "rewritten unchanged");
+    }
+
+    #[test]
+    fn creating_build_resources_creates_the_release_repository() {
+        let yaml = FULL.replace(
+            "stages:",
+            "release:\n  repository: {project: my-release-project, repository: releases}\nstages:",
+        );
+        let (_dir, d) = deployment(&yaml);
+        let repos: Vec<(String, String)> = pre_steps(&d)
+            .into_iter()
+            .filter_map(|s| match s {
+                Step::CreateRepository {
+                    project,
+                    repository,
+                    ..
+                } => Some((project, repository)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            repos.contains(&("my-release-project".into(), "releases".into())),
+            "{repos:?}"
+        );
+        assert!(
+            repos.iter().any(|(p, _)| p == "my-gcp-project"),
+            "and the build repository"
+        );
     }
 
     #[test]

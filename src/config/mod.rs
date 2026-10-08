@@ -46,6 +46,21 @@ impl LoadedConfig {
     pub fn stage_names(&self) -> Vec<String> {
         self.raw.stages.keys().cloned().collect()
     }
+
+    /// Stages mapped to a release flag (`stages.<name>.release.flag`).
+    pub fn release_stages(&self, flag: ReleaseFlag) -> Vec<String> {
+        self.raw
+            .stages
+            .iter()
+            .filter(|(_, st)| {
+                st.as_ref()
+                    .and_then(|s| s.release.as_ref())
+                    .and_then(|r| r.flag.as_deref())
+                    == Some(flag.as_str())
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 /// Reads and strictly parses a configuration file.
@@ -171,6 +186,8 @@ pub struct Deployment {
     /// Where the stage's Cloud Scheduler jobs live (`scheduler.region`, else
     /// `provider.region`), also when none is configured any more.
     pub scheduler_region: String,
+    /// Release flag of the stage and where its released images go.
+    pub release: ReleaseSettings,
     /// Tags bound to the deployment project: namespaced key -> value short name.
     pub project_tags: BTreeMap<String, String>,
     /// Buckets runway creates and keeps configured, by key.
@@ -196,6 +213,41 @@ pub struct BucketConfig {
     pub versioning: Option<bool>,
     pub delete_after_days: Option<u32>,
     pub labels: BTreeMap<String, String>,
+}
+
+/// `deploy --tag` (a release) or `deploy --tag-rc` (a release candidate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseFlag {
+    Tag,
+    TagRc,
+}
+
+impl ReleaseFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReleaseFlag::Tag => "tag",
+            ReleaseFlag::TagRc => "tag-rc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReleaseSettings {
+    /// The flag that deploys this stage (`stages.<name>.release.flag`).
+    pub flag: Option<ReleaseFlag>,
+    /// Where released images are published; `None`: the build repository.
+    pub repository: Option<ReleaseRepository>,
+    /// For a `tag` stage: the `tag-rc` stage whose candidates it releases.
+    pub from: Option<String>,
+}
+
+/// An Artifact Registry Docker repository for released images.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseRepository {
+    pub project: String,
+    pub location: String,
+    pub repository: String,
 }
 
 /// A Cloud Run service or job.
@@ -1049,6 +1101,16 @@ pub fn resolve(
     };
     check_opt(&mut d, &artifact_repository, validate::repository_id);
     check_opt(&mut d, &artifact_location, validate::region);
+    let release = resolve_release(
+        &mut d,
+        raw,
+        st,
+        stage,
+        &project,
+        artifact_location
+            .as_ref()
+            .map_or(region.as_str(), |(l, _)| l.as_str()),
+    );
     check_opt(&mut d, &source_bucket, validate::bucket_name);
     check_opt(&mut d, &build_sa, validate::service_account_email);
 
@@ -1124,6 +1186,7 @@ pub fn resolve(
             },
             impersonate: impersonate.clone(),
             scheduler_region: scheduler_region.clone(),
+            release: release.clone(),
             project_tags: project_tags.clone(),
             buckets: buckets.clone(),
             secrets: managed_secrets.clone(),
@@ -2838,6 +2901,101 @@ fn normalize_path(p: &Path) -> PathBuf {
 }
 
 /// Merges `env`/`secrets` maps key by key. A `null` in the stage removes the key.
+/// The stage's release flag and repository (the stage's replaces the global).
+fn resolve_release(
+    d: &mut Diagnostics,
+    raw: &RawConfig,
+    st: &RawStage,
+    stage: &str,
+    project: &str,
+    default_location: &str,
+) -> ReleaseSettings {
+    if raw.release.as_ref().is_some_and(|r| r.flag.is_some()) {
+        d.error(
+            "release.flag",
+            "a flag maps one stage: set it in `stages.<name>.release.flag`",
+        );
+    }
+    let stage_release = st.release.as_ref();
+    let flag = stage_release
+        .and_then(|r| r.flag.as_deref())
+        .and_then(|f| match f {
+            "tag" => Some(ReleaseFlag::Tag),
+            "tag-rc" => Some(ReleaseFlag::TagRc),
+            other => {
+                d.error(
+                    format!("stages.{stage}.release.flag"),
+                    format!("`{other}` must be `tag` or `tag-rc`"),
+                );
+                None
+            }
+        });
+    let repo = stage_release
+        .and_then(|r| r.repository.as_ref())
+        .map(|r| (r, format!("stages.{stage}.release.repository")))
+        .or_else(|| {
+            raw.release
+                .as_ref()
+                .and_then(|r| r.repository.as_ref())
+                .map(|r| (r, "release.repository".to_string()))
+        });
+    let repository = repo.map(|(r, path)| {
+        let project = r.project.clone().unwrap_or_else(|| project.to_string());
+        let location = r
+            .location
+            .clone()
+            .unwrap_or_else(|| default_location.to_string());
+        for (field, value, check) in [
+            (
+                "project",
+                &project,
+                validate::project_id as fn(&str) -> std::result::Result<(), String>,
+            ),
+            ("location", &location, validate::region),
+            ("repository", &r.repository, validate::repository_id),
+        ] {
+            if let Err(e) = check(value) {
+                d.error(format!("{path}.{field}"), e);
+            }
+        }
+        ReleaseRepository {
+            project,
+            location,
+            repository: r.repository.clone(),
+        }
+    });
+    let from = stage_release.and_then(|r| r.from.clone());
+    if raw.release.as_ref().is_some_and(|r| r.from.is_some()) {
+        d.error(
+            "release.from",
+            "set it in the stage that releases: `stages.<name>.release.from`",
+        );
+    }
+    if let Some(f) = &from {
+        let path = format!("stages.{stage}.release.from");
+        let rc = raw
+            .stages
+            .get(f)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.release.as_ref())
+            .and_then(|r| r.flag.as_deref())
+            == Some("tag-rc");
+        if flag != Some(ReleaseFlag::Tag) {
+            d.error(path, "only for a stage with `flag: tag`");
+        } else if !rc {
+            d.error(
+                path,
+                format!("`{f}` is not a stage with `release.flag: tag-rc`"),
+            );
+        }
+    }
+    ReleaseSettings {
+        flag,
+        repository,
+        from,
+    }
+}
+
 /// The services and jobs of a stage, with the layers of their settings.
 fn workload_inputs(
     d: &mut Diagnostics,

@@ -12,6 +12,19 @@ migration notes.
 
 ### Added
 
+- **Release repositories and promotion.** A `release` block (global, and per
+  stage) publishes released images to a chosen Artifact Registry repository:
+  runway copies the image there with the same digest (registry protocol,
+  layers mounted on the same host) and deploys that copy.
+  `stages.<name>.release.flag: tag | tag-rc` maps a stage to `deploy --tag` or
+  `--tag-rc`: it becomes the flag's default stage and the only one the flag
+  deploys. Once a stage is mapped to `tag-rc`, `deploy --tag` builds nothing:
+  it releases the latest `X.Y.Z-RC<n>` of the changelog version (copied from
+  the `tag-rc` stage's repository when needed, after provisioning;
+  `create_build_resources` also creates the release repository). A `tag`
+  stage can name its source with `release.from`; candidates found in several
+  repositories must be the same image. Files without a `release` block work
+  as before.
 - **Several services, jobs and schedules per file.** `services:` and `jobs:`
   (named `<app>-<name>-<stage>`) next to the main `service`, `schedules:`
   that run a job or call a service, and `defaults:` that every service and

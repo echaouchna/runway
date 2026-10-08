@@ -90,7 +90,7 @@ pub fn next_rc(version: &str, existing: &[String]) -> u32 {
         + 1
 }
 
-fn rc_number(version: &str, tag: &str) -> Option<u32> {
+pub fn rc_number(version: &str, tag: &str) -> Option<u32> {
     tag.to_ascii_lowercase()
         .strip_prefix(&format!("{version}-rc"))?
         .parse()
@@ -106,13 +106,14 @@ pub struct Package<'a> {
 }
 
 impl Package<'_> {
-    fn parent(&self) -> String {
+    pub fn parent(&self) -> String {
         format!(
             "projects/{}/locations/{}/repositories/{}/packages/{}",
             self.project, self.location, self.repository, self.package
         )
     }
-    fn image(&self) -> String {
+    /// `LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/PACKAGE` (no tag).
+    pub fn image(&self) -> String {
         format!(
             "{}-docker.pkg.dev/{}/{}/{}",
             self.location, self.project, self.repository, self.package
@@ -120,8 +121,15 @@ impl Package<'_> {
     }
 }
 
-/// `(tag, digest)` pairs of the package.
-async fn list_tags(ar: &ArtifactRegistry, pkg: &Package<'_>) -> Result<Vec<(String, String)>> {
+/// The latest release candidate of `version` among `(tag, digest)` pairs.
+pub fn latest_candidate(tags: &[(String, String)], version: &str) -> Option<(u32, String, String)> {
+    tags.iter()
+        .filter_map(|(t, d)| rc_number(version, t).map(|n| (n, t.clone(), d.clone())))
+        .max_by_key(|(n, _, _)| *n)
+}
+
+/// `(tag, digest)` pairs of the package (none when it does not exist yet).
+pub async fn list_tags(ar: &ArtifactRegistry, pkg: &Package<'_>) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut token = String::new();
     loop {
@@ -131,8 +139,12 @@ async fn list_tags(ar: &ArtifactRegistry, pkg: &Package<'_>) -> Result<Vec<(Stri
             .set_page_size(1000)
             .set_page_token(token.clone())
             .send()
-            .await
-            .map_err(|e| api_error(e, "listing image tags"))?;
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) if status_code(&e) == Some(Code::NotFound) => return Ok(out),
+            Err(e) => return Err(api_error(e, "listing image tags")),
+        };
         for t in resp.tags {
             let tag = t.name.rsplit('/').next().unwrap_or(&t.name).to_string();
             let digest = t
@@ -240,6 +252,23 @@ fn result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_candidate_of_a_version() {
+        let t = |tag: &str, d: &str| (tag.to_string(), d.to_string());
+        let tags = [
+            t("1.2.0-RC1", "sha256:a"),
+            t("1.2.0-RC3", "sha256:c"),
+            t("1.2.0-RC2", "sha256:b"),
+            t("1.1.0-RC9", "sha256:x"),
+            t("1.2.0", "sha256:z"),
+        ];
+        assert_eq!(
+            latest_candidate(&tags, "1.2.0"),
+            Some((3, "1.2.0-RC3".into(), "sha256:c".into()))
+        );
+        assert_eq!(latest_candidate(&tags, "2.0.0"), None);
+    }
 
     #[test]
     fn reads_the_latest_version() {
