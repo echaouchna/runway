@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>runway: Cloud Run deployments from one file</title>
-<meta name="description" content="runway deploys applications to Google Cloud Run from a single runway.yaml: build, identity, secrets, traffic and guardrails, with no state file and no cluster.">
+<meta name="description" content="runway deploys applications to Google Cloud Run from a single runway.yaml: services, jobs and schedules, builds, identity, secrets, traffic and releases, with no state file and no cluster.">
 <meta property="og:title" content="runway: Cloud Run deployments from one file">
-<meta property="og:description" content="Build, identity, secrets, branch previews, canaries and guardrails for Google Cloud Run, in one runway.yaml.">
+<meta property="og:description" content="Services, jobs, schedules, builds, identity, secrets, branch previews, canaries and releases for Google Cloud Run, in one runway.yaml.">
 <meta property="og:type" content="website">
 <link rel="icon" type="image/svg+xml" href="assets/runway-icon.svg">
 <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
@@ -101,7 +101,7 @@ footer a{color:var(--muted);text-decoration:none;margin-left:18px}
   <div>
     <span class="badge">Open source · Apache-2.0</span>
     <h1>Cloud Run deployments from <span class="grad">one file</span>.</h1>
-    <p class="lead">runway builds your app, creates what it needs (identity, grants, secrets, buckets, tags), rolls it out and manages its traffic, from a <code style="font:inherit;color:var(--text)">runway.yaml</code> next to your code. No state file. No cluster.</p>
+    <p class="lead">runway builds your services and jobs, creates what they need (identity, grants, secrets, buckets, schedules), rolls them out and manages their traffic and releases, from a <code style="font:inherit;color:var(--text)">runway.yaml</code> next to your code. No state file. No cluster.</p>
     <div class="cta">
       <a class="btn primary" href="docs/getting-started/">Get started →</a>
       <a class="btn ghost" href="docs/configuration/">Configuration reference</a>
@@ -145,18 +145,21 @@ Traffic:  100% hello-prod-00012 · 0% feature-login
 <section id="features">
 <div class="wrap">
   <div class="kicker">Features</div>
-  <h2>Everything a Cloud Run service needs, <span class="grad">nothing to glue</span></h2>
-  <p class="sub">One configuration covers the build, the runtime identity and its least-privilege grants, secrets, storage, probes, scaling, access and traffic. Every step reads the live project first and changes only what differs.</p>
+  <h2>Everything a Cloud Run app needs, <span class="grad">nothing to glue</span></h2>
+  <p class="sub">One configuration covers services, jobs and schedules: the build, the runtime identity and its least-privilege grants, secrets, storage, networking, probes, scaling, access, traffic and releases. Every step reads the live project first and changes only what differs.</p>
   <div class="grid">
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg><h3>Builds that skip themselves</h3><p>Dockerfile or buildpacks on Cloud Build. Images are content-addressed: same source and base images, no rebuild.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><h3>A URL per branch</h3><p><code>--preview $BRANCH</code> deploys a revision with its own URL and no traffic. Merge to main and the release gets the traffic.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3"/><path d="M4 4v4h4M20 20v-4h-4"/></svg><h3>Canaries and rollback</h3><p><code>--traffic 10</code>, watch, <code>runway traffic --promote</code>. Roll back with one command. No revision churn.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/></svg><h3>Secrets without the dance</h3><p>Declared secrets are created empty, the right people can fill them, and the deploy waits (with the exact command) until they have a value.</p></div>
-    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5z"/><path d="M9 12l2 2 4-4"/></svg><h3>Least privilege by default</h3><p>A runtime service account per service, roles on exactly one dataset, bucket or secret, private by default, IAP when you want it.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5z"/><path d="M9 12l2 2 4-4"/></svg><h3>Least privilege by default</h3><p>A runtime service account per app, service or job, roles on exactly one dataset, bucket or secret, private by default, IAP when you want it. Removed access is revoked.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12V3h9l9 9-9 9z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg><h3>Org policies welcome</h3><p>Tags bound to the service and awaited until effective; a first deploy that satisfies <code>run.allowedIngress</code> conditions.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><h3>Exact plans</h3><p><code>runway plan</code> diffs config, image, traffic and grants against the live service, and says when something is only known at deploy time.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><h3>Observability built in</h3><p><code>otel_collector: {}</code> adds Google's OpenTelemetry Collector as a sidecar with the roles and APIs it needs. <code>runway logs --follow</code>.</p></div>
     <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c5 0 9 5 9 7a12 12 0 0 1-2.2 3.2M6.6 6.6C4.3 8 3 10.4 3 12c0 2 4 7 9 7a9.8 9.8 0 0 0 4.4-1"/></svg><h3>No state, no cluster</h3><p>The project is the state. Ownership labels keep runway away from what it did not create. Undeploy keeps your data.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M17.5 14v7M14 17.5h7"/></svg><h3>Services, jobs and schedules</h3><p>Several services, Cloud Run jobs and Cloud Scheduler jobs in one file. In a monorepo, <code>--only apps/web</code> deploys what a change touched.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><path d="M20 12l-8 8-9-9V3h8z"/><circle cx="7.5" cy="7.5" r="1.5"/><path d="M14 4l6 6"/></svg><h3>Release what you tested</h3><p><code>--tag-rc</code> to staging, then <code>--tag</code> ships that exact image to production: no rebuild, published to the repository you choose.</p></div>
+    <div class="card"><svg class="ic" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg><h3>Networks and databases</h3><p>Direct VPC egress (Shared VPC too), Cloud SQL sockets with the right role, and sandboxes for untrusted code.</p></div>
   </div>
 </div>
 </section>

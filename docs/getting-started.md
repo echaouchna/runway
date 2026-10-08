@@ -118,7 +118,40 @@ runway logs --stage dev --since 10m
 ```
 
 `runway init --image <image>` generates an image-based configuration instead.
-If a `Dockerfile` already exists, `init` only writes `runway.yaml`.
+If a `Dockerfile` already exists, `init` only writes `runway.yaml`. The
+generated file lists the common options as comments, each valid once
+uncommented.
+
+## Let runway create what it needs
+
+The quickest way to a first deploy: three settings let runway create the
+project-level resources a deploy needs, in a project where you can create
+them (roughly `roles/owner`, or the roles in [Permissions](permissions.md)).
+
+```yaml
+provider:
+  project: my-gcp-project
+  region: europe-west1
+  enable_apis: true             # enable the APIs this file needs
+  create_build_resources: true  # Artifact Registry repository, source bucket, build account and its roles
+service:
+  source: .
+  service_account: "hello-run@${project}.iam.gserviceaccount.com"
+  identity:
+    create: true                # create the runtime account
+    roles:                      # and grant it exactly this
+      - {role: roles/storage.objectViewer, bucket: my-data}
+```
+
+```console
+$ runway plan --stage dev       # lists every API, repository, account and grant it will create
+$ runway deploy --stage dev
+```
+
+runway never deletes what it created this way, except the runtime account
+when you [undeploy](undeploy.md) and nothing else uses it. In a project where
+you cannot create these resources, someone sets them up once (next section)
+and runway checks them (`runway doctor`).
 
 Ready-made examples live in [`examples/`](https://github.com/echaouchna/runway/tree/main/examples):
 [`hello-python`](https://github.com/echaouchna/runway/tree/main/examples/hello-python) (source build) and
@@ -163,6 +196,9 @@ buckets (`buckets:`), and the runtime service account with its grants
 | Source archives `gs://<bucket>/runway/<app>/source-<sha256>.tar.gz` | content-addressed |
 | Images `<location>-docker.pkg.dev/<project>/<repo>/<app>:src-<hash>`| content-addressed tag |
 | Cloud Build runs                                                    | tags `runway`, `runway-app-<app>`, `runway-stage-<stage>`, `runway-src-<hash>` |
+| Other services and jobs `<app>-<name>-<stage>` (`services:`, `jobs:`) | the same labels, plus `runway-name` |
+| Cloud Scheduler jobs `<app>-<name>-<stage>` (`schedules:`) and the scheduler account | a marker in the description; removed ones deleted by the next full deploy |
+| Images copied to a release repository (`release.repository`)         | same digest, release tags only |
 
 Exact setup (replace the first four values):
 
@@ -221,3 +257,14 @@ gcloud secrets add-iam-policy-binding database-url \
 Grant the runtime service account only what your application needs (for
 example `roles/cloudsql.client`). For image-only deployments, skip steps 2, 3
 and 5 and the build-related bindings in step 6.
+
+## Next steps
+
+- Add a second service, a job or a schedule:
+  [Services, jobs and schedules](services-and-jobs.md).
+- Give each branch a URL and roll out gradually:
+  [Previews, canaries and traffic](traffic.md).
+- Use secrets: [Secrets](secrets.md).
+- Deploy from CI: [CI/CD](ci-cd.md).
+- Release what you tested: [Releases](releases.md).
+- Every option: [Configuration](configuration.md).
