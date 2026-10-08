@@ -156,14 +156,23 @@ impl Reconciler<'_> {
     /// Sets one service annotation: an update of `annotations` only, so no
     /// revision is created and traffic is untouched.
     pub async fn set_annotation(&self, name: &str, key: &str, value: &str) -> Result<()> {
+        self.put_annotation(name, key, Some(value)).await
+    }
+
+    /// Sets (`Some`) or removes (`None`) one service annotation, as
+    /// [`Self::set_annotation`].
+    pub async fn put_annotation(&self, name: &str, key: &str, value: Option<&str>) -> Result<()> {
         for attempt in 1..=MAX_MUTATION_ATTEMPTS {
             let Some(mut svc) = self.get(name).await? else {
                 return Ok(());
             };
-            if svc.annotations.get(key).map(String::as_str) == Some(value) {
+            if svc.annotations.get(key).map(String::as_str) == value {
                 return Ok(());
             }
-            svc.annotations.insert(key.into(), value.into());
+            match value {
+                Some(v) => svc.annotations.insert(key.into(), v.into()),
+                None => svc.annotations.remove(key),
+            };
             match self
                 .run
                 .update_service()

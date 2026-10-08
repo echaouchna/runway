@@ -7,9 +7,14 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
 
 **Scope**
 
-- Cloud Run services, jobs and Cloud Scheduler jobs. No worker pools, no
-  Workflows, no custom domains or load balancers, no Serverless VPC Access
-  connectors (Direct VPC egress only). See the [roadmap](roadmap.md).
+- Cloud Run services, jobs and Cloud Scheduler jobs, and the load balancer,
+  certificates and DNS records of their custom domains. No worker pools, no
+  Workflows, no Serverless VPC Access connectors (Direct VPC egress only).
+  See the [roadmap](roadmap.md).
+- Custom domains: no Cloud CDN, Cloud Armor, IPv6 address or certificates
+  you bring; an existing load balancer's URL map must be in the deployment
+  project. Lists of backends, NEGs and certificates read one page (500
+  items) when looking for what to remove.
 - Jobs have no sidecars, OpenTelemetry Collector or health checks. Schedules
   run a job or call a service over HTTP (no Pub/Sub target).
 - Services and jobs are deployed one after another (not concurrently).
@@ -32,9 +37,9 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
   Google-managed OAuth client, which serves users of your organization.
 - Organizations restricting ingress to `internal` /
   `internal-and-cloud-load-balancing` without a tag exception block internet
-  traffic to the `run.app` URL; a load balancer is then needed, which runway
-  does not create. With a tag-based exception, use `service.tags` and
-  `service.bootstrap` (see [How it works](how-it-works.md)).
+  traffic to the `run.app` URL; serve the service through a load balancer
+  ([Custom domains](domains.md)). With a tag-based exception, use
+  `service.tags` and `service.bootstrap` (see [How it works](how-it-works.md)).
 
 **No state file**
 

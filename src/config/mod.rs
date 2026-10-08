@@ -188,6 +188,8 @@ pub struct Deployment {
     pub scheduler_region: String,
     /// Release flag of the stage and where its released images go.
     pub release: ReleaseSettings,
+    /// How the stage serves custom domains.
+    pub domains: DomainsSettings,
     /// Tags bound to the deployment project: namespaced key -> value short name.
     pub project_tags: BTreeMap<String, String>,
     /// Buckets runway creates and keeps configured, by key.
@@ -213,6 +215,62 @@ pub struct BucketConfig {
     pub versioning: Option<bool>,
     pub delete_after_days: Option<u32>,
     pub labels: BTreeMap<String, String>,
+}
+
+/// How a stage serves custom domains.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DomainsSettings {
+    pub mode: DomainMode,
+    /// Cloud DNS zone for the records; `None`: printed for you to create.
+    pub dns: Option<DnsZone>,
+    /// `existing-load-balancer`: the load balancer runway adds routes to.
+    pub existing: Option<ExistingLoadBalancer>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DomainMode {
+    /// A global external Application Load Balancer runway creates.
+    #[default]
+    LoadBalancer,
+    /// Routes and backends added to a load balancer runway does not own.
+    ExistingLoadBalancer,
+    /// Cloud Run domain mappings (preview, some regions).
+    DomainMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct DnsZone {
+    pub zone: String,
+    pub project: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExistingLoadBalancer {
+    pub url_map: String,
+    pub certificate_map: Option<String>,
+    pub address: Option<String>,
+}
+
+/// A custom domain of a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DomainEntry {
+    pub host: String,
+    /// A path prefix (load balancer modes), e.g. `/api/*`.
+    pub path: Option<String>,
+}
+
+impl DomainEntry {
+    /// `NAME.cloud.run`: a Cloud Run custom URL, whatever the mode.
+    pub fn is_cloud_run_url(&self) -> bool {
+        self.host.ends_with(".cloud.run")
+    }
+}
+
+impl std::fmt::Display for DomainEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.host, self.path.as_deref().unwrap_or(""))
+    }
 }
 
 /// `deploy --tag` (a release) or `deploy --tag-rc` (a release candidate).
@@ -466,6 +524,10 @@ pub struct ServiceConfig {
     /// Cloud SQL connection names (`PROJECT:REGION:INSTANCE`).
     pub cloud_sql: Vec<String>,
     pub custom_audiences: Vec<String>,
+    /// Custom domains of the service.
+    pub domains: Vec<DomainEntry>,
+    /// `*.preview.example.com`: preview URLs on a domain.
+    pub preview_domain: Option<String>,
     /// Entrypoint and arguments of the app container; empty: the image's.
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -1101,6 +1163,7 @@ pub fn resolve(
     };
     check_opt(&mut d, &artifact_repository, validate::repository_id);
     check_opt(&mut d, &artifact_location, validate::region);
+    let domains_settings = resolve_domains(&mut d, raw, st, stage, &project, &region);
     let release = resolve_release(
         &mut d,
         raw,
@@ -1135,6 +1198,42 @@ pub fn resolve(
         let service_id = workload_id(&mut d, &raw.app, stage, w);
         if let Some((artifact, service, job)) = resolve_workload(&mut d, &shared, w) {
             resolved_workloads.push((w.key.clone(), service_id, artifact, service, job));
+        }
+    }
+    // ---- custom domains across services ----
+    let mut seen: Vec<(DomainEntry, String)> = Vec::new();
+    for (key, _, _, svc, job) in &resolved_workloads {
+        if job.is_some() {
+            continue;
+        }
+        let at = key
+            .as_ref()
+            .map_or("service".to_string(), |k| format!("services.{k}"));
+        for e in &svc.domains {
+            if let Some((_, other)) = seen.iter().find(|(x, _)| x == e) {
+                d.error(
+                    format!("{at}.domains"),
+                    format!("`{e}` is also a domain of {other}"),
+                );
+            }
+            if domains_settings.mode == DomainMode::DomainMapping
+                && e.path.is_some()
+                && !e.is_cloud_run_url()
+            {
+                d.error(
+                    format!("{at}.domains"),
+                    format!(
+                        "`{e}`: a domain mapping maps a whole host; paths need a load balancer"
+                    ),
+                );
+            }
+            seen.push((e.clone(), at.clone()));
+        }
+        if svc.preview_domain.is_some() && domains_settings.mode == DomainMode::DomainMapping {
+            d.error(
+                format!("{at}.preview_domain"),
+                "preview URLs on a domain need a load balancer (`domains.mode`)",
+            );
         }
     }
     // ---- schedules ----
@@ -1187,6 +1286,7 @@ pub fn resolve(
             impersonate: impersonate.clone(),
             scheduler_region: scheduler_region.clone(),
             release: release.clone(),
+            domains: domains_settings.clone(),
             project_tags: project_tags.clone(),
             buckets: buckets.clone(),
             secrets: managed_secrets.clone(),
@@ -1900,6 +2000,48 @@ fn resolve_workload(
         }
     }
 
+    // ---- custom domains ----
+    let mut domains: Vec<DomainEntry> = Vec::new();
+    if let Some((list, path)) = s!(domains) {
+        for raw_entry in list {
+            let entry = ixs(&mut d, &raw_entry, &path);
+            // Host names are case-insensitive; URL paths are not.
+            let (host, url) = match entry.split_once('/') {
+                Some((h, p)) => (h.to_ascii_lowercase(), Some(format!("/{p}"))),
+                None => (entry.to_ascii_lowercase(), None),
+            };
+            let e = DomainEntry { host, path: url };
+            let check = match e.is_cloud_run_url() {
+                true if e.path.is_some() => {
+                    Err(format!("`{entry}`: a Cloud Run custom URL has no path"))
+                }
+                true => validate::cloud_run_url(&e.host),
+                false => validate::host_name(&e.host)
+                    .and_then(|_| e.path.as_deref().map_or(Ok(()), validate::url_path)),
+            };
+            if is_job {
+                d.error(path.clone(), "jobs have no URL");
+            } else if let Err(err) = check {
+                d.error(path.clone(), err);
+            } else if domains.contains(&e) {
+                d.warn(path.clone(), format!("`{e}` is listed twice"));
+            } else {
+                domains.push(e);
+            }
+        }
+    }
+    let preview_domain = s!(preview_domain).map(|(v, path)| {
+        let v = ixs(&mut d, &v, &path).to_ascii_lowercase();
+        match v.strip_prefix("*.") {
+            Some(rest) if validate::host_name(rest).is_ok() => {}
+            _ => d.error(
+                path,
+                format!("`{v}` must be a wildcard such as `*.preview.example.com`"),
+            ),
+        }
+        v
+    });
+
     // ---- sidecars ----
     let app_port = port;
     let mut sidecars_out = BTreeMap::new();
@@ -2248,6 +2390,8 @@ fn resolve_workload(
                 vpc,
                 cloud_sql,
                 custom_audiences,
+                domains,
+                preview_domain,
                 command,
                 args,
             },
@@ -2901,6 +3045,96 @@ fn normalize_path(p: &Path) -> PathBuf {
 }
 
 /// Merges `env`/`secrets` maps key by key. A `null` in the stage removes the key.
+/// How the stage serves custom domains (a stage block replaces the global).
+fn resolve_domains(
+    d: &mut Diagnostics,
+    raw: &RawConfig,
+    st: &RawStage,
+    stage: &str,
+    project: &str,
+    region: &str,
+) -> DomainsSettings {
+    let Some((raw_d, path)) = st
+        .domains
+        .as_ref()
+        .map(|x| (x, format!("stages.{stage}.domains")))
+        .or_else(|| raw.domains.as_ref().map(|x| (x, "domains".to_string())))
+    else {
+        return DomainsSettings::default();
+    };
+    let mode = match raw_d.mode.as_deref() {
+        None | Some("load-balancer") => DomainMode::LoadBalancer,
+        Some("existing-load-balancer") => DomainMode::ExistingLoadBalancer,
+        Some("domain-mapping") => {
+            if !validate::DOMAIN_MAPPING_REGIONS.contains(&region) {
+                d.error(
+                    format!("{path}.mode"),
+                    format!(
+                        "Cloud Run domain mappings are not available in {region} (only {}); use a load balancer",
+                        validate::DOMAIN_MAPPING_REGIONS.join(", ")
+                    ),
+                );
+            }
+            DomainMode::DomainMapping
+        }
+        Some(other) => {
+            d.error(
+                format!("{path}.mode"),
+                format!("`{other}` must be `load-balancer`, `existing-load-balancer` or `domain-mapping`"),
+            );
+            DomainMode::LoadBalancer
+        }
+    };
+    let dns = raw_d.dns.as_ref().map(|z| {
+        if let Err(e) = validate::dns_zone(&z.zone) {
+            d.error(format!("{path}.dns.zone"), e);
+        }
+        let zone_project = z.project.clone().unwrap_or_else(|| project.to_string());
+        if let Err(e) = validate::project_id(&zone_project) {
+            d.error(format!("{path}.dns.project"), e);
+        }
+        DnsZone {
+            zone: z.zone.clone(),
+            project: zone_project,
+        }
+    });
+    let existing = raw_d.load_balancer.as_ref().map(|lb| {
+        if mode != DomainMode::ExistingLoadBalancer {
+            d.error(
+                format!("{path}.load_balancer"),
+                "only with `mode: existing-load-balancer`",
+            );
+        }
+        if let Err(e) = validate::name_component("URL map name", &lb.url_map, 63) {
+            d.error(format!("{path}.load_balancer.url_map"), e);
+        }
+        if let Some(a) = &lb.address
+            && a.parse::<std::net::Ipv4Addr>().is_err()
+        {
+            d.error(
+                format!("{path}.load_balancer.address"),
+                format!("`{a}` is not an IPv4 address"),
+            );
+        }
+        ExistingLoadBalancer {
+            url_map: lb.url_map.clone(),
+            certificate_map: lb.certificate_map.clone(),
+            address: lb.address.clone(),
+        }
+    });
+    if mode == DomainMode::ExistingLoadBalancer && existing.is_none() {
+        d.error(
+            format!("{path}.load_balancer"),
+            "`existing-load-balancer` needs `load_balancer: {url_map: NAME}`",
+        );
+    }
+    DomainsSettings {
+        mode,
+        dns,
+        existing,
+    }
+}
+
 /// The stage's release flag and repository (the stage's replaces the global).
 fn resolve_release(
     d: &mut Diagnostics,

@@ -79,6 +79,10 @@ New here? Start with [Getting started](getting-started.md).
   without a rebuild, published to the Artifact Registry repository of your
   choice.
   [Releases](releases.md)
+- Custom domains: a load balancer runway creates (or routes in yours), or
+  Cloud Run domain mappings and `*.cloud.run` URLs, with managed certificates,
+  DNS records and preview URLs on your domain.
+  [Custom domains](domains.md)
 
 **Organizations**
 
@@ -106,6 +110,7 @@ New here? Start with [Getting started](getting-started.md).
 | Clean up previews of merged branches | `runway preview prune --stage S --yes` | [Traffic](traffic.md#managing-previews) |
 | Roll out gradually | `deploy --traffic 10`, then `traffic --promote` | [Traffic](traffic.md) |
 | Release what was tested | `deploy --tag-rc`, then `deploy --tag` | [Releases](releases.md) |
+| Serve a service on my domain | `domains: [shop.example.com]` | [Custom domains](domains.md) |
 | Use a secret | `secrets: {NAME: {secret: …}}` | [Secrets](secrets.md) |
 | Let people sign in with Google | `iap: {members: […]}` | [Configuration](configuration.md) |
 | Reach a VPC or Cloud SQL | `vpc:`, `cloud_sql:` | [Configuration](configuration.md#cpu-sandboxes-networking-and-cloud-sql) |
@@ -122,6 +127,7 @@ New here? Start with [Getting started](getting-started.md).
 | [Services, jobs and schedules](services-and-jobs.md) | Several apps per file, monorepos, Cloud Run jobs, Cloud Scheduler |
 | [Previews, canaries and traffic](traffic.md) | A URL per branch, gradual rollouts, rollback |
 | [Releases](releases.md) | Release tags, release candidates, promotion without rebuild |
+| [Custom domains](domains.md) | Load balancers, domain mappings, certificates, DNS records |
 | [Secrets](secrets.md) | References, files, secrets runway creates, rotation |
 | [CI/CD](ci-cd.md) | Workload Identity Federation, the container image, pipelines |
 | [Permissions](permissions.md) | Deployer, build, runtime and scheduler identities |

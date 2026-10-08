@@ -115,6 +115,14 @@ pub enum Step {
         /// Full name `projects/P/locations/R/jobs/ID`.
         name: String,
     },
+    /// Custom domains of the stage: load balancer, certificates, domain
+    /// mappings, DNS records (see [`crate::domains`]). With `removals`, also
+    /// what runway set up that `want` no longer lists.
+    Domains {
+        want: Box<crate::domains::Desired>,
+        previous: crate::domains::Recorded,
+        removals: bool,
+    },
 }
 
 /// Service annotation listing the grants runway manages for the service
@@ -337,6 +345,15 @@ impl Step {
                     name.rsplit('/').next().unwrap_or(name)
                 )
             }
+            Step::Domains { want, .. } if want.is_empty() => "remove custom domains".into(),
+            Step::Domains { want, .. } => format!(
+                "custom domains ({})",
+                match want.mode {
+                    crate::config::DomainMode::LoadBalancer => "load balancer",
+                    crate::config::DomainMode::ExistingLoadBalancer => "existing load balancer",
+                    crate::config::DomainMode::DomainMapping => "domain mappings",
+                }
+            ),
         }
     }
 
@@ -362,7 +379,7 @@ impl Step {
             | Step::IapInvoker
             | Step::IapAccess => 1,
             Step::Grant { .. } | Step::GrantMembers { .. } => 2,
-            Step::SecretValues(_) | Step::Schedule(_) => 3,
+            Step::SecretValues(_) | Step::Schedule(_) | Step::Domains { .. } => 3,
             // After the rollout, once the new revision no longer needs it.
             Step::Revoke(_) | Step::Untag { .. } | Step::Unschedule { .. } => 4,
         }
@@ -512,6 +529,22 @@ pub fn required_apis(d: &Deployment) -> Vec<String> {
     if !d.service.cloud_sql.is_empty() {
         add("sqladmin.googleapis.com");
     }
+    let load_balanced = d.domains.mode != crate::config::DomainMode::DomainMapping
+        && (d.service.preview_domain.is_some()
+            || d.service.domains.iter().any(|e| !e.is_cloud_run_url()));
+    if load_balanced {
+        add("compute.googleapis.com");
+        add("certificatemanager.googleapis.com");
+    }
+    // A zone in another project is that project's business.
+    if (!d.service.domains.is_empty() || d.service.preview_domain.is_some())
+        && d.domains
+            .dns
+            .as_ref()
+            .is_some_and(|z| z.project == d.project)
+    {
+        add("dns.googleapis.com");
+    }
     if d.service.otel_collector.is_some() {
         add("cloudtrace.googleapis.com");
         add("monitoring.googleapis.com");
@@ -521,6 +554,21 @@ pub fn required_apis(d: &Deployment) -> Vec<String> {
     apis.sort();
     apis.dedup();
     apis
+}
+
+/// The custom domains step: when runway.yaml has domains, or when the
+/// holder's record says some were set up (to remove them, with `removals`).
+pub fn domains_step(
+    r: &Resolved,
+    previous: Option<crate::domains::Recorded>,
+    removals: bool,
+) -> Option<Step> {
+    let configured = crate::domains::configured(r);
+    (configured || (removals && previous.is_some())).then(|| Step::Domains {
+        want: Box::new(crate::domains::desired(r)),
+        previous: previous.unwrap_or_default(),
+        removals,
+    })
 }
 
 /// API enablement runs first, before anything else is read or created.
@@ -1026,6 +1074,9 @@ pub struct Endpoints {
     /// Cloud Run (jobs; services use the client given to the provisioner).
     pub run: Option<String>,
     pub scheduler: Option<String>,
+    pub compute: Option<String>,
+    pub certificate_manager: Option<String>,
+    pub dns: Option<String>,
 }
 
 pub struct Provisioner<'a> {
@@ -1047,6 +1098,10 @@ pub struct Provisioner<'a> {
     /// (policy, role, member): the next read decides. Present means runway's
     /// write committed, so the grant is runway's; missing means it did not.
     uncertain: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// What steps want said (DNS records to create elsewhere, certificate
+    /// states), shared by the views; see [`Provisioner::take_notes`].
+    notes: Arc<Mutex<Vec<String>>>,
+    domain_endpoints: crate::domains::Endpoints,
 }
 
 fn missing<T>(c: &Option<T>, what: &str) -> Result<T>
@@ -1171,6 +1226,13 @@ impl<'a> Provisioner<'a> {
             project_number: Default::default(),
             granted: Default::default(),
             uncertain: Default::default(),
+            notes: Default::default(),
+            domain_endpoints: crate::domains::Endpoints {
+                compute: ep.compute.clone(),
+                certificates: ep.certificate_manager.clone(),
+                dns: ep.dns.clone(),
+                run: ep.run.clone(),
+            },
             service_usage: ep
                 .service_usage
                 .clone()
@@ -1198,7 +1260,70 @@ impl<'a> Provisioner<'a> {
             service_usage: self.service_usage.clone(),
             granted: self.granted.clone(),
             uncertain: self.uncertain.clone(),
+            notes: self.notes.clone(),
+            domain_endpoints: self.domain_endpoints.clone(),
         }
+    }
+
+    /// Messages steps left for the user (each once), then forgets them.
+    pub fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.lock().expect("not poisoned"))
+    }
+
+    fn note(&self, n: String) {
+        let mut notes = self.notes.lock().expect("not poisoned");
+        if !notes.contains(&n) {
+            notes.push(n);
+        }
+    }
+
+    /// Runs the domains engine; DNS records to create elsewhere and
+    /// certificate states become notes.
+    async fn domains(
+        &self,
+        want: &crate::domains::Desired,
+        previous: &crate::domains::Recorded,
+        removals: bool,
+        apply: bool,
+        keep_cloud_run_urls: bool,
+    ) -> Result<crate::domains::Report> {
+        let d = self.d;
+        let engine = crate::domains::Engine::new(
+            self.session,
+            &d.project,
+            &d.region,
+            &d.app,
+            &d.stage,
+            apply,
+            &self.domain_endpoints,
+        )
+        .await?;
+        let report = engine
+            .reconcile(want, previous, removals, keep_cloud_run_urls)
+            .await?;
+        for n in &report.notes {
+            self.note(n.clone());
+        }
+        for rec in report.manual() {
+            self.note(format!(
+                "DNS: create {} {} -> {} ELSEWHERE: {}",
+                rec.kind, rec.name, rec.data, rec.state
+            ));
+        }
+        Ok(report)
+    }
+
+    /// `undeploy`: what removing every custom domain of the stage does (or
+    /// did, with `apply`). `NAME.cloud.run` URLs stay unless `release_urls`.
+    pub async fn teardown_domains(
+        &self,
+        previous: &crate::domains::Recorded,
+        apply: bool,
+        release_urls: bool,
+    ) -> Result<crate::domains::Report> {
+        let want = crate::domains::desired_of(self.d, &[]);
+        self.domains(&want, previous, true, apply, !release_urls)
+            .await
     }
 
     fn workloads(&self) -> Vec<&'a Deployment> {
@@ -1805,6 +1930,22 @@ impl<'a> Provisioner<'a> {
                     None => (StepState::InSync, "already deleted".into()),
                 }
             }
+            Step::Domains {
+                want,
+                previous,
+                removals,
+            } => {
+                let report = self
+                    .domains(want, previous, *removals, false, false)
+                    .await?;
+                match report.changes.is_empty() {
+                    true => (StepState::InSync, "up to date".into()),
+                    false if want.is_empty() => {
+                        (StepState::PendingRemoval, report.changes.join("; "))
+                    }
+                    false => (StepState::Pending, report.changes.join("; ")),
+                }
+            }
         })
     }
 
@@ -2148,6 +2289,17 @@ impl<'a> Provisioner<'a> {
                             if live.is_some() { "updated" } else { "created" }.into(),
                         )
                     }
+                }
+            }
+            Step::Domains {
+                want,
+                previous,
+                removals,
+            } => {
+                let report = self.domains(want, previous, *removals, true, false).await?;
+                match report.changes.is_empty() {
+                    true => (StepOutcome::Unchanged, "up to date".into()),
+                    false => (StepOutcome::Changed, report.changes.join("; ")),
                 }
             }
             Step::Unschedule { name } => {

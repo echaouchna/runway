@@ -81,6 +81,10 @@ Cloud Run application** in one file and one tool:
 - **Secrets without the dance.** Declare a secret, runway creates it empty,
   grants who may fill it, and stops the deploy (with the exact command) until
   it has a value.
+- **Your own domains.** `domains: [shop.example.com]`: runway creates the
+  load balancer (or adds routes to yours), the managed certificates and the
+  DNS records, and removes them when you do. Domain mappings and
+  `*.cloud.run` URLs too.
 - **Networks and databases.** Direct VPC egress (Shared VPC too), Cloud SQL
   connections, and Cloud Run sandboxes for untrusted code.
 - **Built for real organizations.** Org-policy-friendly first deploys,

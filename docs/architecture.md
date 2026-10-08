@@ -54,8 +54,11 @@ deploy:
   Resource Manager, IAM, Secret Manager, Service Usage, Artifact Registry,
   BigQuery and IAP use the official `google-cloud-*` Rust crates. Small REST
   adapters exist only where no SDK call exists: the OCI registry v2 protocol
-  (digest lookup, tag listing) and Service Usage `v1beta1
-  generateServiceIdentity`. One field is newer than the Cloud Run crate
+  (digest lookup, tag listing), Service Usage `v1beta1
+  generateServiceIdentity`, and Cloud Run domain mappings (only in the
+  Cloud Run Admin API v1, `domains.cloudrun.com/v1`, in `gcp/domain_mapping.rs`).
+  Compute Engine (load balancers), Certificate Manager and Cloud DNS use their
+  SDK crates (`domains.rs`). One field is newer than the Cloud Run crate
   (1.15): `Container.sandboxLauncher`. It is set and read through the SDK's
   unknown-field passthrough (a JSON round trip of the `Container`, in
   `gcp/run.rs`), not a separate client; switch to the typed field once the
@@ -63,6 +66,12 @@ deploy:
 - **No state file.** Ownership is encoded in labels (`managed-by=runway`,
   `runway-app`, `runway-stage`) and in a marker in the description of service
   accounts runway creates. runway refuses to modify what it does not own.
+  Compute resources (load balancer parts, host rules and path matchers in a
+  shared URL map) and Cloud Scheduler jobs carry the marker
+  `managed-by=runway app=… stage=…` in their description. DNS records cannot
+  carry one: runway changes or deletes a record only when its data is what
+  runway set. The URL and certificate maps runway added routes to are
+  recorded on the service (`runway.dev/domains`).
 - **Steps, not state.** Provisioning is a list of steps; each re-reads before
   writing, so partial failures resume naturally. runway records the grants
   it adds (annotation `runway.dev/grants`) and revokes only those, except on

@@ -620,6 +620,85 @@ pub fn time_zone(s: &str) -> Result<(), String> {
     }
 }
 
+/// A host name for a custom domain: lowercase labels of letters, digits and
+/// hyphens, at least two labels, up to 253 characters.
+pub fn host_name(s: &str) -> Result<(), String> {
+    let labels: Vec<&str> = s.split('.').collect();
+    let ok = s.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        });
+    match ok {
+        true => Ok(()),
+        false => Err(format!(
+            "`{s}` is not a host name (lowercase letters, digits and hyphens, for example `shop.example.com`)"
+        )),
+    }
+}
+
+/// A URL path prefix for a load balancer route: `/api`, `/api/*`.
+pub fn url_path(s: &str) -> Result<(), String> {
+    let body = s.strip_suffix("/*").unwrap_or(s);
+    let ok = s.starts_with('/')
+        && !body.contains('*')
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/-._~".contains(c));
+    match ok {
+        true => Ok(()),
+        false => Err(format!(
+            "`{s}` is not a path prefix (for example `/api` or `/api/*`)"
+        )),
+    }
+}
+
+/// A Cloud Run custom URL `NAME.cloud.run`: NAME is 6 to 63 characters.
+pub fn cloud_run_url(s: &str) -> Result<(), String> {
+    let name = s.strip_suffix(".cloud.run").unwrap_or("");
+    let ok = (6..=63).contains(&name.len())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    match ok {
+        true => Ok(()),
+        false => Err(format!(
+            "`{s}`: a Cloud Run custom URL is NAME.cloud.run, NAME being 6 to 63 lowercase letters, digits or hyphens"
+        )),
+    }
+}
+
+/// A Cloud DNS managed zone name.
+pub fn dns_zone(s: &str) -> Result<(), String> {
+    match is_dns_label(s) && s.len() <= 63 {
+        true => Ok(()),
+        false => Err(format!(
+            "`{s}` is not a managed zone name (the zone's name, such as `example-com`, not its DNS name)"
+        )),
+    }
+}
+
+/// Regions where Cloud Run domain mappings are available.
+pub const DOMAIN_MAPPING_REGIONS: &[&str] = &[
+    "asia-east1",
+    "asia-northeast1",
+    "asia-southeast1",
+    "europe-north1",
+    "europe-west1",
+    "europe-west4",
+    "us-central1",
+    "us-east1",
+    "us-east4",
+    "us-west1",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

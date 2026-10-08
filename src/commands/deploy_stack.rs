@@ -10,10 +10,13 @@ use crate::cli::{Context, DeployArgs};
 use crate::commands::deploy::{
     after_rollout, bootstrap_spec, effective_retry, report_step, roll_out, save_grants, tagged_url,
 };
-use crate::commands::plan::{ImageDecision, decide_image, holder_record, job_for_mode, job_labels};
+use crate::commands::plan::{
+    ImageDecision, decide_image, holder_records, job_for_mode, job_labels,
+};
 use crate::commands::registry_client;
 use crate::config::{Artifact, BuildConfig, Deployment, Resolved, WorkloadKind};
 use crate::deploy::{AccessChange, Reconciler, ServiceChange, check_ownership};
+use crate::domains::{ANNOTATION_DOMAINS, Recorded};
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::jobs::{JobChange, JobReconciler, check_job_ownership};
 use crate::gcp::run;
@@ -22,9 +25,9 @@ use crate::output::{OutputFormat, Progress, print_json};
 use crate::plan::{ImagePlan, ServiceSpec};
 use crate::poll::PollConfig;
 use crate::provision::{
-    ANNOTATION_GRANTS, ManagedGrant, Provisioner, Step, StepOutcome, StepResult, encode_grants,
-    grant_record, merge_removals, schedule_steps, stack_api_step, stack_managed_grants,
-    stack_pre_steps, stack_revoke_steps,
+    ANNOTATION_GRANTS, ManagedGrant, Provisioner, Step, StepOutcome, StepResult, domains_step,
+    encode_grants, grant_record, merge_removals, schedule_steps, stack_api_step,
+    stack_managed_grants, stack_pre_steps, stack_revoke_steps,
 };
 use crate::retry::{RetryConfig, with_retry};
 use crate::traffic::Mode;
@@ -144,6 +147,81 @@ pub async fn save_holder(
     }
     let live = reconciler.get(&name).await?;
     save_grants(reconciler, &name, live.as_ref(), record, p).await
+}
+
+/// Writes (`Some`) or removes the custom domains record on the holder, a
+/// service runway owns (or adopts).
+pub async fn save_domains_record(
+    reconciler: &Reconciler<'_>,
+    holder: &Holder<'_>,
+    value: Option<&Recorded>,
+    p: &Progress,
+) -> Result<()> {
+    if holder.d.is_job() {
+        return Ok(());
+    }
+    let name = holder.d.service_name();
+    let Some(svc) = reconciler.get(&name).await? else {
+        return Ok(());
+    };
+    if run::ownership_of(&svc.labels, &holder.d.app, &holder.d.stage) != run::Ownership::Owned
+        && !holder.adopting
+    {
+        p.warn(format!(
+            "custom domains not recorded: {} is not managed by runway for this app and stage; removing them from runway.yaml will not remove their routes from a shared load balancer",
+            holder.d.service_id
+        ));
+        return Ok(());
+    }
+    let value = value.map(Recorded::encode);
+    reconciler
+        .put_annotation(&name, ANNOTATION_DOMAINS, value.as_deref())
+        .await
+}
+
+/// Applies the custom domains step. What it may touch is recorded first, so
+/// that a failure leaves a record a later deploy or undeploy can clean up;
+/// then what is set up (nothing once domains are gone).
+pub async fn apply_domains(
+    provisioner: &Provisioner<'_>,
+    reconciler: &Reconciler<'_>,
+    holder: &Holder<'_>,
+    step: &Step,
+    retry: &RetryConfig,
+    p: &Progress,
+    report: &dyn Fn(&StepResult),
+) -> Result<Vec<StepResult>> {
+    let Step::Domains {
+        want,
+        previous,
+        removals,
+    } = step
+    else {
+        return Err(Error::internal("not a domains step"));
+    };
+    let target = Recorded::of(want);
+    let touched = previous.union(&target);
+    with_retry(retry, p, "record custom domains", |_| {
+        save_domains_record(reconciler, holder, Some(&touched), p)
+    })
+    .await?;
+    let done = provisioner
+        .apply_all(std::slice::from_ref(step), retry, p, report)
+        .await;
+    for n in provisioner.take_notes() {
+        p.warn(n);
+    }
+    let done = done?;
+    let last = match (*removals, want.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(target),
+        (false, _) => Some(touched),
+    };
+    with_retry(retry, p, "record custom domains", |_| {
+        save_domains_record(reconciler, holder, last.as_ref(), p)
+    })
+    .await?;
+    Ok(done)
 }
 
 pub async fn run(
@@ -275,7 +353,7 @@ pub async fn run(
 
     // 2. Inspect: every workload, one image decision per distinct build, and
     //    the grants recorded on the holder. Ownership is checked first.
-    let (mut lives, decisions, by_workload, recorded) =
+    let (mut lives, decisions, by_workload, (recorded, domains_previous)) =
         with_retry(&retry, p, "inspect current state", |_| async {
             let mut lives = Vec::new();
             for d in &ws {
@@ -313,8 +391,8 @@ pub async fn run(
                 };
                 by_workload.push(i);
             }
-            let recorded = holder_record(r, &run_client, &jobs_client).await?;
-            Ok((lives, decisions, by_workload, recorded))
+            let records = holder_records(r, &run_client, &jobs_client).await?;
+            Ok((lives, decisions, by_workload, records))
         })
         .await?;
     for (d, live) in ws.iter().zip(&lives) {
@@ -554,6 +632,10 @@ pub async fn run(
         if is_holder(d, holder.d) && (!record.is_empty() || !recorded.is_empty()) {
             annotations.insert(ANNOTATION_GRANTS.to_string(), encode_grants(&record));
         }
+        // Unchanged by the rollout: the domains step updates it.
+        if let Some(prev) = domains_previous.as_ref().filter(|_| is_holder(d, holder.d)) {
+            annotations.insert(ANNOTATION_DOMAINS.to_string(), prev.encode());
+        }
         if let Some(rel) = releases.iter().find(|(o, _)| *o == k).map(|(_, r)| r) {
             annotations.insert(naming::ANNOTATION_RELEASE.to_string(), rel.tag.clone());
         }
@@ -648,6 +730,18 @@ pub async fn run(
         }
     }
 
+    if let Mode::Preview { tag } = &mode {
+        for d in selected.iter().filter(|d| !d.is_job()) {
+            if let Some(wildcard) = &d.service.preview_domain {
+                p.info(format!(
+                    "{} preview on your domain: https://{tag}.{} (once the load balancer and its certificate are ready)",
+                    d.name(),
+                    wildcard.trim_start_matches("*.")
+                ));
+            }
+        }
+    }
+
     // 6. Schedules (full deploys, for the targets deployed), then removals:
     //    only after a full deploy of everything, once every service serves
     //    one revision (a preview, canary or partial rollout may need access).
@@ -702,6 +796,23 @@ pub async fn run(
         post.extend(removals);
     }
     let any_url = service_results.iter().find_map(|s| s.url.clone());
+    // Custom domains, once the services exist (full deploys; removals only
+    // when everything is deployed).
+    if let Some(step) = domains_step(r, domains_previous.clone(), everything).filter(|_| full) {
+        p.step("Custom domains");
+        apply_domains(
+            &provisioner,
+            &reconciler,
+            &holder,
+            &step,
+            &retry,
+            p,
+            &report,
+        )
+        .await
+        .map_err(|e| after_rollout(e, first, any_url.as_deref()))
+        .map(|done| steps.extend(done))?;
+    }
     if !post.is_empty() {
         match provisioner.apply_all(&post, &retry, p, &report).await {
             Ok(done) => steps.extend(done),

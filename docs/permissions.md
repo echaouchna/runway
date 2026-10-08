@@ -33,6 +33,9 @@ Extra deployer permissions for the optional features:
 | `undeploy` | also `run.jobs.list` (in `roles/run.developer`), to keep an account a job still runs as; without it the account is kept |
 | `jobs` | `run.jobs.*` (in `roles/run.developer`) and `iam.serviceAccounts.actAs` on the job's runtime account |
 | `schedules` | `roles/cloudscheduler.admin`, `iam.serviceAccounts.actAs` (`roles/iam.serviceAccountUser`) on the scheduler account, `run.services.setIamPolicy`/`run.jobs.setIamPolicy` on the targets (`roles/run.admin`), and with the default account `roles/iam.serviceAccountAdmin` to create it |
+| `domains` (load balancer modes) | `roles/compute.loadBalancerAdmin` (NEGs, backend services, URL maps, proxies, forwarding rules, addresses) and `roles/certificatemanager.owner` on the deployment project; with an existing load balancer, `compute.urlMaps.get`/`update` on its URL map |
+| `domains` (domain mappings, custom URLs) | `run.domainmappings.*` (in `roles/run.admin`); domain mappings also need the domain verified in Search Console with the deployer as an owner |
+| `domains.dns` | `roles/dns.admin` on the zone's project (without it, runway prints the records to create elsewhere) |
 | `vpc` | nothing extra in the same project (the Cloud Run service agent's default role covers it); Shared VPC: the **service agent** needs `roles/compute.networkUser` on the host project or subnet (runway does not grant it) |
 | `cloud_sql` | `roles/resourcemanager.projectIamAdmin` on each instance's project (runway grants the runtime account `roles/cloudsql.client` there) |
 | `volumes` | nothing extra; the **runtime** service account needs access to the bucket (grant it with `identity.roles`) |

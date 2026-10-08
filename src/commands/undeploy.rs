@@ -14,7 +14,7 @@
 use crate::build_client;
 use crate::cli::{Context, UndeployArgs};
 use crate::commands::{connect, load};
-use crate::config::{Artifact, Deployment, Overrides};
+use crate::config::{Artifact, Deployment, Overrides, Resolved};
 use crate::deploy::check_ownership;
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::{api_error, is_not_found};
@@ -453,6 +453,29 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
             .await?
         }
     };
+    // Custom domains go with the whole stage, first: the load balancer
+    // routes to the services.
+    let domains_previous = match whole {
+        false => None,
+        true => domains_record(&resolved, &run_client, &jobs_client).await?,
+    };
+    if let Some(previous) = &domains_previous {
+        let report = with_retry(&retry, p, "inspect custom domains", |_| {
+            prov.teardown_domains(previous, false, args.release_urls)
+        })
+        .await?;
+        domain_items(&report, &mut items);
+    } else if !whole
+        && targets
+            .iter()
+            .any(|d| !d.service.domains.is_empty() || d.service.preview_domain.is_some())
+    {
+        items.push(item(
+            Action::Keep,
+            "custom domains",
+            "routed to what is removed until runway.yaml no longer lists them and the stage is deployed",
+        ));
+    }
     let label = targets
         .iter()
         .map(|d| d.service_id.as_str())
@@ -482,6 +505,19 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(previous) = &domains_previous {
+        p.step("Removing custom domains");
+        let report = with_retry(&retry, p, "remove custom domains", |_| {
+            prov.teardown_domains(previous, true, args.release_urls)
+        })
+        .await?;
+        for n in prov.take_notes() {
+            p.warn(n);
+        }
+        for c in &report.changes {
+            mark(&mut items, c.trim_start_matches("- "), StepOutcome::Changed);
+        }
+    }
     // Triggers first, so nothing calls a target being deleted.
     let scheduler = prov.scheduler_client()?;
     for name in &schedules {
@@ -533,6 +569,39 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What runway set up for the stage's custom domains: the holder's record,
+/// with what runway.yaml names (a lost record leaves nothing behind); `None`
+/// when there is neither (no domain call is made).
+async fn domains_record(
+    r: &Resolved,
+    run: &Services,
+    jobs: &Jobs,
+) -> Result<Option<crate::domains::Recorded>> {
+    let (_, recorded) = crate::commands::plan::holder_records(r, run, jobs).await?;
+    if recorded.is_none() && !crate::domains::configured(r) {
+        return Ok(None);
+    }
+    let named = crate::domains::Recorded::of(&crate::domains::desired(r));
+    Ok(Some(recorded.unwrap_or_default().union(&named)))
+}
+
+/// Undeploy items of a custom domains teardown.
+fn domain_items(report: &crate::domains::Report, items: &mut Vec<Item>) {
+    for c in &report.changes {
+        items.push(item(
+            Action::Delete,
+            c.trim_start_matches("- "),
+            "custom domains of the stage",
+        ));
+    }
+    for (resource, reason) in &report.kept {
+        items.push(item(Action::Keep, resource, reason));
+    }
+    for n in &report.notes {
+        items.push(item(Action::Keep, "note", n));
+    }
 }
 
 /// `--preview NAME`: the preview's URL on every selected service, and the

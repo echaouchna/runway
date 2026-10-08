@@ -7,6 +7,7 @@
 //! account (Workload Identity Federation) configurations used in CI.
 
 pub mod bucket;
+pub mod domain_mapping;
 pub mod iam;
 pub mod jobs;
 pub mod logging;

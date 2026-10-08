@@ -376,6 +376,10 @@ pub struct UndeployArgs {
     /// runway.yaml no longer lists.
     #[arg(long, conflicts_with = "preview")]
     pub orphans: bool,
+    /// Also delete the stage's `NAME.cloud.run` custom URLs (kept by
+    /// default: once deleted, anyone can claim the name).
+    #[arg(long)]
+    pub release_urls: bool,
     /// Maximum time to wait for the service deletion.
     #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
     pub timeout: std::time::Duration,
