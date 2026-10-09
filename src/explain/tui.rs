@@ -1,9 +1,10 @@
 //! The full-screen browser of `runway explain`: keys on the left, what the
-//! selected one does on the right, `/` to search, `f` for the keys your
-//! file sets.
+//! selected one does on the right, `/` to search (best matches first), `f`
+//! for the keys your file sets.
 
 use super::catalog::{Entry, catalog, find, is_placeholder};
 use super::file::FileInfo;
+use super::search::{EXAMPLES, Hit, search_among};
 use crate::error::{Error, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -74,6 +75,8 @@ pub struct App {
     roots: Vec<usize>,
     expanded: BTreeSet<usize>,
     visible: Vec<usize>,
+    /// While searching, the results: `visible` holds their nodes.
+    hits: Vec<Hit>,
     list: ListState,
     scroll: u16,
     /// The furthest the explanation scrolls (from the last drawing).
@@ -99,6 +102,7 @@ impl App {
             roots: Vec::new(),
             expanded: BTreeSet::new(),
             visible: Vec::new(),
+            hits: Vec::new(),
             list: ListState::default(),
             scroll: 0,
             max_scroll: 0,
@@ -182,26 +186,13 @@ impl App {
     }
 
     fn matches(&self, id: usize) -> bool {
-        let n = &self.nodes[id];
-        let words: Vec<String> = self
-            .query
-            .to_lowercase()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-        let hay = match n.entry {
-            Some(e) => format!(
-                "{} {} {} {}",
-                e.path,
-                e.name(),
-                e.summary(),
-                e.kind.as_deref().unwrap_or("")
-            )
-            .to_lowercase(),
-            None => n.label.to_lowercase(),
-        };
-        (words.is_empty() || words.iter().all(|w| hay.contains(w.as_str())))
-            && (!self.only_file || self.in_file(id))
+        !self.only_file || self.in_file(id)
+    }
+
+    fn node_of(&self, e: &Entry) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|n| n.entry.is_some_and(|x| std::ptr::eq(x, e)))
     }
 
     /// The node (or a key below it) is set in the file.
@@ -214,19 +205,36 @@ impl App {
         }
     }
 
-    fn filtering(&self) -> bool {
-        !self.query.trim().is_empty() || self.only_file
+    fn searching(&self) -> bool {
+        !self.query.trim().is_empty()
     }
 
-    /// Recomputes the rows, keeping the selected node when it stays visible.
+    fn filtering(&self) -> bool {
+        self.searching() || self.only_file
+    }
+
+    /// Recomputes the rows, keeping the selected node when it stays visible:
+    /// the results of the search, best first, or the tree.
     fn refresh(&mut self) {
         let keep = self.selected_node();
-        let mut visible = Vec::new();
-        let roots = self.roots.clone();
-        for r in roots {
-            self.collect(r, &mut visible);
+        if self.searching() {
+            // `f` narrows what is searched, before results are ranked and cut.
+            let eligible = |e: &Entry| self.node_of(e).is_some_and(|id| self.matches(id));
+            let found: Vec<(usize, Hit)> = search_among(&self.query, eligible)
+                .into_iter()
+                .filter_map(|h| Some((self.node_of(h.entry)?, h)))
+                .collect();
+            self.visible = found.iter().map(|(id, _)| *id).collect();
+            self.hits = found.into_iter().map(|(_, h)| h).collect();
+        } else {
+            self.hits.clear();
+            let mut visible = Vec::new();
+            let roots = self.roots.clone();
+            for r in roots {
+                self.collect(r, &mut visible);
+            }
+            self.visible = visible;
         }
-        self.visible = visible;
         let i = keep
             .and_then(|k| self.visible.iter().position(|v| *v == k))
             .unwrap_or(0);
@@ -314,18 +322,16 @@ impl App {
             match k.code {
                 KeyCode::Char(c) if !ctrl => {
                     self.query.push(c);
-                    self.refresh();
-                    self.select(self.first_match());
+                    self.select_best();
                 }
                 KeyCode::Backspace => {
                     self.query.pop();
-                    self.refresh();
+                    self.select_best();
                 }
                 KeyCode::Enter => self.typing = false,
                 KeyCode::Esc => {
                     self.typing = false;
-                    self.query.clear();
-                    self.refresh();
+                    self.leave_search();
                 }
                 KeyCode::Down => self.select(i + 1),
                 KeyCode::Up => self.select(i.saturating_sub(1)),
@@ -369,8 +375,8 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::Esc if self.filtering() => {
-                self.query.clear();
+            KeyCode::Esc if self.searching() => self.leave_search(),
+            KeyCode::Esc if self.only_file => {
                 self.only_file = false;
                 self.refresh();
             }
@@ -391,23 +397,27 @@ impl App {
         self.scroll = (self.scroll as i32 + n).clamp(0, self.max_scroll as i32) as u16;
     }
 
-    /// The first key whose name has the query, else the first match.
-    fn first_match(&self) -> usize {
-        let q = self.query.trim().to_lowercase();
-        let named = |id: &usize| {
-            self.nodes[*id]
-                .entry
-                .is_some_and(|e| !q.is_empty() && e.name().to_lowercase().contains(&q))
-        };
-        self.visible
-            .iter()
-            .position(|id| named(id) && self.matches(*id))
-            .or_else(|| {
-                self.visible
-                    .iter()
-                    .position(|id| self.matches(*id) && self.nodes[*id].entry.is_some())
-            })
-            .unwrap_or(0)
+    /// After the query changed: the best match, from the top.
+    fn select_best(&mut self) {
+        self.refresh();
+        self.select(0);
+        self.scroll = 0;
+    }
+
+    /// Back to the tree, unfolded at the key picked in the results.
+    fn leave_search(&mut self) {
+        let picked = self
+            .selected_node()
+            .and_then(|id| self.nodes[id].entry)
+            .filter(|_| self.searching())
+            .map(|e| e.path.clone());
+        self.query.clear();
+        match picked {
+            Some(path) => {
+                self.go_to(&path);
+            }
+            None => self.refresh(),
+        }
     }
 
     /// Unfolds a folded node; otherwise moves to the explanation.
@@ -502,15 +512,25 @@ impl App {
                 .areas(main);
 
         let width = left.width.saturating_sub(4) as usize;
-        let items: Vec<ListItem> = self
-            .visible
-            .iter()
-            .map(|id| ListItem::new(self.row(*id, width)))
-            .collect();
-        let keys_title = match (self.filtering(), self.only_file) {
-            (_, true) => " Keys in your file ".to_string(),
-            (true, _) => format!(" Keys matching \"{}\" ", self.query.trim()),
-            _ => " Keys ".into(),
+        let items: Vec<ListItem> = match self.searching() {
+            true => self
+                .visible
+                .iter()
+                .zip(&self.hits)
+                .map(|(id, hit)| ListItem::new(self.hit_row(*id, hit, width)))
+                .collect(),
+            false => self
+                .visible
+                .iter()
+                .map(|id| ListItem::new(self.row(*id, width)))
+                .collect(),
+        };
+        let query = clip_end(self.query.trim(), width.saturating_sub(18));
+        let keys_title = match (self.searching(), self.only_file) {
+            (true, true) => format!(" Your keys for \"{query}\" "),
+            (true, false) => format!(" Best matches for \"{query}\" "),
+            (false, true) => " Keys in your file ".to_string(),
+            (false, false) => " Keys ".into(),
         };
         // The focused panel has a bright border.
         let border = |focused: bool| match focused {
@@ -640,15 +660,18 @@ impl App {
     fn status_line(&self) -> Line<'static> {
         let t = self.theme;
         if self.typing {
-            let n = self.visible.iter().filter(|id| self.matches(**id)).count();
+            let help = match self.searching() {
+                true => format!(
+                    "   {} match(es) · ↑↓ pick · Enter keep · Esc clear",
+                    self.hits.len()
+                ),
+                false => "   a key, a word, or what you want to do · Esc cancel".into(),
+            };
             return Line::from(vec![
                 Span::styled(" / ", t.fg(t.cyan).add_modifier(Modifier::BOLD)),
                 Span::raw(self.query.clone()),
                 Span::styled("█", t.fg(t.cyan)),
-                Span::styled(
-                    format!("   {n} match(es) · Enter keep · Esc clear"),
-                    t.fg(t.dim),
-                ),
+                Span::styled(help, t.fg(t.dim)),
             ]);
         }
         let mut hints = match self.reading {
@@ -667,6 +690,12 @@ impl App {
                 }
                 h
             }
+            false if self.searching() => vec![
+                ("↑↓", "move"),
+                ("→ Enter", "read"),
+                ("/", "change the search"),
+                ("Esc", "back to the tree"),
+            ],
             false => vec![
                 ("↑↓", "move"),
                 ("→ Enter", "read"),
@@ -722,6 +751,50 @@ impl App {
         ])
     }
 
+    /// A result: its full path, then why it was found and what it does.
+    fn hit_row(&self, id: usize, hit: &Hit, width: usize) -> Text<'static> {
+        let t = self.theme;
+        let e = hit.entry;
+        let (mark, mark_style) = self.marker(id);
+        let room = width.saturating_sub(mark.chars().count());
+        let label = match e.is_topic() {
+            true => clip_start(e.name(), room),
+            false => clip_start(&e.path, room),
+        };
+        let (parents, name) = match label.rfind('.') {
+            Some(i) if !e.is_topic() => label.split_at(i + 1),
+            _ => ("", label.as_str()),
+        };
+        let name_style = match e.is_topic() {
+            true => t.fg(t.violet).add_modifier(Modifier::BOLD),
+            false => t.fg(t.cyan).add_modifier(Modifier::BOLD),
+        };
+        let pad = width.saturating_sub(label.chars().count() + mark.chars().count());
+        let head = Line::from(vec![
+            Span::styled(parents.to_string(), t.fg(t.muted)),
+            Span::styled(name.to_string(), name_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(mark, mark_style),
+        ]);
+        let mut room = width.saturating_sub(2);
+        let mut note = vec![Span::raw("  ")];
+        if let Some(why) = &hit.why {
+            let why = clip_end(why, room);
+            room = room.saturating_sub(why.chars().count() + 3);
+            note.push(Span::styled(why, t.fg(t.amber)));
+            if room > 0 {
+                note.push(Span::styled(" · ", t.fg(t.dim)));
+            }
+        }
+        if room > 0 {
+            note.push(Span::styled(
+                clip_end(&first_sentence(e.summary()), room),
+                t.fg(t.dim),
+            ));
+        }
+        Text::from(vec![head, Line::from(note)])
+    }
+
     /// ✗ a problem, ● set in the file, ◦ something below it is set.
     fn marker(&self, id: usize) -> (&'static str, Style) {
         let t = self.theme;
@@ -756,11 +829,20 @@ impl App {
 
     /// The title and text of the selected node.
     fn details(&self) -> (String, Text<'static>) {
+        if self.typing && !self.searching() {
+            return ("Search".into(), self.search_tips(None));
+        }
         let Some(id) = self.selected_node() else {
-            return (
-                "Nothing matches".into(),
-                Text::from("Esc clears the search."),
-            );
+            return match self.searching() {
+                true => (
+                    "Nothing matches".into(),
+                    self.search_tips(Some(&self.query)),
+                ),
+                false => (
+                    "Nothing matches".into(),
+                    Text::from("Esc clears the filter."),
+                ),
+            };
         };
         let n = &self.nodes[id];
         match n.entry {
@@ -924,6 +1006,43 @@ impl App {
         lines
     }
 
+    /// How to search, with examples; `failed` is a query nothing matches.
+    fn search_tips(&self, failed: Option<&str>) -> Text<'static> {
+        let t = self.theme;
+        let mut lines = Vec::new();
+        if let Some(q) = failed {
+            lines.push(Line::styled(
+                format!("Nothing matches \"{}\".", q.trim()),
+                Style::new().add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(
+                "Try fewer words, other words, or say what you want to do.",
+            ));
+            lines.push(Line::raw(""));
+        }
+        lines.push(inline(
+            "Type a key, a word, or what you want to do. Keys, topics and their explanations are searched, best match first: word forms, other names (`ram` for memory) and typos are understood, and each result says why it was found.",
+            Style::new(),
+            t,
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("For example", t.heading()));
+        let w = EXAMPLES.iter().map(|(q, _)| q.len()).max().unwrap_or(0);
+        for (q, path) in EXAMPLES {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {q:w$}  "), t.fg(t.cyan)),
+                Span::styled(format!("→ {path}"), t.fg(t.muted)),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(inline(
+            "`↑` `↓` pick a result, `Enter` keeps the results to browse them, `Esc` goes back to the tree at the key you picked.",
+            Style::new(),
+            t,
+        ));
+        Text::from(lines)
+    }
+
     fn children_text(&self, children: &[usize]) -> Text<'static> {
         let t = self.theme;
         let mut lines = vec![Line::styled("Keys", t.heading())];
@@ -1017,7 +1136,7 @@ impl App {
             ("Enter Tab", "read the explanation"),
             ("← h", "fold, then go to the parent"),
             ("Space", "fold or unfold"),
-            ("Esc", "clear the search, then quit"),
+            ("Esc", "leave the search (at the key picked), then quit"),
             ("", "In the explanation"),
             ("↑ ↓  j k", "scroll"),
             ("g G", "top, bottom"),
@@ -1030,7 +1149,7 @@ impl App {
             ),
             (
                 "/",
-                "search keys and explanations (Enter keeps, Esc clears)",
+                "search: a key, a word or what you want to do, best first",
             ),
             ("f", "only the keys your runway.yaml sets"),
             ("n", "next key with a problem"),
@@ -1079,6 +1198,27 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         w,
         h,
     )
+}
+
+/// The end of `s` in `w` columns, `…` marking what is cut.
+fn clip_start(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    match n <= w {
+        true => s.to_string(),
+        false if w == 0 => String::new(),
+        false => std::iter::once('…')
+            .chain(s.chars().skip(n - (w - 1)))
+            .collect(),
+    }
+}
+
+/// The start of `s` in `w` columns, `…` marking what is cut.
+fn clip_end(s: &str, w: usize) -> String {
+    match s.chars().count() <= w {
+        true => s.to_string(),
+        false if w == 0 => String::new(),
+        false => s.chars().take(w - 1).chain(std::iter::once('…')).collect(),
+    }
 }
 
 fn first_sentence(s: &str) -> String {
@@ -1213,6 +1353,104 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         assert!(!app.filtering());
         assert!(!app.quit, "Esc first clears the search");
+    }
+
+    fn selected_path(app: &App) -> Option<&'static str> {
+        app.selected_node()
+            .and_then(|id| app.nodes[id].entry)
+            .map(|e| e.path.as_str())
+    }
+
+    #[test]
+    fn search_guides_from_what_you_want_to_do_to_the_key() {
+        let mut app = App::new(None, false);
+        app.on_key(key(KeyCode::Char('/')));
+        let s = screen(&mut app);
+        assert!(
+            s.contains("For example") && s.contains("keep an instance warm"),
+            "{s}"
+        );
+        for c in "keep an instance warm".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            selected_path(&app),
+            Some("service.min_instances"),
+            "best first"
+        );
+        let s = screen(&mut app);
+        assert!(
+            s.contains("Best matches for \"keep an instance warm\""),
+            "{s}"
+        );
+        assert!(s.contains("for \"keep warm\""), "why it was found: {s}");
+        assert!(s.contains("Instances kept running"), "the explanation: {s}");
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.typing && app.searching(), "Enter keeps the results");
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.searching() && !app.quit, "Esc leaves the search");
+        assert_eq!(
+            selected_path(&app),
+            Some("service.min_instances"),
+            "the tree opens at the key picked"
+        );
+    }
+
+    #[test]
+    fn a_search_without_results_says_how_to_search() {
+        let mut app = App::new(None, false);
+        app.on_key(key(KeyCode::Char('/')));
+        for c in "zzqx".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let s = screen(&mut app);
+        assert!(s.contains("Nothing matches \"zzqx\""), "{s}");
+        assert!(s.contains("For example"), "{s}");
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.filtering() && app.selected_node().is_some());
+    }
+
+    #[test]
+    fn search_results_are_limited_to_your_keys_with_f() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(
+            &p,
+            "version: 1\napp: shop\nprovider: {project: my-gcp-project, region: europe-west1}\nservice:\n  image: europe-west1-docker.pkg.dev/my-gcp-project/apps/shop:1\n  service_account: rt@my-gcp-project.iam.gserviceaccount.com\n  memory: 1Gi\nstages:\n  dev: {}\n",
+        )
+        .unwrap();
+        let mut app = App::new(FileInfo::load(&p), false);
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('m')));
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Char('m')));
+        app.on_key(key(KeyCode::Enter));
+        let all = app.hits.len();
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(app.hits.len() < all, "{} of {all}", app.hits.len());
+        assert_eq!(selected_path(&app), Some("service.memory"));
+        assert!(screen(&mut app).contains("Your keys for \"mem\""));
+    }
+
+    #[test]
+    fn your_keys_are_found_even_when_others_outrank_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(
+            &p,
+            "version: 1\napp: shop\nprovider: {project: my-gcp-project, region: europe-west1}\nservice:\n  image: europe-west1-docker.pkg.dev/my-gcp-project/apps/shop:1\n  service_account: rt@my-gcp-project.iam.gserviceaccount.com\n  cloud_sql: [db]\nstages:\n  dev: {}\n",
+        )
+        .unwrap();
+        let mut app = App::new(FileInfo::load(&p), false);
+        app.on_key(key(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('/')));
+        for c in "service".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let found: Vec<&str> = app.hits.iter().map(|h| h.entry.path.as_str()).collect();
+        assert!(found.contains(&"service.cloud_sql"), "{found:?}");
+        assert!(app.visible.iter().all(|id| app.in_file(*id)), "{found:?}");
     }
 
     #[test]

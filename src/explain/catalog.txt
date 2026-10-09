@@ -3,11 +3,13 @@
 # A block starts with `@ PATH` (a key, with `<name>` for names you choose, or
 # `:topic` for a guide). Then optional `title:`, `type:`, `default:`,
 # `group:` (to group a service key), `docs:` (page#anchor), `see:` (related
-# keys), `resolved:` (where the resolved value is, `-` for nowhere), then
+# keys), `also:` (other words people search for it with, or what it is for:
+# `ram, keep warm`), `resolved:` (where the resolved value is, `-` for nowhere), then
 # paragraphs (the first one is the summary), `Example:` (indented lines) and
 # `Rules:` (`- ` lines). Lines starting with `#` are comments.
 
 @ :start
+also: getting started, begin, minimal file, hello world, introduction, tutorial
 title: Start here
 docs: configuration.md
 runway.yaml describes a Cloud Run application: how its image is built, how it runs, who may call it, what it needs (secrets, buckets, a runtime identity), and the stages it is deployed to. `runway plan` shows what a deploy would change; `runway deploy` makes the live project match the file.
@@ -37,6 +39,7 @@ Rules:
 - `runway validate` checks the file without credentials; `runway describe --stage S` explains what a stage deploys.
 
 @ :layers
+also: override per stage, precedence, inherit, merge, remove an inherited key, environment specific
 title: Stages, defaults and precedence
 docs: configuration.md#stage-override-precedence
 see: stages, defaults, stages.<name>.service
@@ -59,6 +62,7 @@ Rules:
 - Scalars cannot be removed with `null`, only replaced.
 
 @ :variables
+also: interpolation, template, placeholder, substitution, dollar
 title: Variables
 docs: configuration.md#variables
 see: vars, buckets, secrets
@@ -76,6 +80,7 @@ Rules:
 - Unknown variables are validation errors.
 
 @ :names
+also: naming, service name, labels, ownership, managed by runway
 title: Names of what runway creates
 docs: configuration.md#several-services-jobs-and-schedules
 see: app, services, jobs
@@ -87,6 +92,7 @@ Rules:
 - A service and a job cannot share a name, and none can be the app name.
 
 @ version
+also: schema version
 type: integer
 docs: configuration.md
 The schema version of the file. Only `1` exists.
@@ -96,6 +102,7 @@ Rules:
 - Required.
 
 @ app
+also: application name, app name
 type: string
 docs: configuration.md
 see: :names
@@ -107,6 +114,7 @@ Rules:
 - Changing it deploys new services under new names (the old ones stay until `undeploy`).
 
 @ vars
+also: custom variables, constants, my own variables
 type: map of strings
 docs: configuration.md#variables
 see: :variables, stages.<name>.vars
@@ -116,6 +124,7 @@ Example:
     data_project: my-data-project
 
 @ provider
+also: google cloud, gcp, where to deploy
 type: block
 docs: configuration.md
 Where the app is deployed (project and region), how images are built (repository, source bucket, build account) and what runway may create for you. A stage can override any of it.
@@ -127,6 +136,7 @@ Example:
     create_build_resources: true
 
 @ provider.project
+also: gcp project, project id, google cloud project
 type: string
 resolved: /project
 docs: configuration.md
@@ -137,6 +147,7 @@ Rules:
 - Required (here or in every stage).
 
 @ provider.region
+also: location, zone, europe, datacenter
 type: string
 resolved: /region
 docs: configuration.md
@@ -147,6 +158,7 @@ Rules:
 - Required (here or in every stage).
 
 @ provider.enable_apis
+also: enable services, turn on apis, service usage, api not enabled
 type: boolean
 default: false
 resolved: /apis/enable
@@ -160,6 +172,7 @@ Rules:
 - APIs are never disabled by runway, not even by `undeploy`.
 
 @ provider.apis
+also: extra apis, google apis
 type: list of strings
 resolved: /apis/extra
 docs: configuration.md
@@ -168,6 +181,7 @@ Example:
   apis: [telemetry.googleapis.com, translate.googleapis.com]
 
 @ provider.create_build_resources
+also: first time setup, build setup
 type: boolean
 default: false
 docs: getting-started.md#let-runway-create-what-it-needs
@@ -176,6 +190,7 @@ Example:
   create_build_resources: true
 
 @ provider.artifact_repository
+also: docker registry, container registry, artifact registry, image repository, where images are pushed
 type: string
 default: runway (with create_build_resources)
 docs: configuration.md
@@ -186,6 +201,7 @@ Rules:
 - Required for source builds, unless `create_build_resources` is true.
 
 @ provider.artifact_location
+also: registry location, multi region
 type: string
 default: provider.region
 docs: configuration.md
@@ -194,6 +210,7 @@ Example:
   artifact_location: europe
 
 @ provider.source_bucket
+also: upload bucket, staging bucket
 type: string
 default: <project>-runway-sources (with create_build_resources)
 docs: configuration.md
@@ -204,6 +221,7 @@ Rules:
 - Required for source builds, unless `create_build_resources` is true.
 
 @ provider.build_service_account
+also: cloud build account, build identity
 type: string
 default: runway-build@<project>.iam.gserviceaccount.com (with create_build_resources)
 docs: permissions.md
@@ -214,6 +232,7 @@ Rules:
 - Required for source builds, unless `create_build_resources` is true.
 
 @ provider.impersonate_service_account
+also: impersonation, act as, delegation, token creator
 type: string
 resolved: /impersonate
 docs: ci-cd.md
@@ -224,6 +243,7 @@ Rules:
 - `--impersonate-service-account` on the command line wins.
 
 @ provider.tags
+also: organization policy, org policy, resource manager tags
 type: map
 resolved: /project_tags
 docs: how-it-works.md
@@ -237,6 +257,7 @@ Rules:
 - A stage map replaces the inherited one.
 
 @ service
+also: main service, web app, api, container, http server
 type: block
 docs: configuration.md
 see: defaults, services, :layers
@@ -252,6 +273,7 @@ Rules:
 - Optional when `services` or `jobs` exist.
 
 @ service.source
+also: build from source, build from code, folder, directory, cloud build
 type: path
 default: . (when there is no image)
 group: Build and image
@@ -265,6 +287,7 @@ Rules:
 - Services and jobs with the same build (folder, Dockerfile or builder) share one image, built once.
 
 @ service.dockerfile
+also: docker, dockerfile path, containerfile
 type: path
 default: Dockerfile, if present (else buildpacks)
 group: Build and image
@@ -275,6 +298,7 @@ Example:
   dockerfile: docker/Dockerfile.prod
 
 @ service.builder
+also: buildpacks, builder image, without dockerfile
 type: image
 default: gcr.io/buildpacks/builder:latest
 group: Build and image
@@ -287,6 +311,7 @@ Rules:
 - The default is a moving tag: each new digest rebuilds. Pin it for reproducible builds.
 
 @ service.rebuild
+also: force build, build cache, always rebuild
 type: on-change | always
 default: on-change
 group: Build and image
@@ -296,6 +321,7 @@ Example:
   rebuild: always
 
 @ service.image
+also: prebuilt image, existing image, docker image, container image, image tag, digest
 type: image reference
 group: Build and image
 resolved: /artifact
@@ -308,6 +334,7 @@ Rules:
 - `--image` on `plan`/`deploy` overrides it.
 
 @ service.command
+also: entrypoint, start command, cmd
 type: list of strings
 default: the image's entrypoint
 group: Build and image
@@ -318,6 +345,7 @@ Example:
   args: [--workers, "2", app:app]
 
 @ service.args
+also: arguments, flags, parameters
 type: list of strings
 default: the image's arguments
 group: Build and image
@@ -327,6 +355,7 @@ Example:
   args: [--workers, "2"]
 
 @ service.port
+also: listen port, http port
 type: integer
 default: 8080
 group: Resources and scaling
@@ -336,6 +365,7 @@ Example:
   port: 3000
 
 @ service.cpu
+also: vcpu, processor, cores, compute
 type: number or string
 default: 1
 group: Resources and scaling
@@ -348,6 +378,7 @@ Rules:
 - Jobs need at least 1.
 
 @ service.memory
+also: ram, memory limit, out of memory, oom, gigabytes
 type: string
 default: 512Mi
 group: Resources and scaling
@@ -360,6 +391,7 @@ Rules:
 - More memory needs more CPU: above 4Gi at least 2 CPUs, above 8Gi 4, above 16Gi 6, above 24Gi 8.
 
 @ service.timeout_seconds
+also: request timeout, slow requests, long requests, deadline, 504
 type: integer
 default: 300
 group: Resources and scaling
@@ -371,6 +403,7 @@ Rules:
 - For a job, see `jobs.<name>.timeout_seconds` (a task timeout).
 
 @ service.concurrency
+also: requests per instance, parallel requests, simultaneous requests, throughput
 type: integer
 default: 80
 group: Resources and scaling
@@ -380,6 +413,7 @@ Example:
   concurrency: 20
 
 @ service.min_instances
+also: keep warm, always on, cold start, idle instances, minimum instances, scale to zero
 type: integer
 default: 0
 group: Resources and scaling
@@ -391,6 +425,7 @@ Rules:
 - At most `max_instances`. runway warns that warm instances are billed.
 
 @ service.max_instances
+also: autoscaling limit, autoscale, scale out, cap cost, maximum instances, limit instances
 type: integer
 default: 10
 group: Resources and scaling
@@ -400,6 +435,7 @@ Example:
   max_instances: 50
 
 @ service.billing
+also: cpu always allocated, cpu throttling, background work, background tasks, pricing, cost
 type: request-based | instance-based
 default: request-based
 group: Resources and scaling
@@ -411,6 +447,7 @@ Rules:
 - `instance-based` needs at least 1 CPU and 512Mi.
 
 @ service.startup_cpu_boost
+also: faster startup, cold start, slow start, boost
 type: boolean
 default: false
 group: Resources and scaling
@@ -420,6 +457,7 @@ Example:
   startup_cpu_boost: true
 
 @ service.execution_environment
+also: gen1, gen2, generation, linux compatibility, gvisor
 type: gen1 | gen2
 default: Cloud Run chooses
 group: Resources and scaling
@@ -431,6 +469,7 @@ Rules:
 - gen2 needs at least 512Mi; gen1 cannot mount Cloud Storage volumes.
 
 @ service.sandbox
+also: untrusted code, isolation, ai generated code, headless browser
 type: boolean
 default: false
 group: Resources and scaling
@@ -443,6 +482,7 @@ Rules:
 - Sandboxes share the container's CPU and memory.
 
 @ service.public
+also: unauthenticated, allow unauthenticated, allusers, anonymous, open to the internet, private service, who can call
 type: boolean
 default: false
 group: Access and networking
@@ -454,6 +494,7 @@ Rules:
 - Organizations with Domain Restricted Sharing refuse `allUsers`: keep the service private or use `iap`.
 
 @ service.ingress
+also: internal only, internal traffic, load balancer only, restrict traffic, private service
 type: all | internal | internal-and-cloud-load-balancing
 default: all
 group: Access and networking
@@ -465,6 +506,7 @@ Rules:
 - With `domains` behind a load balancer, `internal-and-cloud-load-balancing` forces traffic through it.
 
 @ service.iap
+also: identity aware proxy, google login, sign in, sso, employees only, authentication
 type: block
 group: Access and networking
 docs: configuration.md#removing-access
@@ -485,6 +527,7 @@ Example:
   iap: {enabled: false}
 
 @ service.iap.members
+also: allowed users, who can access
 type: list of principals
 docs: configuration.md#removing-access
 Who may pass IAP (`roles/iap.httpsResourceAccessor`): `user:`, `group:`, `domain:` or `serviceAccount:` principals.
@@ -492,6 +535,7 @@ Example:
   members: [group:finops@example.com]
 
 @ service.tags
+also: organization policy, org policy
 type: map
 group: Access and networking
 docs: how-it-works.md
@@ -504,6 +548,7 @@ Rules:
 - Keys are `ORG_OR_PROJECT_ID/key`; `null` in a stage removes an inherited tag.
 
 @ service.bootstrap
+also: first deploy, placeholder, organization policy
 type: block
 group: Access and networking
 docs: how-it-works.md
@@ -529,6 +574,7 @@ Example:
   image: us-docker.pkg.dev/cloudrun/container/hello
 
 @ service.custom_audiences
+also: id token audience, jwt audience
 type: list of strings
 group: Access and networking
 docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
@@ -539,6 +585,7 @@ Rules:
 - Changing it creates no revision. Audiences set outside runway are removed.
 
 @ service.vpc
+also: private network, private ip, vpc connector, serverless vpc access, shared vpc, redis, memorystore, internal ip
 type: block
 group: Access and networking
 docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
@@ -568,6 +615,7 @@ Rules:
 - `/26` or larger in practice (about two addresses per instance).
 
 @ service.vpc.egress
+also: all traffic, cloud nat, static outbound ip, fixed ip, outbound traffic
 type: private-ranges-only | all-traffic
 default: private-ranges-only
 docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
@@ -576,6 +624,7 @@ Example:
   egress: all-traffic
 
 @ service.vpc.network_tags
+also: firewall rules
 type: list of strings
 docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
 Network tags on the instances, for firewall rules.
@@ -583,6 +632,7 @@ Example:
   network_tags: [run-egress]
 
 @ service.domains
+also: custom domain, my own domain, hostname, url, https certificate, ssl certificate
 type: list of strings
 group: Domains
 docs: domains.md
@@ -596,6 +646,7 @@ Rules:
 - Changes with a full deploy; removed domains are cleaned up by a full deploy of everything.
 
 @ service.preview_domain
+also: preview url, branch preview, pull request environment, review app
 type: wildcard host
 group: Domains
 docs: domains.md#previews-on-your-domain
@@ -606,6 +657,7 @@ Rules:
 - Load balancer modes only (not `domain-mapping`).
 
 @ service.service_account
+also: runtime identity, runtime account, permissions, iam, who the app runs as
 type: email
 group: Identity, secrets and env
 docs: permissions.md
@@ -617,6 +669,7 @@ Rules:
 - Required (here, in `defaults` or on each service and job).
 
 @ service.identity
+also: create service account, grant roles, permissions, iam
 type: block
 group: Identity, secrets and env
 docs: configuration.md#removing-access
@@ -647,6 +700,7 @@ Example:
   display_name: hello runtime
 
 @ service.identity.roles
+also: grant role, permissions, iam binding, access bigquery, access bucket
 type: list
 docs: configuration.md#removing-access
 Roles granted to the runtime account, each on exactly one resource: a `project`, a `bucket`, a `dataset` or a `secret`.
@@ -693,6 +747,7 @@ Example:
   secret: database-url
 
 @ service.env
+also: environment variables, env vars, config, settings, dotenv
 type: map
 group: Identity, secrets and env
 docs: configuration.md
@@ -706,6 +761,7 @@ Rules:
 - `null` in a stage removes an inherited variable.
 
 @ service.secrets
+also: secret manager, password, database password, api key, credentials, token, sensitive
 type: map
 group: Identity, secrets and env
 docs: secrets.md
@@ -732,6 +788,7 @@ Example:
   secret: database-url
 
 @ service.secrets.<NAME>.version
+also: pin secret version, latest secret, rotate secret
 type: number or latest
 default: newest version, pinned at deploy (files: latest)
 docs: secrets.md
@@ -742,6 +799,7 @@ Rules:
 - `latest` for an environment variable is accepted with a warning: instances read it at start.
 
 @ service.secrets.<NAME>.path
+also: secret file, mount secret
 type: absolute path
 docs: secrets.md
 Mount the secret as a file at this path instead of an environment variable.
@@ -751,6 +809,7 @@ Rules:
 - One secret file per directory.
 
 @ service.volumes
+also: mount bucket, gcs fuse, cloud storage, files, disk, persistent storage, filesystem
 type: map
 group: Storage and databases
 docs: configuration.md
@@ -798,6 +857,7 @@ Example:
   mount_options: [implicit-dirs]
 
 @ service.cloud_sql
+also: database, postgres, postgresql, mysql, sql server, db connection
 type: list of strings
 group: Storage and databases
 docs: configuration.md#cpu-sandboxes-networking-and-cloud-sql
@@ -809,6 +869,7 @@ Rules:
 - For private IP, use `vpc` and the instance's address instead.
 
 @ service.health_check
+also: probes, readiness, liveness, startup probe, healthz, health endpoint
 type: block
 group: Containers and health
 docs: configuration.md
@@ -865,6 +926,7 @@ docs: configuration.md
 Failed probes before the instance counts as failed.
 
 @ service.health_check.liveness
+also: restart instance, liveness probe
 type: boolean or block
 default: true (every 30s, timeout 3s, 3 failures)
 docs: configuration.md
@@ -873,6 +935,7 @@ Example:
   liveness: {period_seconds: 60}
 
 @ service.sidecars
+also: multi container, extra container, proxy, nginx, cache container
 type: map
 group: Containers and health
 docs: configuration.md#sidecars
@@ -964,6 +1027,7 @@ Example:
   volumes: {cache: /cache}
 
 @ service.otel_collector
+also: opentelemetry, tracing, traces, metrics, logs, observability, prometheus, monitoring
 type: block
 group: Containers and health
 docs: configuration.md
@@ -1009,6 +1073,7 @@ docs: configuration.md
 Your own collector configuration.
 
 @ defaults
+also: shared settings, common settings, every service, base config
 type: block (service keys)
 docs: configuration.md#several-services-jobs-and-schedules
 see: service, :layers
@@ -1020,6 +1085,7 @@ Example:
     env: {LOG_LEVEL: info}
 
 @ services
+also: multiple services, several services, microservices, backend, frontend, worker
 type: map
 docs: services-and-jobs.md#add-a-second-service
 see: service, defaults
@@ -1039,6 +1105,7 @@ Rules:
 - Names are lowercase letters, digits and hyphens, and cannot be the app name.
 
 @ jobs
+also: batch, migration, database migration, one off task, run to completion, worker
 type: map
 docs: services-and-jobs.md#add-a-job
 see: schedules
@@ -1058,6 +1125,7 @@ Rules:
 - With the same build as a service, the image is built once.
 
 @ jobs.<name>.tasks
+also: parallel tasks, split work, shards, array job
 type: integer
 default: 1
 resolved: /kind/tasks
@@ -1067,6 +1135,7 @@ Example:
   tasks: 10
 
 @ jobs.<name>.parallelism
+also: concurrent tasks
 type: integer
 default: 0 (as many as possible)
 resolved: /kind/parallelism
@@ -1076,6 +1145,7 @@ Example:
   parallelism: 2
 
 @ jobs.<name>.max_retries
+also: retry failed task
 type: integer
 default: 3
 resolved: /kind/max_retries
@@ -1085,6 +1155,7 @@ Example:
   max_retries: 1
 
 @ jobs.<name>.timeout_seconds
+also: job timeout, long running
 type: integer
 default: 600
 resolved: /service/timeout_seconds
@@ -1094,6 +1165,7 @@ Example:
   timeout_seconds: 1800
 
 @ schedules
+also: cron, cron job, every night, nightly, every hour, daily, periodic, recurring, timetable, scheduled task
 type: map
 docs: services-and-jobs.md#run-a-job-every-night
 see: scheduler, jobs
@@ -1114,6 +1186,7 @@ docs: services-and-jobs.md#run-a-job-every-night
 One schedule, with exactly one target: `job` or `service`.
 
 @ schedules.<name>.schedule
+also: cron expression, crontab, every day
 type: cron
 docs: services-and-jobs.md#run-a-job-every-night
 When it runs, in unix cron format.
@@ -1123,6 +1196,7 @@ Rules:
 - Required.
 
 @ schedules.<name>.time_zone
+also: timezone, utc
 type: IANA time zone
 default: Etc/UTC
 docs: services-and-jobs.md#run-a-job-every-night
@@ -1183,12 +1257,14 @@ docs: configuration.md#several-services-jobs-and-schedules
 How long an attempt may take, from 15 to 1800 seconds.
 
 @ schedules.<name>.paused
+also: disable schedule, pause, suspend
 type: boolean
 default: false
 docs: configuration.md#several-services-jobs-and-schedules
 Keep the schedule paused.
 
 @ scheduler
+also: cloud scheduler account
 type: block
 docs: configuration.md#several-services-jobs-and-schedules
 see: schedules
@@ -1219,6 +1295,7 @@ Example:
   region: europe-west1
 
 @ release
+also: promote, promotion, release candidate, rc, version tag, semver, production release
 type: block
 docs: releases.md
 see: stages.<name>.release
@@ -1228,6 +1305,7 @@ Example:
     repository: {project: my-release-project, repository: releases}
 
 @ release.flag
+also: tag rc
 type: tag | tag-rc
 resolved: /release/flag
 docs: releases.md#release-what-you-tested
@@ -1271,6 +1349,7 @@ Rules:
 - Required.
 
 @ domains
+also: load balancer, domain mapping, custom domain setup, certificates, https
 type: block
 docs: domains.md
 see: service.domains
@@ -1281,6 +1360,7 @@ Example:
     dns: {zone: example-com}
 
 @ domains.mode
+also: domain mapping, global load balancer
 type: load-balancer | existing-load-balancer | domain-mapping
 default: load-balancer
 resolved: /domains/mode
@@ -1292,6 +1372,7 @@ Rules:
 - `domain-mapping` needs a supported region and no paths nor `preview_domain`.
 
 @ domains.dns
+also: cloud dns, dns records, a record, dns zone
 type: block
 docs: domains.md#dns-records
 A Cloud DNS zone runway writes the records to (A records, certificate authorizations, mapping records). Without it, or without permission, `plan` and `deploy` print the records to create elsewhere.
@@ -1316,6 +1397,7 @@ docs: domains.md#dns-records
 The zone's project.
 
 @ domains.load_balancer
+also: existing load balancer, url map
 type: block
 docs: domains.md#an-existing-load-balancer
 The load balancer runway adds routes to, with `mode: existing-load-balancer` (which requires it).
@@ -1341,6 +1423,7 @@ docs: domains.md#an-existing-load-balancer
 The load balancer's IP, for the hosts' A records.
 
 @ retry
+also: retries, flaky, transient errors, backoff
 type: block
 docs: how-it-works.md#failure-handling-and-recovery
 How deploy retries a failed step (top level only); `--retries` overrides the attempts.
@@ -1357,6 +1440,7 @@ docs: how-it-works.md#failure-handling-and-recovery
 Total attempts per step, from 1 (no retry) to 20.
 
 @ retry.delay
+also: backoff
 type: duration
 default: 5s
 docs: how-it-works.md#failure-handling-and-recovery
@@ -1369,6 +1453,7 @@ docs: how-it-works.md#failure-handling-and-recovery
 The longest delay between attempts.
 
 @ buckets
+also: create bucket, storage, gcs, cloud storage bucket, object storage, s3
 type: map
 docs: configuration.md
 see: service.volumes, service.identity.roles.bucket
@@ -1400,16 +1485,19 @@ docs: configuration.md
 The bucket location. It cannot change once created.
 
 @ buckets.<key>.storage_class
+also: nearline, coldline, archive, cheaper storage
 type: string
 docs: configuration.md
 The default storage class, for example `STANDARD` or `NEARLINE`.
 
 @ buckets.<key>.versioning
+also: object versions, backup
 type: boolean
 docs: configuration.md
 Keep previous versions of objects.
 
 @ buckets.<key>.delete_after_days
+also: lifecycle, expire, ttl, retention, clean up old files
 type: integer
 docs: configuration.md
 Delete objects older than this many days.
@@ -1420,6 +1508,7 @@ docs: configuration.md
 Your labels; runway adds its own.
 
 @ secrets
+also: create secret, empty secret, secret value
 type: map
 docs: secrets.md
 see: service.secrets
@@ -1443,6 +1532,7 @@ Example:
   name: "${app}-${stage}-api-key"
 
 @ secrets.<key>.adders
+also: who can add secret values, secret writers
 type: list of principals
 docs: secrets.md
 Who may add values (`roles/secretmanager.secretVersionAdder`). On a secret runway created, adders not listed are removed.
@@ -1450,6 +1540,7 @@ Example:
   adders: [group:devops@example.com]
 
 @ secrets.<key>.locations
+also: replication
 type: list of strings
 default: [provider.region]
 docs: secrets.md
@@ -1461,6 +1552,7 @@ docs: secrets.md
 Your labels; runway adds its own.
 
 @ stages
+also: environments, dev, staging, prod, production, per environment
 type: map
 docs: configuration.md#stage-override-precedence
 see: :layers
@@ -1486,6 +1578,7 @@ docs: configuration.md#variables
 Variables of this stage, overriding the top-level ones.
 
 @ stages.<name>.provider
+also: another project per stage, separate project
 type: block (provider keys)
 docs: configuration.md#stage-override-precedence
 Provider settings of this stage, for example another project.
@@ -1493,6 +1586,7 @@ Example:
   provider: {project: my-prod-project}
 
 @ stages.<name>.service
+also: override per stage, production settings, environment override
 type: block (service keys)
 docs: configuration.md#stage-override-precedence
 The main service in this stage: only what differs.

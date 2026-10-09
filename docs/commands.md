@@ -35,7 +35,7 @@ and warnings to stderr, so JSON output stays parseable.
 |---------|-------------|
 | `runway init [--app] [--project] [--region] [--image] [--dir]` | Scaffold `runway.yaml` and a runnable example. Never overwrites files. |
 | `runway validate [--stage S]` | Offline validation of all stages. |
-| `runway explain [KEY] [--plain \| --agent]` | Offline: learn `runway.yaml`. In a terminal, a browser of every key (what it does, default, example, rules, docs link), with what your file sets: where each key is set, its resolved value per stage, and validation problems. `/` searches, `f` shows only your keys, `n` jumps to the next problem. With a key (`service.vpc`, `services.web.memory`, `stages.prod.service.env`, `variables`), prints it; in a pipe, lists every key; `--agent` prints Markdown for LLMs and coding agents; `-o json` for scripts. See [Learn the configuration](#learn-the-configuration). |
+| `runway explain [KEY] [--plain \| --agent]` | Offline: learn `runway.yaml`. In a terminal, a browser of every key (what it does, default, example, rules, docs link), with what your file sets: where each key is set, its resolved value per stage, and validation problems. `/` searches (a key, a word or what you want to do, best matches first), `f` shows only your keys, `n` jumps to the next problem. With a key (`service.vpc`, `services.web.memory`, `stages.prod.service.env`, `variables`), prints it; in a pipe, lists every key; `--agent` prints Markdown for LLMs and coding agents; `-o json` for scripts. See [Learn the configuration](#learn-the-configuration). |
 | `runway doctor --stage S` | Read-only checks: config, ADC principal, project, enabled APIs, deployer permissions (`testIamPermissions`), service accounts and `actAs`, repository, bucket, secrets (version state and accessor grants), ownership of an existing service. |
 | `runway plan --stage S [--image I] [--offline] [--preview NAME \| --traffic N]` | Field-level diff against the live service (including the traffic split), image resolution, build and access changes. Makes no mutations. `--offline` contacts nothing. |
 | `runway deploy --stage S [--image I] [--timeout 10m] [--build-timeout 20m] [--force-build] [--adopt] [--retries N] [--retry-delay 5s] [--tag \| --tag-rc] [--preview NAME \| --traffic N] [--allow-older] [--wait-timeout 30m \| --no-wait]` | Create the runtime identity and grants, build if needed, create/update, wait for readiness, bind tags, configure IAP, reconcile access, print the URL. `--preview NAME`: no traffic, a URL for the new revision. `--traffic N`: canary with N% of the traffic. `--retries` overrides `retry.attempts` (`--retries 0` disables retries). `--tag`/`--tag-rc`: tag a release (see [Releases](configuration.md#releases)); `--stage` is optional when runway.yaml maps a stage to the flag. Waits while another run holds the stage (`--wait-timeout`, `--no-wait`) and refuses a commit older than the one serving unless `--allow-older` (see [Several runs at once](how-it-works.md#several-runs-at-once)). |
@@ -90,6 +90,15 @@ explanation ends with where the key is set and its value in every stage.
 `↑`/`↓` move in the keys; `→` or `Enter` moves to the explanation, where
 `↑`/`↓` scroll it and `←` or `Esc` come back (`→` first unfolds a folded
 key, `Space` folds and unfolds). The focused panel has a bright border.
+
+`/` searches, offline. Type a key, a word, or what you want to do: `keep an
+instance warm` finds `service.min_instances`, `run every night` finds
+`schedules`, `database password` finds `service.secrets`. Results come best
+first, with their full path, why they were found (`for "keep warm"`,
+`"memroy" ≈ memory`) and what they do. Word forms, other names (`ram` for
+memory) and typos are understood. `Enter` keeps the results to browse them,
+`f` keeps only the keys your file sets, and `Esc` goes back to the tree,
+opened at the key you picked.
 
 ```console
 $ runway explain                          # browse (q quits, ? lists the keys)
