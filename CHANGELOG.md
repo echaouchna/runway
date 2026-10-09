@@ -40,9 +40,13 @@ migration notes.
 - **`runway explain`.** Learn `runway.yaml` in the terminal: a full-screen
   browser of every key (what it does, default, example, rules, docs link),
   with service keys grouped by topic, search (`/`), and guide topics (stages
-  and precedence, variables, names). Next to a `runway.yaml`, it marks the
-  keys the file sets and its problems, and shows where each key is set and
-  its resolved value per stage (`f`: only your keys, `n`: next problem).
+  and precedence, variables, names). The search is offline and takes a
+  key, a word or what you want to do (`keep an instance warm` finds
+  `service.min_instances`): results come best first with why each was
+  found, understanding word forms, other names (`ram` for memory) and
+  typos; `Esc` goes back to the tree at the key picked. Next to a
+  `runway.yaml`, it marks the keys the file sets and its problems, and
+  shows where each key is set and its resolved value per stage (`f`: only your keys, `n`: next problem).
   `→`/`Enter` move to the explanation to scroll it with `↑`/`↓`, `←`/`Esc`
   come back. `--agent` prints the reference as Markdown for LLMs and coding
   agents (with the current file's values and problems; with a key, that key

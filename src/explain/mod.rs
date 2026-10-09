@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod catalog;
 pub mod file;
+pub mod search;
 pub mod tui;
 
 use crate::cli::{Context, ExplainArgs};

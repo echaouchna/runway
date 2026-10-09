@@ -24,6 +24,9 @@ pub struct Entry {
     pub docs: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub see: Vec<String>,
+    /// Other words for the key, or what it is for, that search finds it by.
+    #[serde(skip)]
+    pub also: Vec<String>,
     /// JSON pointer of the resolved value in a deployment; `-`: none.
     #[serde(skip)]
     pub resolved: Option<String>,
@@ -132,6 +135,10 @@ pub fn parse(text: &str) -> Vec<Entry> {
             }
             if k == "see" {
                 e.see = v.split(", ").map(String::from).collect();
+                continue;
+            }
+            if k == "also" {
+                e.also = v.split(", ").map(String::from).collect();
                 continue;
             }
         }
@@ -324,11 +331,12 @@ mod tests {
     #[test]
     fn the_format_reads_meta_text_examples_and_rules() {
         let e = &parse(
-            "# comment\n@ service.memory\ntype: string\ndefault: 512Mi\nsee: service.cpu, :layers\nMemory per\ninstance.\n\nMore.\nExample:\n  memory: 1Gi\n\n  # two\nRules:\n- one\n  continued\n- two\n",
+            "# comment\n@ service.memory\ntype: string\ndefault: 512Mi\nsee: service.cpu, :layers\nalso: ram, out of memory\nMemory per\ninstance.\n\nMore.\nExample:\n  memory: 1Gi\n\n  # two\nRules:\n- one\n  continued\n- two\n",
         )[0];
         assert_eq!(e.kind.as_deref(), Some("string"));
         assert_eq!(e.default.as_deref(), Some("512Mi"));
         assert_eq!(e.see, ["service.cpu", ":layers"]);
+        assert_eq!(e.also, ["ram", "out of memory"]);
         assert_eq!(e.text, ["Memory per instance.", "More."]);
         assert_eq!(e.example, ["memory: 1Gi", "", "# two"]);
         assert_eq!(e.rules, ["one continued", "two"]);
