@@ -85,6 +85,26 @@ and the stage deploys that copy. `--tag` finds the candidate where the
 `provider.create_build_resources: true`, runway creates the release
 repository when it is missing.
 
+**The image path.** Released images keep the build's name (`<app>`, or
+`<app>-<name>` for named services and jobs) unless `package` names another
+path in the release repository, nested paths included:
+
+```yaml
+release:
+  repository:
+    project: my-release-project
+    location: europe-west1
+    repository: docker-releases
+    package: mr-terraform-agent/agent
+stages:
+  prod: {}    # no tag-rc stage: `--tag` builds, publishes and deploys
+```
+
+`runway deploy --stage prod --tag` builds the image (or reuses it), copies it
+to `europe-west1-docker.pkg.dev/my-release-project/docker-releases/mr-terraform-agent/agent`,
+tags it with the changelog version and deploys that copy. A package names one
+image: a stage that builds several is an error.
+
 **Several `tag-rc` stages.** Each repository numbers its candidates on its
 own, so candidates found in several repositories must be the same image.
 Otherwise `--tag` lists them and asks you to choose:

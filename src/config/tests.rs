@@ -1741,7 +1741,8 @@ fn release_repositories_are_global_or_per_stage() {
         Some(ReleaseRepository {
             project: "my-gcp-project".into(),
             location: "europe-west1".into(),
-            repository: "releases".into()
+            repository: "releases".into(),
+            package: None,
         }),
         "the global one, in the deployment project and the build location"
     );
@@ -1781,6 +1782,78 @@ fn release_settings_are_validated() {
         "{e:#?}"
     );
     assert!(has_error(&e, "release.repository.repository", ""), "{e:#?}");
+}
+
+#[test]
+fn a_release_repository_can_name_the_image_path() {
+    let yaml = FULL.replace(
+        "stages:\n",
+        "release:\n  repository:\n    project: plat-artfcs-registry-prod-63a2\n    repository: docker-releases-plat\n    package: mr-terraform-agent/agent\nstages:\n",
+    );
+    let (_d, cfg) = load_str(&yaml);
+    let r = resolve_ok(&cfg, "prod");
+    let t = crate::commands::release::target(r.first()).unwrap();
+    assert_eq!(
+        t.image(),
+        "europe-west1-docker.pkg.dev/plat-artfcs-registry-prod-63a2/docker-releases-plat/mr-terraform-agent/agent"
+    );
+    assert_eq!(
+        r.first().image_package(),
+        "hello-api",
+        "the build repository keeps its names"
+    );
+
+    // A stage's repository replaces the global one, package included.
+    let (_d, cfg) = load_str(&yaml.replace(
+        "  prod:\n    service:\n",
+        "  prod:\n    release: {repository: {repository: prod-releases}}\n    service:\n",
+    ));
+    let t = crate::commands::release::target(resolve_ok(&cfg, "prod").first()).unwrap();
+    assert_eq!(
+        t.image(),
+        "europe-west1-docker.pkg.dev/my-gcp-project/prod-releases/hello-api"
+    );
+
+    // A path that is not an image path, reported where it is written.
+    let (_d, cfg) = load_str(&yaml.replace(
+        "package: mr-terraform-agent/agent",
+        "package: europe-west1-docker.pkg.dev/p/r/agent:1.0.0",
+    ));
+    let e = resolve_err(&cfg, "dev");
+    assert!(
+        has_error(&e, "release.repository.package", "not a full image name"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn a_release_package_names_one_image() {
+    let yaml = MULTI.replace(
+        "\ndefaults:\n",
+        "\nrelease:\n  repository: {repository: releases, package: shop/app}\ndefaults:\n",
+    );
+    let (_d, cfg) = load_multi(&yaml);
+    // prod builds two images (the main service and its job share one).
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(
+            &e,
+            "release.repository.package",
+            "stage `prod` builds 2 (service, service web)"
+        ),
+        "{e:#?}"
+    );
+    // dev leaves `web` out: one image, published for the service and the job.
+    let r = resolve_ok(&cfg, "dev");
+    for d in &r.deployments {
+        let t = crate::commands::release::target(r.build_owner(d)).unwrap();
+        assert_eq!(
+            t.image(),
+            "europe-west1-docker.pkg.dev/my-gcp-project/releases/shop/app",
+            "{}",
+            d.what()
+        );
+    }
 }
 
 #[test]

@@ -37,25 +37,26 @@ impl Target {
     }
 }
 
-/// The stage's release repository, else the build repository; `None` for a
-/// workload that deploys an existing image.
+/// The stage's release repository (with its `package`, else the build's),
+/// else the build repository; `None` for a workload that deploys an existing
+/// image.
 pub fn target(d: &Deployment) -> Option<Target> {
     let Artifact::Build(b) = &d.artifact else {
         return None;
     };
-    let (project, location, repository) = match &d.release.repository {
-        Some(r) => (r.project.clone(), r.location.clone(), r.repository.clone()),
-        None => (
-            d.project.clone(),
-            b.artifact_location.clone(),
-            b.artifact_repository.clone(),
-        ),
-    };
-    Some(Target {
-        project,
-        location,
-        repository,
-        package: d.image_package(),
+    Some(match &d.release.repository {
+        Some(r) => Target {
+            project: r.project.clone(),
+            location: r.location.clone(),
+            repository: r.repository.clone(),
+            package: r.package.clone().unwrap_or_else(|| d.image_package()),
+        },
+        None => Target {
+            project: d.project.clone(),
+            location: b.artifact_location.clone(),
+            repository: b.artifact_repository.clone(),
+            package: d.image_package(),
+        },
     })
 }
 
@@ -188,7 +189,7 @@ pub async fn find_candidate(
             let looked: Vec<String> = sources.iter().map(|(s, _)| s.image()).collect();
             Err(Error::prerequisite(format!(
                 "no release candidate of {version} for {}: looked in {}",
-                d.image_package(),
+                t.package,
                 looked.join(", ")
             ))
             .hint(format!(
@@ -218,7 +219,7 @@ pub async fn find_candidate(
                 .collect();
             Err(Error::config(format!(
                 "release candidates of {version} for {} are different images in different repositories: {}",
-                d.image_package(),
+                t.package,
                 list.join("; ")
             ))
             .hint(format!(

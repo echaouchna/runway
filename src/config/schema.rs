@@ -199,6 +199,9 @@ pub struct RawReleaseRepository {
     /// else `provider.region`).
     pub location: Option<String>,
     pub repository: String,
+    /// The image path inside the repository (`team/agent`). Default: the
+    /// build's package (`<app>`, `<app>-<name>`).
+    pub package: Option<String>,
 }
 
 /// A Cloud Run job: the runtime settings of a service that apply to jobs,
