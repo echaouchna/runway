@@ -7,6 +7,7 @@
 use crate::build::package::{self, SourceManifest};
 use crate::build_client;
 use crate::cli::{Context, PlanArgs};
+use crate::commands::release::{self, Commit, Op, Request, Resolution};
 use crate::commands::{load, registry_client, resolve_existing_image};
 use crate::config::{Artifact, Deployment, Overrides, Resolved, WorkloadKind};
 use crate::deploy::Reconciler;
@@ -40,7 +41,101 @@ pub struct Remote<'a> {
     pub provisioner: Option<&'a Provisioner<'a>>,
 }
 
+/// What `plan` says about an image's resolution: the promotion, and the
+/// copies and tags `deploy` makes.
+fn resolution_notes(owner: &Deployment, r: &Resolution) -> Vec<String> {
+    let what = owner.what();
+    let mut notes = r.notes.clone();
+    match (&r.promoted, &r.decision.image) {
+        (Some(p), _) => notes.push(format!("{what}: no build, deploys {}", p.why)),
+        (None, ImagePlan::Unresolved { reference, reason })
+            if matches!(owner.artifact, Artifact::Promote(_)) =>
+        {
+            notes.push(format!("{what}: no build, deploys {reference}; {reason}"))
+        }
+        _ => {}
+    }
+    for op in &r.ops {
+        if !matches!(op, Op::Build { .. }) {
+            notes.push(format!("{what}: deploy will {op}"));
+        }
+    }
+    if r.promoted.is_some() && r.commit == Commit::Unknown {
+        notes.push(format!(
+            "{what}: the commit of the promoted image is unknown: deploy removes the stage's commit record (older deploys are not detected until a deploy records one)"
+        ));
+    }
+    notes
+}
+
+/// The decision `plan` shows for an owner: from its resolution (the
+/// deployed reference), else a plain decision.
+async fn planned_decision(
+    owner: &Deployment,
+    resolution: Option<&Resolution>,
+    resolver: Option<&dyn DigestResolver>,
+    notes: &mut Vec<String>,
+) -> Result<ImageDecision> {
+    match resolution {
+        Some(r) => {
+            notes.extend(resolution_notes(owner, r));
+            Ok(ImageDecision {
+                image: r.planned_image(),
+                ..r.decision.clone()
+            })
+        }
+        None => decide_image(owner, resolver, notes).await,
+    }
+}
+
+/// Each build owner's resolution (by build key), as `deploy` makes it
+/// without a release flag; `readers = None`: offline. A promotion that
+/// would fail is shown with the reason the deploy stops.
+async fn plan_resolutions(
+    cfg: &crate::config::LoadedConfig,
+    owners: &[&Deployment],
+    readers: Option<&crate::commands::release::Readers<'_>>,
+    resolver: Option<&dyn DigestResolver>,
+    ours: Option<&crate::source::Source>,
+) -> Result<Vec<(String, Resolution)>> {
+    let req = Request {
+        version: None,
+        ours,
+    };
+    let mut out: Vec<(String, Resolution)> = Vec::new();
+    for o in owners {
+        let Some(k) = o.build_key() else { continue };
+        if out.iter().any(|(x, _)| *x == k) {
+            continue;
+        }
+        let mut notes = Vec::new();
+        let mut r = match release::resolve(cfg, o, readers, resolver, &req, &mut notes).await {
+            Ok(r) => r,
+            Err(e) if readers.is_some() => {
+                let mut r = release::resolve(cfg, o, None, resolver, &req, &mut notes).await?;
+                if let ImagePlan::Unresolved { reason, .. } = &mut r.decision.image {
+                    *reason = format!("deploy stops: {}", e.message);
+                }
+                r
+            }
+            Err(e) => return Err(e),
+        };
+        r.notes = notes;
+        out.push((k, r));
+    }
+    Ok(out)
+}
+
+fn resolution_of<'a>(
+    list: &'a [(String, Resolution)],
+    owner: &Deployment,
+) -> Option<&'a Resolution> {
+    let k = owner.build_key()?;
+    list.iter().find(|(x, _)| *x == k).map(|(_, r)| r)
+}
+
 /// Desired image information derived from the configuration.
+#[derive(Debug, Clone)]
 pub struct ImageDecision {
     pub image: ImagePlan,
     pub build: Option<BuildPlan>,
@@ -56,9 +151,9 @@ pub fn build_target(
 ) -> (String, String) {
     let name = naming::build_image_name(
         &b.artifact_location,
-        &d.project,
+        &b.artifact_project,
         &b.artifact_repository,
-        &d.image_package(),
+        &d.build_package(),
     );
     let tagged = format!("{name}:{}", naming::build_image_tag(sha256));
     (name, tagged)
@@ -68,7 +163,7 @@ pub fn build_target(
 fn unlisted_check(step: &Step, d: &Deployment) -> StepCheck {
     let detail = match step {
         Step::Revoke(g) => format!("not in runway.yaml: revoke from {}", g.member),
-        _ => "not in service.tags: unbind".into(),
+        _ => format!("not in {}.tags: unbind", d.yaml_path()),
     };
     StepCheck {
         step: step.describe(d),
@@ -84,7 +179,19 @@ pub async fn decide_image(
 ) -> Result<ImageDecision> {
     let mut annotations = BTreeMap::new();
     match &d.artifact {
-        Artifact::Image { reference, parsed } => {
+        // Chosen by `release::resolve`, which reads what the source serves.
+        Artifact::Promote(p) => Ok(ImageDecision {
+            image: ImagePlan::Unresolved {
+                reference: format!("(the image stage {} serves)", p.from),
+                reason: "looked up when deploying".into(),
+            },
+            build: None,
+            source: None,
+            annotations,
+        }),
+        Artifact::Image {
+            reference, parsed, ..
+        } => {
             annotations.insert(naming::ANNOTATION_IMAGE_REF.to_string(), reference.clone());
             let image = match resolver {
                 Some(r) => resolve_existing_image(r, parsed, reference).await,
@@ -298,6 +405,7 @@ pub async fn compute(
     mode: &crate::traffic::Mode,
     progress: &Progress,
     stack: Option<&Resolved>,
+    resolution: Option<&Resolution>,
 ) -> Result<(Plan, ImageDecision)> {
     let mut notes = Vec::new();
     let name = d.service_name();
@@ -313,7 +421,7 @@ pub async fn compute(
     // plan costs about one round trip.
     let (decision, live, early_checks) = match &remote {
         None => (
-            decide_image(image_of, None, &mut notes).await?,
+            planned_decision(image_of, resolution, None, &mut notes).await?,
             None,
             Vec::new(),
         ),
@@ -341,7 +449,7 @@ pub async fn compute(
             };
             let mut img_notes = Vec::new();
             let (decision, svc, public, early) = tokio::join!(
-                decide_image(image_of, Some(r.resolver), &mut img_notes),
+                planned_decision(image_of, resolution, Some(r.resolver), &mut img_notes),
                 rec.get(&name),
                 rec.current_public(&name),
                 early,
@@ -366,12 +474,14 @@ pub async fn compute(
             (decision?, Some((svc, public)), early)
         }
     };
-    let spec = ServiceSpec::from_deployment(
+    let mut spec = ServiceSpec::from_deployment(
         d,
         decision.image.deploy_reference().unwrap_or(""),
         decision.annotations.clone(),
     )
     .with_traffic_mode(mode.clone());
+    // The revision says where its image comes from, as deploy stamps it.
+    spec.provenance = resolution.map(|r| r.provenance(None)).unwrap_or_default();
     let spec = match &live {
         Some((Some(svc), _)) => run::spec_for_live(&spec, Some(svc)),
         _ => spec,
@@ -675,8 +785,19 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
         return Ok(());
     }
     let d = resolved.first();
+    let cfg = crate::config::load(&ctx.config)?;
+    let ours = crate::source::current(&crate::commands::config_dir(ctx));
     let (mut plan, _) = if args.offline {
-        let (mut plan, dec) = compute(d, None, &mode, &ctx.progress, None).await?;
+        let resolved_images = plan_resolutions(&cfg, &[d], None, None, ours.as_ref()).await?;
+        let (mut plan, dec) = compute(
+            d,
+            None,
+            &mode,
+            &ctx.progress,
+            None,
+            resolution_of(&resolved_images, d),
+        )
+        .await?;
         if d.service.otel_collector.as_ref().is_some_and(|o| !o.pinned) {
             plan.notes.push(
                 "offline: the newest otel_collector version was not looked up; deploy uses the latest release".into(),
@@ -687,15 +808,29 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
         let session = crate::commands::connect(ctx, d)
             .await
             .map_err(|e| e.hint("use `runway plan --offline` to plan without credentials"))?;
+        let push = crate::commands::push_session(ctx, d, &session).await?;
         let run = build_client!(Services, session)?;
         let revisions = build_client!(Revisions, session)?;
-        let registry = registry_client(&session).await?;
+        let registry = registry_client(&push).await?;
         let mut version_notes = Vec::new();
         let d = &crate::commands::resolve_runtime_versions(d, &registry, &mut version_notes).await;
         let provisioner = Provisioner::new(d, &session, &run).await?;
         let d =
             &crate::commands::resolve_secret_versions(d, &provisioner, &mut version_notes, false)
                 .await?;
+        let ar = build_client!(
+            google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+            push
+        )?;
+        let jobs = build_client!(Jobs, session)?;
+        let readers = crate::commands::release::Readers {
+            ar: &ar,
+            services: &run,
+            revisions: &revisions,
+            jobs: &jobs,
+        };
+        let resolved_images =
+            plan_resolutions(&cfg, &[d], Some(&readers), Some(&registry), ours.as_ref()).await?;
         let (mut plan, dec) = compute(
             d,
             Some(Remote {
@@ -707,6 +842,7 @@ pub async fn run(ctx: &Context, args: PlanArgs) -> Result<()> {
             &mode,
             &ctx.progress,
             None,
+            resolution_of(&resolved_images, d),
         )
         .await?;
         plan.notes.extend(version_notes);
@@ -777,19 +913,21 @@ async fn job_plan(
     remote: Option<(&Jobs, &dyn DigestResolver)>,
     mode: &crate::traffic::Mode,
     progress: &Progress,
+    resolution: Option<&Resolution>,
 ) -> Result<JobPlan> {
     let WorkloadKind::Job(settings) = &d.kind else {
         return Err(crate::error::Error::internal("not a job"));
     };
     let mut notes = Vec::new();
     let target = job_for_mode(d, mode)?;
-    let decision = decide_image(owner, remote.map(|r| r.1), &mut notes).await?;
+    let decision = planned_decision(owner, resolution, remote.map(|r| r.1), &mut notes).await?;
     let mut spec = ServiceSpec::from_deployment(
         &target,
         decision.image.deploy_reference().unwrap_or(""),
         decision.annotations.clone(),
     );
     spec.labels = job_labels(d, mode);
+    spec.provenance = resolution.map(|r| r.provenance(None)).unwrap_or_default();
     let desired = crate::gcp::jobs::desired_flat(&spec, settings);
     if let crate::traffic::Mode::Canary { .. } = mode {
         notes.push(
@@ -958,11 +1096,21 @@ async fn stack_plan(
     if !full && !r.schedules.is_empty() {
         notes.push("schedules change with a full deploy, not a preview or canary".into());
     }
+    let cfg = crate::config::load(&ctx.config)?;
+    let owners: Vec<&Deployment> = selected.iter().map(|d| r.build_owner(d)).collect();
+    let ours = crate::source::current(&crate::commands::config_dir(ctx));
     if offline {
+        let resolved_images = plan_resolutions(&cfg, &owners, None, None, ours.as_ref()).await?;
         for d in &selected {
+            let promotion = resolution_of(&resolved_images, r.build_owner(d));
             match d.is_job() {
-                true => job_plans.push(job_plan(d, r.build_owner(d), None, mode, progress).await?),
-                false => services.push(compute(d, None, mode, progress, Some(r)).await?.0),
+                true => job_plans
+                    .push(job_plan(d, r.build_owner(d), None, mode, progress, promotion).await?),
+                false => services.push(
+                    compute(d, None, mode, progress, Some(r), promotion)
+                        .await?
+                        .0,
+                ),
             }
         }
         let domains = crate::provision::domains_step(r, None, false).filter(|_| full);
@@ -981,10 +1129,29 @@ async fn stack_plan(
     let session = crate::commands::connect(ctx, first)
         .await
         .map_err(|e| e.hint("use `runway plan --offline` to plan without credentials"))?;
+    let push = crate::commands::push_session(ctx, first, &session).await?;
     let run = build_client!(Services, session)?;
     let revisions = build_client!(Revisions, session)?;
     let jobs = build_client!(Jobs, session)?;
-    let registry = registry_client(&session).await?;
+    let registry = registry_client(&push).await?;
+    let ar = build_client!(
+        google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+        push
+    )?;
+    let readers = crate::commands::release::Readers {
+        ar: &ar,
+        services: &run,
+        revisions: &revisions,
+        jobs: &jobs,
+    };
+    let resolved_images = plan_resolutions(
+        &cfg,
+        &owners,
+        Some(&readers),
+        Some(&registry),
+        ours.as_ref(),
+    )
+    .await?;
     let prov = Provisioner::new(first, &session, &run).await?.with_stack(r);
     let mut ready: Vec<Deployment> = Vec::new();
     for d in &selected {
@@ -1000,6 +1167,7 @@ async fn stack_plan(
                     Some((&jobs, &registry)),
                     mode,
                     progress,
+                    resolution_of(&resolved_images, r.build_owner(d)),
                 )
                 .await?,
             );
@@ -1016,6 +1184,7 @@ async fn stack_plan(
                 mode,
                 progress,
                 Some(r),
+                resolution_of(&resolved_images, r.build_owner(d)),
             )
             .await?;
             services.push(plan);
@@ -1110,5 +1279,128 @@ fn stack_result(
         jobs,
         steps,
         notes,
+    }
+}
+
+#[cfg(test)]
+mod promotion_tests {
+    use super::*;
+
+    fn stage(name: &str) -> (tempfile::TempDir, crate::config::LoadedConfig, Resolved) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(
+            &p,
+            "version: 1\napp: shop\nprovider:\n  project: my-gcp-project\n  region: europe-west1\n  create_build_resources: true\nservice:\n  source: .\n  service_account: rt@my-gcp-project.iam.gserviceaccount.com\nstages:\n  dev: {}\n  uat:\n    promote: {from: dev}\n    provider: {artifact_repository: uat-images}\n",
+        )
+        .unwrap();
+        let cfg = crate::config::load(&p).unwrap();
+        let r = crate::config::resolve(&cfg, name, &Default::default()).unwrap();
+        (dir, cfg, r)
+    }
+
+    #[tokio::test]
+    async fn a_promoted_stage_plans_no_build_and_its_destination() {
+        let (_d, cfg, r) = stage("uat");
+        let d = r.first();
+        assert!(matches!(d.artifact, Artifact::Promote(_)));
+        let offline = plan_resolutions(&cfg, &[d], None, None, None)
+            .await
+            .unwrap();
+        let (plan, _) = compute(
+            d,
+            None,
+            &Default::default(),
+            &Progress::silent(),
+            None,
+            resolution_of(&offline, d),
+        )
+        .await
+        .unwrap();
+        assert!(plan.build.is_none(), "nothing is built: {:?}", plan.build);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("no build")
+                && n.contains("the image stage dev serves")
+                && n.contains("looked up when deploying")),
+            "{:?}",
+            plan.notes
+        );
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("deploy will copy")
+                    && n.contains("my-gcp-project/uat-images/shop")),
+            "the copy deploy makes: {:?}",
+            plan.notes
+        );
+
+        // Known: the reference deployed is the destination's, as deploy does.
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut known = offline[0].1.clone();
+        known.promoted = Some(release::Promoted {
+            image: format!("europe-west1-docker.pkg.dev/my-gcp-project/runway/shop@{digest}"),
+            from: "dev".into(),
+            why: "what stage dev serves".into(),
+            provenance: Default::default(),
+        });
+        known.decision.image = ImagePlan::Pinned {
+            reference: format!("europe-west1-docker.pkg.dev/my-gcp-project/runway/shop@{digest}"),
+            digest: digest.clone(),
+            origin: "promoted".into(),
+        };
+        let list = [(d.build_key().unwrap(), known)];
+        let (plan, _) = compute(
+            d,
+            None,
+            &Default::default(),
+            &Progress::silent(),
+            None,
+            resolution_of(&list, d),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&plan.image, ImagePlan::Pinned { reference, .. }
+                if *reference == format!("europe-west1-docker.pkg.dev/my-gcp-project/uat-images/shop@{digest}")),
+            "{:?}",
+            plan.image
+        );
+    }
+
+    #[test]
+    fn a_promoting_stage_provisions_no_build_prerequisites() {
+        let (_d, _cfg, r) = stage("uat");
+        let d = r.first();
+        let steps: Vec<String> = crate::provision::all_steps(d)
+            .iter()
+            .map(|s| s.describe(d))
+            .collect();
+        assert!(
+            steps.iter().any(|s| s.contains("uat-images")),
+            "its repository: {steps:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s.contains("runway-sources") || s.contains("runway-build")),
+            "no source bucket nor build account: {steps:?}"
+        );
+        let apis = crate::provision::required_apis(d);
+        assert!(
+            !apis.iter().any(|a| a == "cloudbuild.googleapis.com"),
+            "{apis:?}"
+        );
+
+        let (_d, _cfg, dev) = stage("dev");
+        let d = dev.first();
+        let steps: Vec<String> = crate::provision::all_steps(d)
+            .iter()
+            .map(|s| s.describe(d))
+            .collect();
+        assert!(
+            steps.iter().any(|s| s.contains("runway-build")),
+            "dev builds: {steps:?}"
+        );
     }
 }

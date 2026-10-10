@@ -183,6 +183,12 @@ pub struct Deployment {
     pub apis: ApisConfig,
     /// Service account impersonated for API calls (config default; the CLI flag wins).
     pub impersonate: Option<String>,
+    /// Service account impersonated for the registry work runway does itself
+    /// (resolving, copying and tagging images); `None`: the API session.
+    pub push_service_account: Option<String>,
+    /// The stage whose images this stage deploys instead of building
+    /// (`stages.<name>.promote.from`).
+    pub promote: Option<String>,
     /// Where the stage's Cloud Scheduler jobs live (`scheduler.region`, else
     /// `provider.region`), also when none is configured any more.
     pub scheduler_region: String,
@@ -340,6 +346,15 @@ impl Deployment {
     pub fn name(&self) -> &str {
         self.key.as_deref().unwrap_or(&self.app)
     }
+    /// Its block in runway.yaml, for messages that name a key:
+    /// `service`, `services.<name>` or `jobs.<name>`.
+    pub fn yaml_path(&self) -> String {
+        match (&self.key, self.is_job()) {
+            (None, _) => "service".into(),
+            (Some(k), false) => format!("services.{k}"),
+            (Some(k), true) => format!("jobs.{k}"),
+        }
+    }
     /// Artifact Registry package of the images built for it: `{app}` for the
     /// main service (as before named workloads existed), `{app}-{name}`.
     pub fn image_package(&self) -> String {
@@ -348,17 +363,69 @@ impl Deployment {
             Some(k) => format!("{}-{k}", self.app),
         }
     }
+    /// The image path of its builds in the build repository:
+    /// `provider.artifact_package`, else [`Self::image_package`].
+    pub fn build_package(&self) -> String {
+        match &self.artifact {
+            Artifact::Build(BuildConfig {
+                artifact_package: Some(p),
+                ..
+            })
+            | Artifact::Promote(PromoteConfig {
+                artifact_package: Some(p),
+                ..
+            }) => p.clone(),
+            _ => self.image_package(),
+        }
+    }
+    /// `LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/PACKAGE` its builds (or
+    /// promoted copies) go to (no tag); `None` for a workload deploying an
+    /// existing image.
+    pub fn build_image(&self) -> Option<String> {
+        let (location, project, repository) = match &self.artifact {
+            Artifact::Build(b) => (
+                &b.artifact_location,
+                &b.artifact_project,
+                &b.artifact_repository,
+            ),
+            Artifact::Promote(p) => (
+                &p.artifact_location,
+                &p.artifact_project,
+                &p.artifact_repository,
+            ),
+            Artifact::Image { .. } => return None,
+        };
+        Some(crate::naming::build_image_name(
+            location,
+            project,
+            repository,
+            &self.build_package(),
+        ))
+    }
     /// Workloads with the same key build the same image.
     pub fn build_key(&self) -> Option<String> {
         match &self.artifact {
             Artifact::Build(b) => Some(format!(
-                "{}|{:?}|{:?}|{}|{}|{}",
+                "{}|{:?}|{:?}|{}|{}|{}|{}|{:?}",
                 b.context_dir.display(),
                 b.strategy,
                 b.excluded,
                 b.rebuild_always,
                 b.artifact_location,
-                b.artifact_repository
+                b.artifact_project,
+                b.artifact_repository,
+                b.artifact_package
+            )),
+            // Each promoted workload takes what its own counterpart serves:
+            // workloads that share a build here may not share one in the
+            // source stage. Equal copies are merged once their digests and
+            // destinations are known.
+            Artifact::Promote(p) => Some(format!(
+                "promote|{}|{}|{:?}|{}",
+                p.from,
+                self.is_job(),
+                self.key,
+                self.service_id
             )),
             Artifact::Image { .. } => None,
         }
@@ -394,9 +461,35 @@ pub enum Artifact {
         reference: String,
         #[serde(skip)]
         parsed: ImageRef,
+        /// Where it comes from, worded for messages: the YAML path that sets
+        /// it in backticks (`` `stages.prod.services.web.image` ``,
+        /// `` `--image` ``), or the release it is promoted from.
+        #[serde(skip)]
+        origin: String,
     },
     /// Build from local source with Cloud Build.
     Build(BuildConfig),
+    /// Deploy another stage's image (`stages.<name>.promote.from`): nothing
+    /// is built, so nothing of a build is needed (bucket, account, Cloud Build).
+    Promote(PromoteConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromoteConfig {
+    /// The stage whose image is deployed.
+    pub from: String,
+    /// The source folder the stage would build (`--only PATH`, changelog).
+    pub context_dir: PathBuf,
+    /// The stage's repository the promoted copy goes to.
+    pub artifact_location: String,
+    pub artifact_project: String,
+    pub artifact_repository: String,
+    pub artifact_package: Option<String>,
+    /// Create that repository when missing (`create_build_resources`).
+    pub create_resources: bool,
+    /// `promote.commit: checkout`: only the image built from the commit
+    /// being deployed, found in the source's revisions.
+    pub match_commit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -408,7 +501,12 @@ pub struct BuildConfig {
     /// Rebuild on every deploy (`rebuild: always`).
     pub rebuild_always: bool,
     pub artifact_location: String,
+    /// Project of the repository builds are pushed to (`provider.project`
+    /// unless `artifact_project` says otherwise).
+    pub artifact_project: String,
     pub artifact_repository: String,
+    /// Image path in the repository; `None`: the workload's package.
+    pub artifact_package: Option<String>,
     pub source_bucket: String,
     pub build_service_account: String,
     /// Create the repository, source bucket and build service account (+ roles) if missing.
@@ -829,6 +927,7 @@ impl Resolved {
             .iter()
             .filter_map(|d| match &d.artifact {
                 Artifact::Build(b) => Some((d, abs(&b.context_dir))),
+                Artifact::Promote(p) => Some((d, abs(&p.context_dir))),
                 Artifact::Image { .. } => None,
             })
             .collect();
@@ -1035,8 +1134,11 @@ pub fn resolve(
     let region = p(|x| &x.region, "region");
     let artifact_repository = p(|x| &x.artifact_repository, "artifact_repository");
     let artifact_location = p(|x| &x.artifact_location, "artifact_location");
+    let artifact_project = p(|x| &x.artifact_project, "artifact_project");
+    let artifact_package = p(|x| &x.artifact_package, "artifact_package");
     let source_bucket = p(|x| &x.source_bucket, "source_bucket");
     let build_sa = p(|x| &x.build_service_account, "build_service_account");
+    let push_sa = p(|x| &x.push_service_account, "push_service_account");
 
     let project = required(&mut d, project, "provider.project", validate::project_id);
     let region = required(&mut d, region, "provider.region", validate::region);
@@ -1083,6 +1185,8 @@ pub fn resolve(
         };
     let source_bucket = interp_opt(&mut d, source_bucket);
     let build_sa = interp_opt(&mut d, build_sa);
+    let artifact_project = interp_opt(&mut d, artifact_project);
+    let push_sa = interp_opt(&mut d, push_sa);
 
     let enable_apis = pick(
         stage,
@@ -1166,6 +1270,10 @@ pub fn resolve(
     };
     check_opt(&mut d, &artifact_repository, validate::repository_id);
     check_opt(&mut d, &artifact_location, validate::region);
+    check_opt(&mut d, &artifact_project, validate::project_id);
+    check_opt(&mut d, &artifact_package, validate::image_package);
+    check_opt(&mut d, &push_sa, validate::service_account_email);
+    let push_service_account = push_sa.map(|(v, _)| v);
     let domains_settings = resolve_domains(&mut d, raw, st, stage, &project, &region);
     let release = resolve_release(
         &mut d,
@@ -1179,6 +1287,18 @@ pub fn resolve(
     );
     check_opt(&mut d, &source_bucket, validate::bucket_name);
     check_opt(&mut d, &build_sa, validate::service_account_email);
+    let promote = resolve_promote(&mut d, raw, st, stage);
+    let match_commit = match st.promote.as_ref().and_then(|p| p.commit.as_deref()) {
+        None => false,
+        Some("checkout") => true,
+        Some(other) => {
+            d.error(
+                format!("stages.{stage}.promote.commit"),
+                format!("`{other}` must be `checkout` (the commit being deployed)"),
+            );
+            false
+        }
+    };
 
     // ---- services and jobs ----
     let inputs = workload_inputs(&mut d, raw, st, stage, overrides);
@@ -1193,8 +1313,12 @@ pub fn resolve(
         create_build,
         artifact_repository,
         artifact_location,
+        artifact_project: artifact_project.map(|(v, _)| v),
+        artifact_package: artifact_package.clone().map(|(v, _)| v),
         source_bucket,
         build_sa,
+        promote: promote.clone(),
+        match_commit,
     };
     let mut resolved_workloads = Vec::new();
     for w in &inputs {
@@ -1287,6 +1411,8 @@ pub fn resolve(
                 extra: extra_apis.clone(),
             },
             impersonate: impersonate.clone(),
+            push_service_account: push_service_account.clone(),
+            promote: promote.clone(),
             scheduler_region: scheduler_region.clone(),
             release: release.clone(),
             domains: domains_settings.clone(),
@@ -1296,6 +1422,9 @@ pub fn resolve(
         })
         .collect();
     check_release_package(&mut d, st, stage, &release, &deployments);
+    if let Some((package, path)) = &artifact_package {
+        check_one_image(&mut d, stage, package, path.clone(), &deployments);
+    }
     if !d.errors.is_empty() {
         return Err(d);
     }
@@ -1335,8 +1464,12 @@ struct Shared<'a> {
     create_build: bool,
     artifact_repository: Option<(String, String)>,
     artifact_location: Option<(String, String)>,
+    artifact_project: Option<String>,
+    artifact_package: Option<String>,
     source_bucket: Option<(String, String)>,
     build_sa: Option<(String, String)>,
+    promote: Option<String>,
+    match_commit: bool,
 }
 
 /// The highest-precedence value of a field and where it came from.
@@ -1381,6 +1514,17 @@ fn merge_layers<V: Clone>(
     out
 }
 
+/// An environment variable name of the app container. For a service, Cloud
+/// Run sets `PORT` from `port`, a key of the block the error is reported in
+/// (the path says which: `defaults`, `services.web`, a stage's block); jobs
+/// have no port.
+fn app_env_name(k: &str, is_job: bool) -> std::result::Result<(), String> {
+    validate::env_name(k).map_err(|e| match k {
+        "PORT" if !is_job => format!("{e}; set `port` in the same block instead"),
+        _ => e,
+    })
+}
+
 /// Resolves one service or job; errors and warnings go to `diags`.
 fn resolve_workload(
     diags: &mut Diagnostics,
@@ -1421,9 +1565,13 @@ fn resolve_workload(
             region: region.clone(),
             artifact_repository: sh.artifact_repository.clone(),
             artifact_location: sh.artifact_location.clone(),
+            artifact_project: sh.artifact_project.clone(),
+            artifact_package: sh.artifact_package.clone(),
             source_bucket: sh.source_bucket.clone(),
             build_sa: sh.build_sa.clone(),
             create: create_build,
+            promote: sh.promote.clone(),
+            match_commit: sh.match_commit,
             project: project.clone(),
         },
     );
@@ -1439,7 +1587,7 @@ fn resolve_workload(
     {
         d.error(
             "provider.build_service_account",
-            "create_build_resources can only create user-managed service accounts (NAME@PROJECT.iam.gserviceaccount.com)",
+            "`provider.create_build_resources` can only create user-managed service accounts (NAME@PROJECT.iam.gserviceaccount.com)",
         );
     }
     if let Some(Artifact::Build(b)) = &artifact
@@ -1448,7 +1596,7 @@ fn resolve_workload(
     {
         d.error(
             format!("buckets.{}", dup.key),
-            "the build source bucket is created by `create_build_resources`; do not declare it again",
+            "the build source bucket is created by `provider.create_build_resources`; do not declare it again",
         );
     }
 
@@ -1623,7 +1771,7 @@ fn resolve_workload(
     let env = merge_layers(&mut d, &w.layers, |l| &l.env, "env");
     let mut env_out = BTreeMap::new();
     for (k, (v, path)) in env {
-        if let Err(e) = validate::env_name(&k) {
+        if let Err(e) = app_env_name(&k, is_job) {
             d.error(path.clone(), e);
         }
         let value = ixs(&mut d, &v.to_string_value(), &path);
@@ -1715,7 +1863,7 @@ fn resolve_workload(
             );
         }
         if file.is_none()
-            && let Err(e) = validate::env_name(&k)
+            && let Err(e) = app_env_name(&k, is_job)
         {
             d.error(path.clone(), e);
         }
@@ -2777,10 +2925,16 @@ fn required(
 
 struct BuildProvider {
     create: bool,
+    /// The stage promotes from this stage instead of building.
+    promote: Option<String>,
+    /// ...the image built from the commit being deployed.
+    match_commit: bool,
     project: String,
     region: String,
     artifact_repository: Option<(String, String)>,
     artifact_location: Option<(String, String)>,
+    artifact_project: Option<String>,
+    artifact_package: Option<String>,
     source_bucket: Option<(String, String)>,
     build_sa: Option<(String, String)>,
 }
@@ -2851,13 +3005,14 @@ fn resolve_artifact(
             Ok(parsed) => {
                 if parsed.is_mutable() {
                     d.warn(
-                        path,
+                        path.clone(),
                         "mutable tag; runway resolves it to an immutable digest at deploy time when the registry allows",
                     );
                 }
                 Some(Artifact::Image {
                     reference: image.clone(),
                     parsed,
+                    origin: format!("`{path}`"),
                 })
             }
             Err(e) => {
@@ -2991,13 +3146,37 @@ fn resolve_artifact(
             None => {
                 d.error(
                     format!("provider.{field}"),
-                    "is required for source builds (or set `provider.create_build_resources: true` to let runway create it with a default name, or deploy an existing image with `service.image`)",
+                    match &bp.promote {
+                        Some(_) => "is required: promoted images are copied into it (or set `provider.create_build_resources: true` to let runway create it with a default name)",
+                        None => "is required for source builds (or set `provider.create_build_resources: true` to let runway create it with a default name, or deploy an existing image: `image` instead of `source`)",
+                    },
                 );
                 None
             }
         }
     };
     let repo = need(d, &bp.artifact_repository, "artifact_repository");
+    // A promoting stage builds nothing: only the repository its copies go to.
+    if let Some(from) = &bp.promote {
+        let location = bp
+            .artifact_location
+            .clone()
+            .map(|(v, _)| v)
+            .unwrap_or(bp.region.clone());
+        return match (repo, ok) {
+            (Some(artifact_repository), true) => Some(Artifact::Promote(PromoteConfig {
+                from: from.clone(),
+                context_dir: context_dir.clone(),
+                artifact_location: location,
+                artifact_project: bp.artifact_project.clone().unwrap_or(bp.project.clone()),
+                artifact_repository,
+                artifact_package: bp.artifact_package.clone(),
+                create_resources: bp.create,
+                match_commit: bp.match_commit,
+            })),
+            _ => None,
+        };
+    }
     let bucket = need(d, &bp.source_bucket, "source_bucket");
     let build_sa = need(d, &bp.build_sa, "build_service_account");
     let location = bp
@@ -3015,7 +3194,9 @@ fn resolve_artifact(
                 strategy,
                 rebuild_always,
                 artifact_location: location,
+                artifact_project: bp.artifact_project.unwrap_or(bp.project),
                 artifact_repository,
+                artifact_package: bp.artifact_package,
                 source_bucket,
                 build_service_account,
                 create_resources: bp.create,
@@ -3155,8 +3336,29 @@ fn check_release_package(
     let Some(package) = release.repository.as_ref().and_then(|r| r.package.as_ref()) else {
         return;
     };
+    let path = match st.release.as_ref().and_then(|r| r.repository.as_ref()) {
+        Some(_) => format!("stages.{stage}.release.repository.package"),
+        None => "release.repository.package".to_string(),
+    };
+    check_one_image(d, stage, package, path, deployments);
+}
+
+/// A package (`artifact_package`, `release.repository.package`) is the
+/// image of one build: a second build would overwrite its tags.
+fn check_one_image(
+    d: &mut Diagnostics,
+    stage: &str,
+    package: &str,
+    path: String,
+    deployments: &[Deployment],
+) {
     let mut builds: Vec<(String, String)> = Vec::new();
-    for w in deployments {
+    // Promoted images are known only when deploying: workloads promoted to
+    // the same package are checked then (same image, or refused).
+    for w in deployments
+        .iter()
+        .filter(|w| !matches!(w.artifact, Artifact::Promote(_)))
+    {
         if let Some(k) = w.build_key()
             && !builds.iter().any(|(x, _)| *x == k)
         {
@@ -3166,19 +3368,76 @@ fn check_release_package(
     if builds.len() < 2 {
         return;
     }
-    let path = match st.release.as_ref().and_then(|r| r.repository.as_ref()) {
-        Some(_) => format!("stages.{stage}.release.repository.package"),
-        None => "release.repository.package".to_string(),
-    };
     let names: Vec<&str> = builds.iter().map(|(_, w)| w.as_str()).collect();
     d.error(
         path,
         format!(
-            "`{package}` names one image, but stage `{stage}` builds {} ({}): remove `package` to publish each under its own name, or build them from the same `source`",
+            "`{package}` names one image, but stage `{stage}` builds {} ({}): remove it to name each image after its service or job, or build them from the same `source`",
             builds.len(),
             names.join(", ")
         ),
     );
+}
+
+/// The stage `stages.<stage>.promote.from` names: another stage of the file,
+/// not in a loop, and not with `release.from` (which says the same).
+fn resolve_promote(
+    d: &mut Diagnostics,
+    raw: &RawConfig,
+    st: &RawStage,
+    stage: &str,
+) -> Option<String> {
+    let from = st.promote.as_ref()?.from.clone();
+    let path = format!("stages.{stage}.promote.from");
+    let promote_of = |s: &str| {
+        raw.stages
+            .get(s)
+            .and_then(|x| x.as_ref())
+            .and_then(|x| x.promote.as_ref())
+            .map(|p| p.from.clone())
+    };
+    if from == stage {
+        d.error(path, "a stage cannot promote from itself");
+        return None;
+    }
+    if !raw.stages.contains_key(&from) {
+        let known: Vec<&str> = raw
+            .stages
+            .keys()
+            .map(String::as_str)
+            .filter(|s| *s != stage)
+            .collect();
+        d.error(
+            path,
+            format!(
+                "`{from}` is not a stage of this file (stages: {}); remove `promote` to build in this stage",
+                known.join(", ")
+            ),
+        );
+        return None;
+    }
+    let mut chain = vec![stage.to_string(), from.clone()];
+    while let Some(next) = promote_of(chain.last().expect("not empty")) {
+        if chain.contains(&next) {
+            chain.push(next);
+            d.error(
+                path,
+                format!(
+                    "promotions loop: {}; one stage must build",
+                    chain.join(" -> ")
+                ),
+            );
+            return None;
+        }
+        chain.push(next);
+    }
+    if st.release.as_ref().is_some_and(|r| r.from.is_some()) {
+        d.error(
+            format!("stages.{stage}.release.from"),
+            "`promote.from` already says where this stage's images come from: remove `release.from`",
+        );
+    }
+    Some(from)
 }
 
 /// The stage's release flag and repository (the stage's replaces the global).

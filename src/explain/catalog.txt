@@ -209,6 +209,31 @@ The location of the repository, when it is not the region (for example a multi-r
 Example:
   artifact_location: europe
 
+@ provider.artifact_project
+also: registry project, push to another project, shared registry, central registry
+type: string
+default: provider.project
+docs: configuration.md#where-images-go
+The project of the repository builds are pushed to, when it is not the deployment project (a shared registry project). Set it in a stage's `provider` for that stage only.
+Example:
+  provider:
+    artifact_project: my-registry-project
+    artifact_repository: docker-dev
+Rules:
+- Cloud Build still runs in `provider.project`; its account needs `roles/artifactregistry.writer` on the repository, and the stage's Cloud Run service agent `roles/artifactregistry.reader` (runway grants neither in another project, unless `create_build_resources` grants the first).
+
+@ provider.artifact_package
+also: build image name, image path, nested image
+type: string
+default: <app> (main service), <app>-<name>
+docs: configuration.md#where-images-go
+The image path of builds in the repository, when it must differ from runway's names: `team/agent` pushes `LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/team/agent`. Releases use it too, unless `release.repository.package` says otherwise.
+Example:
+  artifact_package: mr-terraform-agent/agent
+Rules:
+- Parts separated by `/`, each of lowercase letters and digits joined by one `.`, one `_`, `__` or dashes.
+- It names one image: a stage that builds several is an error.
+
 @ provider.source_bucket
 also: upload bucket, staging bucket
 type: string
@@ -230,6 +255,19 @@ Example:
   build_service_account: "builds@${project}.iam.gserviceaccount.com"
 Rules:
 - Required for source builds, unless `create_build_resources` is true.
+
+@ provider.push_service_account
+also: registry account, copy images as, ci account, gitlab service account, promotion account
+type: string
+resolved: /push_service_account
+docs: releases.md#who-pushes
+The account runway uses for the registry work it does itself: finding, copying and tagging images when it promotes or releases them (your CI's account, or one you create). Everything else uses your credentials (or `impersonate_service_account`).
+Example:
+  push_service_account: "gitlab-ci@my-ci-project.iam.gserviceaccount.com"
+Rules:
+- Your credentials need `roles/iam.serviceAccountTokenCreator` on it (not needed when it is the account `impersonate_service_account` names).
+- It needs `roles/artifactregistry.reader` on the repositories images come from and `roles/artifactregistry.writer` on those they go to. runway does not create it nor grant it anything.
+- Cloud Build still pushes builds as `build_service_account`.
 
 @ provider.impersonate_service_account
 also: impersonation, act as, delegation, token creator
@@ -1647,3 +1685,48 @@ Example:
 type: block
 docs: domains.md
 How this stage serves custom domains; replaces the global `domains` block.
+
+@ stages.<name>.promote
+also: promotion, promote from dev, deploy what dev runs, no rebuild, same image
+type: block
+resolved: -
+docs: releases.md#promote-between-stages
+Deploy another stage's images instead of building: what it serves (its one revision with all the traffic), read with that revision's provenance. With `--tag-rc` or `--tag`, it must be a candidate of the changelog version, or built from the commit being deployed. The image is copied into this stage's repository (same digest) and that copy is deployed.
+Example:
+  stages:
+    dev: {}                       # builds
+    uat: {promote: {from: dev}}
+    prod: {promote: {from: uat}}
+Rules:
+- Optional: a stage without it builds, so a project without a `dev` or `uat` just leaves it out.
+- The stage builds nothing: it needs `artifact_repository` only (no source bucket, build account or Cloud Build).
+- A service or job with its own `image:`, or targeted by `--image`, deploys that image instead.
+- Each service and job takes what its own counterpart serves (as Cloud Run reports it serving).
+- A source stage splitting its traffic (a canary) is refused until it is settled; a rollout in progress is waited for.
+- `--force-build` is refused in a stage that promotes.
+
+@ stages.<name>.promote.from
+type: stage name
+resolved: /promote
+docs: releases.md#promote-between-stages
+The stage whose images are deployed. Without a flag: what it serves. With `--tag-rc`/`--tag` (version V): the `V` this stage already serves (a re-run), else what it serves if that is `V` or a `V-RCn`, else what it serves if it was built from the commit being deployed; otherwise the deploy stops and says why.
+Example:
+  promote: {from: uat}
+Rules:
+- Another stage of the file, not in a loop (`uat -> dev -> uat`).
+- Not with `release.from`, which says the same.
+
+@ stages.<name>.promote.commit
+also: git tag, tagged commit, same sha, promote by commit, release on tag
+type: checkout
+resolved: -
+docs: releases.md#promote-the-tagged-commit
+`checkout`: promote the image the source stage ran built from the commit being deployed (HEAD, or `RUNWAY_SOURCE_COMMIT` in CI: on a tag pipeline, the tagged SHA), found in its Ready revisions even after it moved on. With or without `--tag`.
+Example:
+  stages:
+    prod:
+      promote: {from: uat, commit: checkout}
+Rules:
+- No fallback: no matching revision, or several images built from the commit, stops the deploy; a matching release tag never replaces the commit.
+- A job keeps no history: its current image must be built from the commit.
+- The commit must be known (a git checkout, or RUNWAY_SOURCE_COMMIT and RUNWAY_SOURCE_TIME).

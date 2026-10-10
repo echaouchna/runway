@@ -12,6 +12,48 @@ migration notes.
 
 ### Added
 
+- **Where images go, promotion and who pushes, all optional.**
+  `provider.artifact_project` and `provider.artifact_package` (global or per
+  stage) push builds to a repository in another project (a shared registry)
+  under a chosen image path; Cloud Build still runs in `provider.project`,
+  and releases default to the same path. `stages.<name>.promote.from` makes
+  a stage deploy another stage's images instead of building: for each
+  service and job, what its counterpart *serves* (its one revision with all
+  the traffic, as Cloud Run reports it; a split is refused until settled, a
+  rollout in progress is waited for), read with that revision's provenance.
+  With `--tag-rc`/`--tag`, the version the stage already serves is reused,
+  else the source must serve a candidate of the version or an image built
+  from the same commit; a version another stage published in a shared
+  release repository for another image is refused; otherwise the deploy
+  stops and says why. The image is copied (same digest)
+  into the stage's own repository and that copy runs; `plan` shows that
+  reference, why, and the copies and tags deploy makes. A promoting stage
+  builds nothing, so it provisions no source bucket, build account or Cloud
+  Build; a service or job with its own `image:` (or `--image`) deploys that
+  image instead, in every deploy path. `--force-build` is refused there. A
+  stage without `promote` builds, as before. `provider.push_service_account`
+  runs the registry work runway does itself (finding, copying, tagging) as
+  another account, such as the CI's; `doctor` checks it by impersonating it
+  from your own credentials, as deploy does.
+- **Promote the tagged commit.** `stages.<name>.promote.commit: checkout`
+  promotes the image the source stage ran built from the commit being
+  deployed (HEAD, or `RUNWAY_SOURCE_COMMIT` on a tag pipeline), found in its
+  Ready revisions even after it moved on; no match or several images stop
+  the deploy, and a matching release tag never stands in for the commit.
+  `--tag` on a commit tagged with a version (`CI_COMMIT_TAG`, GitHub's tag
+  ref, or `git tag --points-at`) requires the changelog's version to match.
+- **Revisions say what they run.** Each revision (and job) runway deploys
+  records the commit its image comes from and its release
+  (`runway.dev/source`, `runway.dev/release` on the revision template),
+  shown by `plan` as `provenance.*`. The first deploy after upgrading rolls a
+  new revision for it, and so does a new commit with an unchanged image. A
+  promoted stage records its image's commit, never the checkout's: when it
+  is unknown, its commit record is removed.
+- **`--tag`/`--tag-rc` publish any image**: a build, a promotion or a
+  configured image (which needs a `release.repository`). With stages mapped
+  to `tag-rc`, `--tag` now releases the candidate the `tag-rc` stage
+  *serves*, not the latest one of a repository it shares (an untested newer
+  RC was released before).
 - **Release image path.** `release.repository.package` (global or per stage)
   names the image path in the release repository, nested paths included:
   `package: mr-terraform-agent/agent` makes `deploy --tag`/`--tag-rc` publish
@@ -222,6 +264,16 @@ migration notes.
 
 ### Fixed
 
+- **Messages name keys by their full path.** `doctor` said "set
+  identity.create / provider.create_build_resources" for any missing account:
+  it now names the one setting that creates it (`service.identity.create`,
+  `services.<name>.…`, `jobs.<name>.…`, or `provider.create_build_resources`)
+  and links the docs instead of README sections that do not exist. Likewise:
+  a missing image names where it is set (`stages.prod.service.image`,
+  `defaults.image`, `--image`), `PORT` in `env` points at `port` in the same
+  block (not for jobs, which have none), the startup-failure hint names the
+  service's own `port`, removed tags and `undeploy` name the workload's block,
+  and validation messages say `provider.create_build_resources`.
 - **Billing:** services were deployed with instance-based billing (CPU always
   allocated, billed for the instance's whole life) instead of Cloud Run's
   request-based default: with resource limits set, Cloud Run needs `cpuIdle`

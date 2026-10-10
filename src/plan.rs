@@ -55,8 +55,66 @@ pub struct ServiceSpec {
     pub annotations: BTreeMap<String, String>,
     /// Revision-template annotations (not diffed); used to force a new revision.
     pub revision_annotations: BTreeMap<String, String>,
+    /// Where the image comes from, stamped on the revision (diffed: a
+    /// revision always says what it runs).
+    pub provenance: Provenance,
     /// What happens to traffic, and the resulting split (see [`ServiceSpec::for_service`]).
     pub traffic: TrafficSpec,
+}
+
+/// Where a revision's (or job's) image comes from, stamped on its template:
+/// the commit it was built from and the release tag it carries. Read with
+/// the image in one read of the (immutable) revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Provenance {
+    pub source: Option<crate::source::Source>,
+    pub release: Option<String>,
+}
+
+impl Provenance {
+    /// The template annotations that carry it.
+    pub fn annotations(&self) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        if let Some(s) = &self.source {
+            m.insert(crate::source::ANNOTATION_SOURCE.to_string(), s.encode());
+        }
+        if let Some(r) = &self.release {
+            m.insert(crate::naming::ANNOTATION_RELEASE.to_string(), r.clone());
+        }
+        m
+    }
+
+    /// Read back from a template's annotations.
+    pub fn from_annotations<'a>(
+        annotations: impl IntoIterator<Item = (&'a String, &'a String)>,
+    ) -> Self {
+        let mut p = Self::default();
+        for (k, v) in annotations {
+            if k == crate::source::ANNOTATION_SOURCE {
+                p.source = crate::source::Source::decode(Some(v));
+            } else if k == crate::naming::ANNOTATION_RELEASE {
+                p.release = Some(v.clone());
+            }
+        }
+        p
+    }
+
+    /// Its diffed fields: a new commit or release is a new revision.
+    pub fn flat(&self) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        if let Some(s) = &self.source {
+            let dirty = if s.dirty {
+                " (uncommitted changes)"
+            } else {
+                ""
+            };
+            m.insert("provenance.commit".into(), format!("{}{dirty}", s.commit));
+        }
+        if let Some(r) = &self.release {
+            m.insert("provenance.release".into(), r.clone());
+        }
+        m
+    }
 }
 
 /// Requested traffic mode and the split computed from the live service.
@@ -117,6 +175,7 @@ impl ServiceSpec {
             custom_audiences: s.custom_audiences.clone(),
             annotations,
             revision_annotations: BTreeMap::new(),
+            provenance: Provenance::default(),
             traffic: TrafficSpec::default(),
         }
     }
@@ -153,6 +212,7 @@ impl ServiceSpec {
         m.insert("max_instances".into(), self.max_instances.to_string());
         m.insert("service_account".into(), self.service_account.clone());
         m.insert("ingress".into(), self.ingress.clone());
+        m.extend(self.provenance.flat());
         m.extend(crate::traffic::flat(&self.traffic.entries));
         m.insert(
             "containers".into(),
@@ -1180,6 +1240,7 @@ mod tests {
             artifact: Artifact::Image {
                 reference: "nginx:1".into(),
                 parsed: ImageRef::parse("nginx:1").unwrap(),
+                origin: "`service.image`".into(),
             },
             service: ServiceConfig {
                 port: 8080,
@@ -1224,6 +1285,8 @@ mod tests {
             retry: Default::default(),
             apis: Default::default(),
             impersonate: None,
+            push_service_account: None,
+            promote: None,
             scheduler_region: "europe-west1".into(),
             release: Default::default(),
             domains: Default::default(),

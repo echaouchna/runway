@@ -492,13 +492,18 @@ pub fn required_apis(d: &Deployment) -> Vec<String> {
     .map(|s| s.to_string())
     .collect();
     let mut add = |a: &str| apis.push(a.to_string());
-    if let Artifact::Build(b) = &d.artifact {
-        add("cloudbuild.googleapis.com");
-        add("artifactregistry.googleapis.com");
-        add("storage.googleapis.com");
-        if b.create_resources {
-            add("cloudresourcemanager.googleapis.com");
+    match &d.artifact {
+        Artifact::Build(b) => {
+            add("cloudbuild.googleapis.com");
+            add("artifactregistry.googleapis.com");
+            add("storage.googleapis.com");
+            if b.create_resources {
+                add("cloudresourcemanager.googleapis.com");
+            }
         }
+        // Nothing is built: only the repository the copy goes to.
+        Artifact::Promote(_) => add("artifactregistry.googleapis.com"),
+        Artifact::Image { .. } => {}
     }
     let roles = &d.service.identity.roles;
     let uses = |f: fn(&RoleTarget) -> bool| roles.iter().any(|r| f(&r.target));
@@ -597,6 +602,28 @@ pub fn pre_steps(d: &Deployment) -> Vec<Step> {
     steps.extend(d.secrets.values().cloned().map(Step::CreateSecret));
     let mut grants = Vec::new();
     let mut accounts = Vec::new();
+    // A promoting stage builds nothing: no bucket, build account nor grants,
+    // only the repositories its copies go to.
+    if let Artifact::Promote(p) = &d.artifact
+        && p.create_resources
+    {
+        steps.push(Step::CreateRepository {
+            project: p.artifact_project.clone(),
+            location: p.artifact_location.clone(),
+            repository: p.artifact_repository.clone(),
+        });
+        if let Some(r) = &d.release.repository
+            && (r.project != p.artifact_project
+                || r.location != p.artifact_location
+                || r.repository != p.artifact_repository)
+        {
+            steps.push(Step::CreateRepository {
+                project: r.project.clone(),
+                location: r.location.clone(),
+                repository: r.repository.clone(),
+            });
+        }
+    }
     if let Artifact::Build(b) = &d.artifact
         && b.create_resources
     {
@@ -610,13 +637,13 @@ pub fn pre_steps(d: &Deployment) -> Vec<Step> {
             labels: Default::default(),
         }));
         steps.push(Step::CreateRepository {
-            project: d.project.clone(),
+            project: b.artifact_project.clone(),
             location: b.artifact_location.clone(),
             repository: b.artifact_repository.clone(),
         });
         // Released images are copied to the stage's release repository.
         if let Some(r) = &d.release.repository
-            && (r.project != d.project
+            && (r.project != b.artifact_project
                 || r.location != b.artifact_location
                 || r.repository != b.artifact_repository)
         {
@@ -647,7 +674,7 @@ pub fn pre_steps(d: &Deployment) -> Vec<Step> {
         grants.push(grant(
             "roles/artifactregistry.writer",
             RoleTarget::Repository {
-                project: d.project.clone(),
+                project: b.artifact_project.clone(),
                 location: b.artifact_location.clone(),
                 repository: b.artifact_repository.clone(),
             },
@@ -1918,7 +1945,7 @@ impl<'a> Provisioner<'a> {
                 if self.tag_binding_exists(binding).await? {
                     (
                         StepState::PendingRemoval,
-                        "not in service.tags: unbind".into(),
+                        format!("not in {}.tags: unbind", self.d.yaml_path()),
                     )
                 } else {
                     (StepState::InSync, "already unbound".into())
@@ -3440,17 +3467,13 @@ impl<'a> Provisioner<'a> {
         ))
     }
 
-    /// Deletes the app's image package from the repository (all its tags and digests).
+    /// Deletes the app's image package from the repository (all its tags
+    /// and digests).
     pub async fn delete_images(
         &self,
-        location: &str,
-        repository: &str,
-        package: &str,
+        pkg: &crate::build::release::Package<'_>,
     ) -> Result<StepOutcome> {
-        let name = format!(
-            "projects/{}/locations/{location}/repositories/{repository}/packages/{package}",
-            self.d.project
-        );
+        let name = pkg.parent();
         let op = missing(&self.clients.artifact, "ArtifactRegistry")?
             .delete_package()
             .set_name(&name)

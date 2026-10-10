@@ -130,6 +130,32 @@ pub(crate) async fn connect(ctx: &Context, d: &crate::config::Deployment) -> Res
     Ok(session)
 }
 
+/// The session for the registry work runway does itself (resolving,
+/// copying and tagging images): `provider.push_service_account`,
+/// impersonated from the caller's credentials, else `session` itself.
+pub(crate) async fn push_session(
+    ctx: &Context,
+    d: &crate::config::Deployment,
+    session: &Session,
+) -> Result<Session> {
+    let Some(sa) = &d.push_service_account else {
+        return Ok(session.clone());
+    };
+    if session.impersonating.as_ref().map(|i| &i.target) == Some(sa) {
+        return Ok(session.clone());
+    }
+    let imp = crate::gcp::Impersonation {
+        target: sa.clone(),
+        delegates: Vec::new(),
+    };
+    ctx.progress.info(format!("registry operations as {sa}"));
+    let push = Session::connect(Some(&imp))?;
+    push.verify().await.map_err(|e| {
+        e.hint("or remove `provider.push_service_account` to use your own credentials")
+    })?;
+    Ok(push)
+}
+
 /// Pins secrets referenced without a version to their newest enabled
 /// version, so that a new value rolls out (new revision) with the next deploy.
 /// `strict`: a secret without any enabled version is an error (deploy);
@@ -317,6 +343,30 @@ pub(crate) fn config_dir(ctx: &Context) -> std::path::PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| ".".into())
+}
+
+/// The commit a deploy records and checks against the one serving: this
+/// checkout's for a build or a configured image, the image's for a promotion
+/// (`None` when unknown: nothing is checked, and the record is removed).
+pub(crate) fn deploy_commit(
+    ctx: &Context,
+    commit: &crate::commands::release::Commit,
+) -> Option<crate::source::Source> {
+    use crate::commands::release::Commit;
+    match commit {
+        Commit::Checkout(s) => s.clone(),
+        Commit::Recorded(s) => {
+            ctx.progress
+                .info(format!("source: {s} (the promoted image's)"));
+            Some(s.clone())
+        }
+        Commit::Unknown => {
+            ctx.progress.warn(
+                "the commit of the promoted image is unknown: older deploys are not checked, and the stage's commit record is removed",
+            );
+            None
+        }
+    }
 }
 
 /// The commit this checkout deploys, said once.
