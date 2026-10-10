@@ -196,6 +196,11 @@ async fn across_locations_layers_are_streamed_and_indexes_copy_every_platform() 
 }
 
 fn release_config(stages: &str) -> (tempfile::TempDir, config::LoadedConfig) {
+    release_config_with("", stages)
+}
+
+/// `top` goes before `stages:` (a global `release` block).
+fn release_config_with(top: &str, stages: &str) -> (tempfile::TempDir, config::LoadedConfig) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
     std::fs::write(dir.path().join("CHANGELOG.md"), "## [1.2.0]\n").unwrap();
@@ -215,7 +220,7 @@ provider:
 service:
   source: .
   service_account: rt@my-gcp-project.iam.gserviceaccount.com
-stages:
+{top}stages:
 {stages}"#
         ),
     )
@@ -349,6 +354,78 @@ async fn a_release_finds_the_candidate_first_and_copies_it_when_publishing() {
         "{:?}",
         e.hints
     );
+}
+
+#[tokio::test]
+async fn a_release_is_published_under_the_package_the_file_names() {
+    let s = MockServer::start().await;
+    let (dir, cfg) = release_config_with(
+        "release:\n  repository:\n    project: plat-artfcs-registry-prod-63a2\n    location: europe-west1\n    repository: docker-releases-plat\n    package: mr-terraform-agent/agent\n",
+        "  prod: {}\n",
+    );
+    assert!(
+        !runway::commands::release::promotes(&cfg),
+        "no tag-rc stage: --tag builds"
+    );
+    let prod = config::resolve(&cfg, "prod", &Default::default()).unwrap();
+    let (body, digest) = manifest(&sha(b"{}"), &sha(b"layer"));
+    let (src_repo, dst_repo) = (
+        "my-gcp-project/builds/shop",
+        "plat-artfcs-registry-prod-63a2/docker-releases-plat/mr-terraform-agent/agent",
+    );
+    serve_manifest(&s, src_repo, &body, &digest, MANIFEST).await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{dst_repo}/manifests/{digest}")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&s)
+        .await;
+    // The resource name escapes the nested path; the image name does not.
+    let parent = "projects/plat-artfcs-registry-prod-63a2/locations/europe-west1/repositories/docker-releases-plat/packages/mr-terraform-agent%2Fagent";
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/{parent}/tags")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/{parent}/tags")))
+        .and(query_param("tagId", "1.2.0"))
+        .respond_with(|r: &Request| {
+            let b: Value = serde_json::from_slice(&r.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(b)
+        })
+        .expect(1)
+        .mount(&s)
+        .await;
+    let ar = artifact_registry(&s).await;
+    let built = format!("europe-west1-docker.pkg.dev/{src_repo}@{digest}");
+    let (deployed, tag) = runway::commands::release::publish(
+        &ar,
+        &client(&s),
+        prod.first(),
+        &built,
+        runway::build::release::ReleaseKind::Release,
+        "1.2.0",
+        &dir.path().join("CHANGELOG.md"),
+    )
+    .await
+    .unwrap();
+    let image = format!("europe-west1-docker.pkg.dev/{dst_repo}");
+    assert_eq!(
+        deployed,
+        format!("{image}@{digest}"),
+        "the copy is deployed"
+    );
+    assert_eq!(tag.image, format!("{image}:1.2.0"));
+    assert!(tag.created);
+    let reqs = s.received_requests().await.unwrap();
+    let post = reqs.iter().find(|r| r.method.as_str() == "POST").unwrap();
+    let b: Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(b["version"], format!("{parent}/versions/{digest}"));
 }
 
 #[tokio::test]

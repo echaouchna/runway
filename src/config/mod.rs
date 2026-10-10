@@ -306,6 +306,9 @@ pub struct ReleaseRepository {
     pub project: String,
     pub location: String,
     pub repository: String,
+    /// The image path inside the repository; `None`: the build's package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
 }
 
 /// A Cloud Run service or job.
@@ -1263,7 +1266,7 @@ pub fn resolve(
         return Err(d);
     }
 
-    let deployments = resolved_workloads
+    let deployments: Vec<Deployment> = resolved_workloads
         .into_iter()
         .map(|(key, service_id, artifact, service, job)| Deployment {
             app: raw.app.clone(),
@@ -1292,6 +1295,10 @@ pub fn resolve(
             secrets: managed_secrets.clone(),
         })
         .collect();
+    check_release_package(&mut d, st, stage, &release, &deployments);
+    if !d.errors.is_empty() {
+        return Err(d);
+    }
     Ok(Resolved {
         deployments,
         schedules,
@@ -3135,6 +3142,45 @@ fn resolve_domains(
     }
 }
 
+/// `release.repository.package` names one image: every release of the stage
+/// would land in it, and the second build's would be refused as another
+/// image under the same version.
+fn check_release_package(
+    d: &mut Diagnostics,
+    st: &RawStage,
+    stage: &str,
+    release: &ReleaseSettings,
+    deployments: &[Deployment],
+) {
+    let Some(package) = release.repository.as_ref().and_then(|r| r.package.as_ref()) else {
+        return;
+    };
+    let mut builds: Vec<(String, String)> = Vec::new();
+    for w in deployments {
+        if let Some(k) = w.build_key()
+            && !builds.iter().any(|(x, _)| *x == k)
+        {
+            builds.push((k, w.what()));
+        }
+    }
+    if builds.len() < 2 {
+        return;
+    }
+    let path = match st.release.as_ref().and_then(|r| r.repository.as_ref()) {
+        Some(_) => format!("stages.{stage}.release.repository.package"),
+        None => "release.repository.package".to_string(),
+    };
+    let names: Vec<&str> = builds.iter().map(|(_, w)| w.as_str()).collect();
+    d.error(
+        path,
+        format!(
+            "`{package}` names one image, but stage `{stage}` builds {} ({}): remove `package` to publish each under its own name, or build them from the same `source`",
+            builds.len(),
+            names.join(", ")
+        ),
+    );
+}
+
 /// The stage's release flag and repository (the stage's replaces the global).
 fn resolve_release(
     d: &mut Diagnostics,
@@ -3192,10 +3238,16 @@ fn resolve_release(
                 d.error(format!("{path}.{field}"), e);
             }
         }
+        if let Some(p) = &r.package
+            && let Err(e) = validate::image_package(p)
+        {
+            d.error(format!("{path}.package"), e);
+        }
         ReleaseRepository {
             project,
             location,
             repository: r.repository.clone(),
+            package: r.package.clone(),
         }
     });
     let from = stage_release.and_then(|r| r.from.clone());

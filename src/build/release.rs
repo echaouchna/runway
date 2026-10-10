@@ -31,7 +31,7 @@ pub enum ReleaseKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReleaseTag {
     pub tag: String,
-    /// `<repository path>/<app>:<tag>`.
+    /// `<repository path>/<package>:<tag>`.
     pub image: String,
     pub version: String,
     pub changelog: String,
@@ -106,10 +106,16 @@ pub struct Package<'a> {
 }
 
 impl Package<'_> {
+    /// The package's resource name. Artifact Registry escapes the slashes
+    /// of a nested image path (`team/agent` is `team%2Fagent`): unescaped,
+    /// they would end the package ID.
     pub fn parent(&self) -> String {
         format!(
             "projects/{}/locations/{}/repositories/{}/packages/{}",
-            self.project, self.location, self.repository, self.package
+            self.project,
+            self.location,
+            self.repository,
+            self.package.replace('/', "%2F")
         )
     }
     /// `LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/PACKAGE` (no tag).
@@ -268,6 +274,24 @@ mod tests {
             Some((3, "1.2.0-RC3".into(), "sha256:c".into()))
         );
         assert_eq!(latest_candidate(&tags, "2.0.0"), None);
+    }
+
+    #[test]
+    fn a_nested_package_is_escaped_in_its_resource_name_only() {
+        let p = Package {
+            project: "my-gcp-project",
+            location: "europe-west1",
+            repository: "releases",
+            package: "team/agent",
+        };
+        assert_eq!(
+            p.parent(),
+            "projects/my-gcp-project/locations/europe-west1/repositories/releases/packages/team%2Fagent"
+        );
+        assert_eq!(
+            p.image(),
+            "europe-west1-docker.pkg.dev/my-gcp-project/releases/team/agent"
+        );
     }
 
     #[test]

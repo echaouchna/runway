@@ -12,6 +12,12 @@ migration notes.
 
 ### Added
 
+- **Release image path.** `release.repository.package` (global or per stage)
+  names the image path in the release repository, nested paths included:
+  `package: mr-terraform-agent/agent` makes `deploy --tag`/`--tag-rc` publish
+  `LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/mr-terraform-agent/agent:X.Y.Z`
+  and deploy that copy. Default: the build's name, as before. A stage that
+  builds several images with a `package` set is a validation error.
 - **Several runs at once.** Runs on the same stage coordinate through a lease
   on the stage's own Cloud Run service (annotation `runway.dev/lease`,
   written with the etag; no lock file): deploys, canaries, traffic changes

@@ -88,6 +88,46 @@ pub fn repository_id(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// An image path inside a Docker repository: `agent` or `team/agent`.
+pub fn image_package(s: &str) -> Result<(), String> {
+    if s.contains("docker.pkg.dev") || s.contains("://") {
+        return Err(format!(
+            "`{s}` must be the image path inside the repository (for example `team/agent`), not a full image name"
+        ));
+    }
+    if s.contains([':', '@']) {
+        return Err(format!(
+            "`{s}` must not have a tag or digest: runway tags released images with the changelog version"
+        ));
+    }
+    if s.is_empty() || !s.split('/').all(docker_path_component) {
+        return Err(format!(
+            "`{s}` is not a valid image path (parts separated by `/`, each of lowercase letters and digits joined by one `.`, one `_`, `__` or dashes, for example `team/my-agent`)"
+        ));
+    }
+    Ok(())
+}
+
+/// A path component of a Docker reference, as registries check it:
+/// `[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*` (distribution/reference).
+fn docker_path_component(p: &str) -> bool {
+    let alnum = |c: &char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let mut chars = p.chars().peekable();
+    loop {
+        if chars.next_if(alnum).is_none() {
+            return false;
+        }
+        while chars.next_if(alnum).is_some() {}
+        let sep: String = std::iter::from_fn(|| chars.next_if(|c| !alnum(c))).collect();
+        if sep.is_empty() {
+            return true;
+        }
+        if !matches!(sep.as_str(), "." | "_" | "__") && !sep.chars().all(|c| c == '-') {
+            return false;
+        }
+    }
+}
+
 pub fn bucket_name(s: &str) -> Result<(), String> {
     if let Some(rest) = s.strip_prefix("gs://") {
         return Err(format!("use the bucket name without `gs://` (`{rest}`)"));
@@ -753,6 +793,41 @@ mod tests {
         assert!(service_account_email("someone@gmail.com").is_err());
         assert!(repository_id("applications").is_ok());
         assert!(repository_id("europe-west1-docker.pkg.dev/p/apps").is_err());
+        for ok in [
+            "agent",
+            "mr-terraform-agent/agent",
+            "a/b.c/d_e",
+            "agent__worker",
+            "agent---worker",
+            "a.b_c-d__e--f/0",
+        ] {
+            assert!(image_package(ok).is_ok(), "{ok}");
+        }
+        for (bad, why) in [
+            ("", "valid image path"),
+            ("team/agent..worker", "valid image path"),
+            ("agent___worker", "valid image path"),
+            ("agent.-worker", "valid image path"),
+            ("agent-_worker", "valid image path"),
+            ("agent._worker", "valid image path"),
+            ("agent.", "valid image path"),
+            ("_agent", "valid image path"),
+            ("team/a gent", "valid image path"),
+            ("/agent", "valid image path"),
+            ("team//agent", "valid image path"),
+            ("team/agent/", "valid image path"),
+            ("Team/Agent", "valid image path"),
+            ("team/-agent", "valid image path"),
+            ("agent:1.0.0", "tag or digest"),
+            ("agent@sha256:abc", "tag or digest"),
+            (
+                "europe-west1-docker.pkg.dev/p/r/agent",
+                "not a full image name",
+            ),
+        ] {
+            let e = image_package(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]

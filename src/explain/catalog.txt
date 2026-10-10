@@ -1348,6 +1348,22 @@ The repository name.
 Rules:
 - Required.
 
+@ release.repository.package
+also: image name, image path, nested image, release image name
+type: string
+default: <app> (main service), <app>-<name>
+docs: releases.md#publish-to-a-release-repository
+The image path inside the release repository, when it must differ from the build's: `team/agent` publishes `LOCATION-docker.pkg.dev/PROJECT/REPOSITORY/team/agent:X.Y.Z`. The build repository keeps its own names.
+Example:
+  release:
+    repository:
+      project: my-release-project
+      repository: releases
+      package: mr-terraform-agent/agent
+Rules:
+- Parts separated by `/`, each of lowercase letters and digits joined by one `.`, one `_`, `__` or dashes (Docker's rule); no registry host, tag or digest.
+- It names one image: a stage that builds several (a service and a job from another `source`) is an error.
+
 @ domains
 also: load balancer, domain mapping, custom domain setup, certificates, https
 type: block

@@ -440,6 +440,7 @@ release:                      # global (optional)
     project: my-release-project   # default: provider.project
     location: europe-west1        # default: the build repository's location
     repository: releases
+    package: team/agent           # optional: the image path in it (default: <app>, <app>-<name>)
 
 stages:
   staging:
@@ -454,6 +455,17 @@ stages:
 
 Without a `release` block, `--stage` is required and the image is tagged in
 the build repository.
+
+`package` is the image path inside the release repository, when your
+organisation requires one: `package: mr-terraform-agent/agent` publishes
+`europe-west1-docker.pkg.dev/PROJECT/REPOSITORY/mr-terraform-agent/agent:X.Y.Z`.
+Its parts are separated by `/`, each made of lowercase letters and digits
+joined by one `.`, one `_`, `__` or dashes, as Docker requires (no registry
+host, tag or digest). The build repository keeps its own names. A
+package names one image, so a stage that builds several (a service and a job
+built from another `source`) is an error: remove `package`, or build them
+from the same `source`. A stage's `release.repository` replaces the global
+one, `package` included.
 
 ## Removing access
 
