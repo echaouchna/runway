@@ -93,7 +93,9 @@ async fn cloud_build_uses_regional_endpoints_and_expected_body() {
             path: "Dockerfile".into(),
         },
         artifact_location: "europe-west1".into(),
+        artifact_project: "p".into(),
         artifact_repository: "apps".into(),
+        artifact_package: None,
         source_bucket: "src-bucket".into(),
         build_service_account: "builds@p.iam.gserviceaccount.com".into(),
         excluded: vec![],
@@ -212,6 +214,7 @@ fn spec() -> ServiceSpec {
         custom_audiences: Vec::new(),
         annotations: BTreeMap::new(),
         revision_annotations: BTreeMap::new(),
+        provenance: Default::default(),
         traffic: Default::default(),
     }
 }

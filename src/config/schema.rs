@@ -101,8 +101,17 @@ pub struct RawProvider {
     pub artifact_repository: Option<String>,
     /// Location of the Artifact Registry repository. Defaults to `region`.
     pub artifact_location: Option<String>,
+    /// Project of the Artifact Registry repository builds are pushed to.
+    /// Defaults to `project`.
+    pub artifact_project: Option<String>,
+    /// Image path of builds in that repository (`team/agent`). Defaults to
+    /// `<app>` (main service) or `<app>-<name>`.
+    pub artifact_package: Option<String>,
     pub source_bucket: Option<String>,
     pub build_service_account: Option<String>,
+    /// Account runway impersonates for the registry work it does itself
+    /// (reading, copying and tagging images); default: the caller.
+    pub push_service_account: Option<String>,
     /// Enable the APIs the configuration needs (plus `apis`) when missing.
     pub enable_apis: Option<bool>,
     /// Extra APIs to enable/check, e.g. `telemetry.googleapis.com`.
@@ -144,6 +153,19 @@ pub struct RawStage {
     /// replaces the global one.
     pub release: Option<RawRelease>,
     pub domains: Option<RawDomains>,
+    /// Deploy another stage's images instead of building.
+    pub promote: Option<RawPromote>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPromote {
+    /// The stage whose images are deployed: without a release flag, what it
+    /// runs; with `--tag`/`--tag-rc`, its candidate of the version.
+    pub from: String,
+    /// `checkout`: the image that stage ran built from the commit being
+    /// deployed (found in its revisions), and no other.
+    pub commit: Option<String>,
 }
 
 /// How a stage serves its services' custom domains.

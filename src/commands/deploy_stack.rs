@@ -10,10 +10,9 @@ use crate::cli::{Context, DeployArgs};
 use crate::commands::deploy::{
     after_rollout, bootstrap_spec, effective_retry, report_step, roll_out, save_grants, tagged_url,
 };
-use crate::commands::plan::{
-    ImageDecision, decide_image, holder_records, job_for_mode, job_labels,
-};
+use crate::commands::plan::{ImageDecision, holder_records, job_for_mode, job_labels};
 use crate::commands::registry_client;
+use crate::commands::release::Commit;
 use crate::config::{Artifact, BuildConfig, Deployment, Resolved, WorkloadKind};
 use crate::deploy::{AccessChange, Reconciler, ServiceChange, check_ownership};
 use crate::domains::{ANNOTATION_DOMAINS, Recorded};
@@ -271,6 +270,8 @@ pub async fn run(
         }
     ));
     let session = crate::commands::connect(ctx, first).await?;
+    // Registry work runway does itself (resolve, copy, tag): maybe another account.
+    let push = crate::commands::push_session(ctx, first, &session).await?;
     let run_client = build_client!(Services, session)?;
     let revisions = build_client!(Revisions, session)?;
     let jobs_client = build_client!(Jobs, session)?;
@@ -307,7 +308,7 @@ pub async fn run(
         Ok::<_, Error>(Some(res))
     };
     let login = async {
-        let registry = with_retry(&retry, p, "authenticate", |_| registry_client(&session)).await?;
+        let registry = with_retry(&retry, p, "authenticate", |_| registry_client(&push)).await?;
         let mut notes = Vec::new();
         let mut ws = Vec::new();
         for d in selected {
@@ -335,43 +336,27 @@ pub async fn run(
     )
     .await?;
     let outcome = async {
-    // `--tag` with release candidates: each build's candidate, nothing built.
-    // Only looked up here (the APIs are enabled); the release step copies it
-    // into the stage's release repository, once provisioned.
-    let mut promoted: Vec<(String, String)> = Vec::new();
-    if let Some((crate::build::release::ReleaseKind::Release, version, _)) = &release_request
-        && crate::commands::release::promotes(cfg)
-    {
-        let ar = build_client!(
-            google_cloud_artifactregistry_v1::client::ArtifactRegistry,
-            session
-        )?;
-        for d in selected {
-            let owner = r.build_owner(d);
-            if let Some(k) = owner.build_key()
-                && !promoted.iter().any(|(x, _)| *x == k)
-            {
-                let image = with_retry(&retry, p, "find the release candidate", |_| {
-                    crate::commands::release::find_candidate(&ar, cfg, owner, version)
-                })
-                .await?;
-                p.info(format!("releasing {image} for {} (no build)", owner.what()));
-                promoted.push((k, image));
-            }
-        }
-    }
-    let promoted_image = |o: &Deployment| {
-        o.build_key().and_then(|k| {
-            promoted
-                .iter()
-                .find(|(x, _)| *x == k)
-                .map(|(_, i)| i.clone())
-        })
+    // How each image is resolved: a build, a configured image, or what the
+    // source stage serves (a promotion), with the request's publication.
+    let ar = build_client!(
+        google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+        push
+    )?;
+    let readers = crate::commands::release::Readers {
+        ar: &ar,
+        services: &run_client,
+        revisions: &revisions,
+        jobs: &jobs_client,
+    };
+    let ours = crate::commands::this_source(ctx);
+    let req = crate::commands::release::Request {
+        version: release_request.as_ref().map(|(k, v, _)| (*k, v.as_str())),
+        ours: ours.as_ref(),
     };
 
     // 2. Inspect: every workload, one image decision per distinct build, and
     //    the grants recorded on the holder. Ownership is checked first.
-    let (mut lives, decisions, by_workload, mut records) =
+    let (mut lives, resolutions, by_workload, mut records) =
         with_retry(&retry, p, "inspect current state", |_| async {
             let mut lives = Vec::new();
             for d in &ws {
@@ -380,9 +365,9 @@ pub async fn run(
                     false => Live::Service(reconciler.get(&d.service_name()).await?),
                 });
             }
-            // One decision per distinct build, made for its owner.
+            // One resolution per distinct build, made for its owner.
             let mut owners: Vec<&Deployment> = Vec::new();
-            let mut decisions: Vec<ImageDecision> = Vec::new();
+            let mut resolutions: Vec<crate::commands::release::Resolution> = Vec::new();
             let mut by_workload = Vec::new();
             for d in &ws {
                 let owner = r.build_owner(d);
@@ -395,22 +380,24 @@ pub async fn run(
                     Some(i) => i,
                     None => {
                         let mut notes = Vec::new();
-                        let decision = match promoted_image(owner) {
-                            Some(img) => {
-                                let o = crate::commands::release::with_image(owner, &img)?;
-                                decide_image(&o, Some(&registry), &mut notes).await?
-                            }
-                            None => decide_image(owner, Some(&registry), &mut notes).await?,
-                        };
-                        decisions.push(decision);
+                        let res = crate::commands::release::resolve(
+                            cfg,
+                            owner,
+                            Some(&readers),
+                            Some(&registry),
+                            &req,
+                            &mut notes,
+                        )
+                        .await?;
+                        resolutions.push(res);
                         owners.push(owner);
-                        decisions.len() - 1
+                        resolutions.len() - 1
                     }
                 };
                 by_workload.push(i);
             }
             let records = holder_records(r, &run_client, &jobs_client).await?;
-            Ok((lives, decisions, by_workload, records))
+            Ok((lives, resolutions, by_workload, records))
         })
         .await?;
     let check_owners = |lives: &[Live]| -> Result<()> {
@@ -452,11 +439,23 @@ pub async fn run(
     let (recorded, domains_previous) = (records.grants.clone(), records.domains.clone());
     let held = lease.held();
     provisioner.hold(held.clone());
+    let decisions: Vec<&ImageDecision> = resolutions.iter().map(|r| &r.decision).collect();
+    // The stage's commit: its promoted images' (all from the source stage;
+    // unknown if any is), else this checkout's.
+    let stage_commit = resolutions
+        .iter()
+        .filter(|r| r.promoted.is_some())
+        .map(|r| r.commit.clone())
+        .reduce(|a, b| match (&a, &b) {
+            (Commit::Unknown, _) | (_, Commit::Unknown) => Commit::Unknown,
+            _ => a,
+        })
+        .unwrap_or(Commit::Checkout(ours.clone()));
     // A deploy of an older commit than the one serving is refused (previews
     // do not change what serves).
-    let source = crate::commands::this_source(ctx);
+    let source = crate::commands::deploy_commit(ctx, &stage_commit);
     let records_source = !matches!(mode, Mode::Preview { .. });
-    if records_source {
+    if records_source && stage_commit != Commit::Unknown {
         if let Some(l) = &records.source {
             p.info(format!("deployed: {l}"));
         }
@@ -478,13 +477,24 @@ pub async fn run(
             r.build_owner(&ws[w])
         })
         .collect();
+    for (res, owner) in resolutions.iter().zip(&owners) {
+        if let Some(pr) = &res.promoted {
+            p.info(format!(
+                "deploying {} for {}: {} (no build)",
+                pr.image,
+                owner.what(),
+                pr.why
+            ));
+        }
+    }
 
     // 3. Images: builds needed, or existing images (checked before any change).
     let rebuild: Vec<Option<&BuildConfig>> = decisions
         .iter()
         .zip(&owners)
-        .map(|(dec, owner)| match (&owner.artifact, &dec.image) {
-            _ if promoted_image(owner).is_some() => None,
+        .enumerate()
+        .map(|(i, (dec, owner))| match (&owner.artifact, &dec.image) {
+            _ if resolutions[i].promoted.is_some() => None,
             (Artifact::Build(cfg), img)
                 if args.force_build || cfg.rebuild_always || !img.is_exact() =>
             {
@@ -497,12 +507,12 @@ pub async fn run(
     for (i, dec) in decisions.iter().enumerate() {
         existing_images.push(match (&owners[i].artifact, &dec.image) {
             _ if rebuild[i].is_some() => None,
-            (Artifact::Image { .. }, ImagePlan::Unresolved { reference, reason }) => {
+            (Artifact::Image { origin, .. }, ImagePlan::Unresolved { reference, reason }) => {
                 if reason.contains("no such tag") {
                     return Err(Error::prerequisite(format!(
                         "image {reference} was not found in its registry"
                     ))
-                    .hint(format!("push the image first, or fix the `image` of {}", owners[i].what())));
+                    .hint(format!("push the image first, or fix {origin}")));
                 }
                 p.warn(format!(
                     "deploying tag {reference} without a pinned digest ({reason}); Cloud Run resolves it when the revision is created"
@@ -683,8 +693,17 @@ pub async fn run(
         })
         .collect::<Result<_>>()?;
     let mut images = images;
-    let releases =
-        apply_releases(&session, &retry, p, &release_request, &owners, &mut images).await?;
+    let releases = apply_releases(
+        &ar,
+        &push,
+        &retry,
+        p,
+        &release_request,
+        &resolutions,
+        &owners,
+        &mut images,
+    )
+    .await?;
 
     // 5. Services, then jobs.
     let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
@@ -710,9 +729,11 @@ pub async fn run(
         if let Some(prev) = domains_previous.as_ref().filter(|_| is_holder(d, holder.d)) {
             annotations.insert(ANNOTATION_DOMAINS.to_string(), prev.encode());
         }
-        if let Some(rel) = releases.iter().find(|(o, _)| *o == k).map(|(_, r)| r) {
+        let release = releases.iter().find(|(o, _)| *o == k).map(|(_, r)| r);
+        if let Some(rel) = release {
             annotations.insert(naming::ANNOTATION_RELEASE.to_string(), rel.tag.clone());
         }
+        let provenance = resolutions[k].provenance(release.map(|r| r.tag.as_str()));
         match &d.kind {
             WorkloadKind::Service => {
                 let existing = match &lives[i] {
@@ -726,6 +747,7 @@ pub async fn run(
                     d,
                     image,
                     annotations,
+                    provenance,
                     existing,
                     &mode,
                     &retry,
@@ -748,6 +770,7 @@ pub async fn run(
                 let target = job_for_mode(d, &mode)?;
                 let mut spec = ServiceSpec::from_deployment(&target, image, annotations);
                 spec.labels = job_labels(d, &mode);
+                spec.provenance = provenance;
                 let known = match &lives[i] {
                     Live::Job(j) => j.clone(),
                     Live::Service(_) => None,
@@ -923,19 +946,28 @@ pub async fn run(
     // What serves now comes from this commit: a later deploy of an older one
     // is refused.
     // Not on a holder runway does not own (it is not changed).
+    // A promoted image of unknown commit removes the record rather than
+    // claim this checkout's.
+    let value = match (&stage_commit, &source) {
+        (Commit::Unknown, _) => Some(None),
+        (_, Some(src)) => Some(Some(src.encode())),
+        (_, None) => None,
+    };
     if records_source
         && (records.owned || !records.exists || holder.adopting)
-        && let Some(src) = &source
+        && let Some(value) = value
     {
-        let value = src.encode();
         let name = holder.d.service_name();
         with_retry(&retry, p, "record the deployed commit", |_| async {
             held.check()?;
             match holder.d.is_job() {
-                true => jrec.set_annotation(&name, crate::source::ANNOTATION_SOURCE, &value).await,
+                true => {
+                    jrec.put_annotation(&name, crate::source::ANNOTATION_SOURCE, value.as_deref())
+                        .await
+                }
                 false => {
                     reconciler
-                        .set_annotation(&name, crate::source::ANNOTATION_SOURCE, &value)
+                        .put_annotation(&name, crate::source::ANNOTATION_SOURCE, value.as_deref())
                         .await
                 }
             }
@@ -983,6 +1015,7 @@ async fn deploy_service(
     d: &Deployment,
     image: &str,
     annotations: std::collections::BTreeMap<String, String>,
+    provenance: crate::plan::Provenance,
     existing: Option<Service>,
     mode: &Mode,
     retry: &RetryConfig,
@@ -992,8 +1025,9 @@ async fn deploy_service(
     let name = d.service_name();
     let report = |x: &StepResult| report_step(p, x);
     let mut steps = Vec::new();
-    let base_spec =
+    let mut base_spec =
         ServiceSpec::from_deployment(d, image, annotations).with_traffic_mode(mode.clone());
+    base_spec.provenance = provenance;
     let mut existing = existing;
     let bootstrapped = if existing.is_none()
         && let Some(bs) = &d.service.bootstrap
@@ -1109,9 +1143,10 @@ async fn deploy_service(
     Ok((result, svc, steps))
 }
 
-/// `--tag`/`--tag-rc`: the version from the changelog (next to runway.yaml
-/// or in the first build context), checked before anything changes.
-fn release_request(
+/// `--tag`/`--tag-rc`: the version from the changelog (in the first build
+/// folder, else next to runway.yaml), checked before anything changes. Any
+/// image can be published: built, configured or promoted.
+pub(crate) fn release_request(
     ctx: &Context,
     args: &DeployArgs,
     selected: &[&Deployment],
@@ -1125,28 +1160,27 @@ fn release_request(
     if !(args.tag || args.tag_rc) {
         return Ok(None);
     }
-    let Some(b) = selected.iter().find_map(|d| match &d.artifact {
-        Artifact::Build(b) => Some(b),
+    let folder = selected.iter().find_map(|d| match &d.artifact {
+        Artifact::Build(b) => Some(b.context_dir.as_path()),
+        Artifact::Promote(p) => Some(p.context_dir.as_path()),
         Artifact::Image { .. } => None,
-    }) else {
-        return Err(Error::config(
-            "--tag/--tag-rc tag images built by runway; this selection deploys existing images only",
-        ));
-    };
+    });
     let config_dir = ctx
         .config
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    let path =
-        crate::build::release::find_changelog(&[config_dir, &b.context_dir]).ok_or_else(|| {
-            Error::config(format!(
-                "--tag needs a changelog ({}) next to {} or in {}",
-                crate::build::release::CHANGELOG_NAMES.join(", "),
-                ctx.config.display(),
-                b.context_dir.display()
-            ))
-        })?;
+    let dirs: Vec<&std::path::Path> = folder.into_iter().chain([config_dir]).collect();
+    let path = crate::build::release::find_changelog(&dirs).ok_or_else(|| {
+        Error::config(format!(
+            "--tag needs a changelog ({}) in {}",
+            crate::build::release::CHANGELOG_NAMES.join(", "),
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ))
+    })?;
     let text = std::fs::read_to_string(&path)?;
     let version = crate::build::release::latest_version(&text).ok_or_else(|| {
         Error::config(format!(
@@ -1158,14 +1192,28 @@ fn release_request(
         true => crate::build::release::ReleaseKind::Candidate,
         false => crate::build::release::ReleaseKind::Release,
     };
+    // On a git tag, the release is named after it.
+    let dir = crate::commands::config_dir(ctx);
+    let commit = crate::source::current(&dir).map(|s| s.commit);
+    crate::source::check_tag_version(&version, &crate::source::tags(&dir, commit.as_deref()))?;
     ctx.progress
         .info(format!("release version {version} from {}", path.display()));
     Ok(Some((kind, version, path)))
 }
 
-/// Tags each image runway builds (one per distinct build) with the release.
+/// What publishing an image to a destination gave: the reference deployed
+/// and the release tag, by `(digest, destination image)`.
+type Published = Vec<(
+    (String, String),
+    (String, Option<crate::build::release::ReleaseTag>),
+)>;
+
+/// Puts each image where its resolution says (a promoted copy, a release
+/// target) and tags it with the release; the copies are deployed.
+#[allow(clippy::too_many_arguments)]
 async fn apply_releases(
-    session: &crate::gcp::Session,
+    ar: &google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+    push: &crate::gcp::Session,
     retry: &RetryConfig,
     p: &Progress,
     request: &Option<(
@@ -1173,37 +1221,63 @@ async fn apply_releases(
         String,
         std::path::PathBuf,
     )>,
+    resolutions: &[crate::commands::release::Resolution],
     owners: &[&Deployment],
     images: &mut [String],
 ) -> Result<Vec<(usize, crate::build::release::ReleaseTag)>> {
-    let Some((kind, version, path)) = request else {
+    if resolutions.iter().all(|r| r.destination.is_none()) {
         return Ok(Vec::new());
+    }
+    let items: Vec<(String, &crate::commands::release::Resolution, &str)> = resolutions
+        .iter()
+        .zip(owners)
+        .zip(images.iter())
+        .map(|((r, o), i)| (o.what(), r, i.as_str()))
+        .collect();
+    crate::commands::release::check_destinations(&items, request.is_some())?;
+    let registry = registry_client(push).await?;
+    let release = request
+        .as_ref()
+        .map(|(k, v, path)| (*k, v.as_str(), path.as_path()));
+    let what = match request {
+        Some(_) => "publish the release",
+        None => "copy the promoted image",
     };
-    let ar = build_client!(
-        google_cloud_artifactregistry_v1::client::ArtifactRegistry,
-        session
-    )?;
-    let registry = registry_client(session).await?;
     let mut out = Vec::new();
-    for (i, owner) in owners.iter().enumerate() {
-        if !matches!(owner.artifact, Artifact::Build(_)) {
+    // One copy (and tag) per image and destination, shared by the
+    // workloads that get it.
+    let mut done: Published = Vec::new();
+    for (i, res) in resolutions.iter().enumerate() {
+        let Some(t) = &res.destination else {
             continue;
-        }
-        // Published to the stage's release repository (copied when the
-        // image is elsewhere), then tagged; the published image is deployed.
-        let (deployed, r) = with_retry(retry, p, "publish the release", |_| {
-            crate::commands::release::publish(
-                &ar, &registry, owner, &images[i], *kind, version, path,
-            )
-        })
-        .await?;
+        };
+        // The same digest under another path is the same image.
+        let digest = images[i]
+            .rsplit_once('@')
+            .map_or(images[i].as_str(), |(_, d)| d);
+        let key = (digest.to_string(), t.image());
+        let (deployed, tag) = match done.iter().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.clone(),
+            None => {
+                let v = with_retry(retry, p, what, |_| {
+                    crate::commands::release::publish(ar, &registry, res, &images[i], release)
+                })
+                .await?;
+                if let Some(r) = &v.1 {
+                    if r.created {
+                        p.success(format!("tagged {}", r.image));
+                    } else {
+                        p.info(format!("= {} already tags this image", r.image));
+                    }
+                }
+                done.push((key, v.clone()));
+                v
+            }
+        };
         images[i] = deployed;
-        if r.created {
-            p.success(format!("tagged {}", r.image));
-        } else {
-            p.info(format!("= {} already tags this image", r.image));
+        if let Some(r) = tag {
+            out.push((i, r));
         }
-        out.push((i, r));
     }
     Ok(out)
 }

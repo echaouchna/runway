@@ -7,7 +7,6 @@
 use crate::build::cloudbuild::{BuildInputs, Builder, BuiltImage};
 use crate::build_client;
 use crate::cli::{Context, DeployArgs};
-use crate::commands::plan::decide_image;
 use crate::commands::{load, registry_client};
 use crate::config::{Artifact, Deployment, ReleaseFlag};
 use crate::deploy::{AccessChange, Applied, Reconciler, ServiceChange, Target, check_ownership};
@@ -136,6 +135,13 @@ pub async fn run(ctx: &Context, args: DeployArgs) -> Result<()> {
         ));
     }
     let resolved = load(ctx, &stage, &overrides)?;
+    if args.force_build
+        && let Some(from) = &resolved.first().promote
+    {
+        return Err(Error::config(format!(
+            "stage {stage} promotes stage {from}'s images (`stages.{stage}.promote.from`): --force-build would deploy an untested build"
+        )));
+    }
     let selected = resolved.select(&args.stage.only)?;
     if crate::commands::plan::is_single(&resolved) {
         return run_single(ctx, args, &resolved, started, &cfg).await;
@@ -195,43 +201,7 @@ async fn run_single(
     let retry = effective_retry(d, &args);
 
     // Release tag: read the changelog before doing anything else.
-    let release_request = if args.tag || args.tag_rc {
-        let Artifact::Build(b) = &d.artifact else {
-            return Err(Error::config(
-                "--tag/--tag-rc tag images built by runway; this stage deploys an existing image",
-            ));
-        };
-        let config_dir = ctx
-            .config
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
-        let path = crate::build::release::find_changelog(&[&b.context_dir, config_dir])
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "--tag needs a changelog ({}) in {} or next to {}",
-                    crate::build::release::CHANGELOG_NAMES.join(", "),
-                    b.context_dir.display(),
-                    ctx.config.display()
-                ))
-            })?;
-        let text = std::fs::read_to_string(&path)?;
-        let version = crate::build::release::latest_version(&text).ok_or_else(|| {
-            Error::config(format!(
-                "no `vX.Y.Z` or `X.Y.Z` version heading found in {}",
-                path.display()
-            ))
-        })?;
-        let kind = if args.tag_rc {
-            crate::build::release::ReleaseKind::Candidate
-        } else {
-            crate::build::release::ReleaseKind::Release
-        };
-        p.info(format!("release version {version} from {}", path.display()));
-        Some((kind, version, path))
-    } else {
-        None
-    };
+    let release_request = crate::commands::deploy_stack::release_request(ctx, &args, &[d])?;
 
     let mode = crate::commands::traffic_mode(args.preview.as_deref(), args.traffic, &d.service_id)?;
     p.step(format!(
@@ -247,11 +217,18 @@ async fn run_single(
         }
     ));
     let session = crate::commands::connect(ctx, d).await?;
+    // Registry work runway does itself (resolve, copy, tag): maybe another account.
+    let push = crate::commands::push_session(ctx, d, &session).await?;
     // The deployment keeps its build settings (its repositories are
-    // provisioned); a promoted release only replaces the image it deploys.
+    // provisioned); a promoted image only replaces the image it deploys.
     let build_d = d.clone();
     let run_client = build_client!(Services, session)?;
     let revisions = build_client!(Revisions, session)?;
+    let jobs = build_client!(google_cloud_run_v2::client::Jobs, session)?;
+    let ar = build_client!(
+        google_cloud_artifactregistry_v1::client::ArtifactRegistry,
+        push
+    )?;
     let reconciler = Reconciler {
         run: &run_client,
         revisions: Some(&revisions),
@@ -274,7 +251,7 @@ async fn run_single(
         Ok::<_, Error>(Some(r))
     };
     let login = async {
-        let registry = with_retry(&retry, p, "authenticate", |_| registry_client(&session)).await?;
+        let registry = with_retry(&retry, p, "authenticate", |_| registry_client(&push)).await?;
         let mut notes = Vec::new();
         let resolved = crate::commands::resolve_runtime_versions(d, &registry, &mut notes).await;
         Ok::<_, Error>((registry, resolved, notes))
@@ -300,38 +277,34 @@ async fn run_single(
     )
     .await?;
     let outcome = async {
-    // `--tag` with release candidates: the candidate's image, nothing built.
-    // Only looked up here (the APIs are enabled); it is copied into the
-    // stage's release repository by the release step, once provisioned.
-    let promoted = match &release_request {
-        Some((crate::build::release::ReleaseKind::Release, version, _))
-            if crate::commands::release::promotes(cfg) =>
-        {
-            let ar = build_client!(
-                google_cloud_artifactregistry_v1::client::ArtifactRegistry,
-                session
-            )?;
-            let image = with_retry(&retry, p, "find the release candidate", |_| {
-                crate::commands::release::find_candidate(&ar, cfg, &build_d, version)
-            })
-            .await?;
-            p.info(format!("releasing {image} (no build)"));
-            Some(crate::commands::release::with_image(d, &image)?)
-        }
-        _ => None,
+    // 2. Inspect: read the live service while resolving the image (a build:
+    //    hashing the source; a promotion: what the source stage serves), all
+    //    read-only. Ownership is checked before any change.
+    let ours = crate::commands::this_source(ctx);
+    let readers = crate::commands::release::Readers {
+        ar: &ar,
+        services: &run_client,
+        revisions: &revisions,
+        jobs: &jobs,
     };
-
-    // 2. Inspect: read the live service while hashing the source and resolving
-    //    the image (all read-only). Ownership is checked before any change.
-    let (mut existing, decision) = with_retry(&retry, p, "inspect current state", |_| async {
+    let req = crate::commands::release::Request {
+        version: release_request.as_ref().map(|(k, v, _)| (*k, v.as_str())),
+        ours: ours.as_ref(),
+    };
+    let (mut existing, resolution) = with_retry(&retry, p, "inspect current state", |_| async {
         let mut notes = Vec::new();
-        let (existing, decision) = tokio::join!(
+        let (existing, resolution) = tokio::join!(
             reconciler.get(&name),
-            decide_image(promoted.as_ref().unwrap_or(d), Some(&registry), &mut notes)
+            crate::commands::release::resolve(cfg, &build_d, Some(&readers), Some(&registry), &req, &mut notes)
         );
-        Ok((existing?, decision?))
+        Ok((existing?, resolution?))
     })
     .await?;
+    let decision = &resolution.decision;
+    let promoted = resolution.promoted.is_some();
+    if let Some(pr) = &resolution.promoted {
+        p.info(format!("deploying {}: {} (no build)", pr.image, pr.why));
+    }
     if let Some(svc) = &existing {
         check_ownership(svc, &d.app, &d.stage, args.adopt)?;
     }
@@ -356,10 +329,10 @@ async fn run_single(
     let held = lease.held();
     provisioner.hold(held.clone());
     // A deploy of an older commit than the one serving is refused (previews
-    // do not change what serves).
-    let source = crate::commands::this_source(ctx);
+    // do not change what serves). A promotion's commit is its image's.
+    let source = crate::commands::deploy_commit(ctx, &resolution.commit);
     let records_source = !matches!(mode, crate::traffic::Mode::Preview { .. });
-    if records_source {
+    if records_source && resolution.commit != crate::commands::release::Commit::Unknown {
         let live = existing
             .as_ref()
             .filter(|svc| run::ownership(svc, &d.app, &d.stage) == run::Ownership::Owned)
@@ -395,7 +368,7 @@ async fn run_single(
 
     // 3. Image: a build, or an existing image (checked before any change).
     let rebuild = match (&d.artifact, &decision.image) {
-        _ if promoted.is_some() => None,
+        _ if promoted => None,
         (Artifact::Build(cfg), img)
             if args.force_build || cfg.rebuild_always || !img.is_exact() =>
         {
@@ -405,12 +378,12 @@ async fn run_single(
     };
     let existing_image = match (&d.artifact, &decision.image) {
         _ if rebuild.is_some() => None,
-        (Artifact::Image { .. }, ImagePlan::Unresolved { reference, reason }) => {
+        (Artifact::Image { origin, .. }, ImagePlan::Unresolved { reference, reason }) => {
             if reason.contains("no such tag") {
                 return Err(Error::prerequisite(format!(
                     "image {reference} was not found in its registry"
                 ))
-                .hint("push the image first, or fix `service.image`"));
+                .hint(format!("push the image first, or fix {origin}")));
             }
             p.warn(format!(
                 "deploying tag {reference} without a pinned digest ({reason}); Cloud Run resolves it when the revision is created"
@@ -584,32 +557,43 @@ async fn run_single(
             prev.encode(),
         );
     }
+    // Copied where the stage runs it from (a promotion, a release target),
+    // then tagged with the release; that copy is deployed.
     let mut release = None;
-    if let Some((kind, version, path)) = &release_request {
-        let ar = build_client!(
-            google_cloud_artifactregistry_v1::client::ArtifactRegistry,
-            session
-        )?;
-        let registry = registry_client(&session).await?;
-        // Published to the stage's release repository (copied when the
-        // image is elsewhere), then tagged; the published image is deployed.
-        let (deployed, r) = with_retry(&retry, p, "publish the release", |_| {
+    if resolution.destination.is_some() {
+        let registry = registry_client(&push).await?;
+        let what = match &release_request {
+            Some(_) => "publish the release",
+            None => "copy the promoted image",
+        };
+        let (deployed, tag) = with_retry(&retry, p, what, |_| {
             crate::commands::release::publish(
-                &ar, &registry, &build_d, &image, *kind, version, path,
+                &ar,
+                &registry,
+                &resolution,
+                &image,
+                release_request
+                    .as_ref()
+                    .map(|(k, v, path)| (*k, v.as_str(), path.as_path())),
             )
         })
         .await?;
         image = deployed;
-        if r.created {
-            p.success(format!("tagged {}", r.image));
-        } else {
-            p.info(format!("= {} already tags this image", r.image));
+        if let Some(r) = tag {
+            if r.created {
+                p.success(format!("tagged {}", r.image));
+            } else {
+                p.info(format!("= {} already tags this image", r.image));
+            }
+            annotations.insert(naming::ANNOTATION_RELEASE.to_string(), r.tag.clone());
+            release = Some(r);
         }
-        annotations.insert(naming::ANNOTATION_RELEASE.to_string(), r.tag.clone());
-        release = Some(r);
     }
-    let base_spec =
+    let mut base_spec =
         ServiceSpec::from_deployment(d, &image, annotations).with_traffic_mode(mode.clone());
+    // The revision says where its image comes from (read with the image when
+    // another stage promotes it).
+    base_spec.provenance = resolution.provenance(release.as_ref().map(|r| r.tag.as_str()));
 
     // First deploy with `bootstrap`: a placeholder service that organization
     // policies accept, so the service's tags exist (and are effective) before
@@ -820,13 +804,18 @@ async fn run_single(
     .map_err(|e| after_rollout(e, d, url.as_deref()))?;
 
     // What serves now comes from this commit: a later deploy of an older one
-    // is refused.
-    if records_source && let Some(src) = &source {
-        let value = src.encode();
+    // is refused. A promoted image of unknown commit removes the record
+    // rather than claim this checkout's.
+    let record = match (&resolution.commit, &source) {
+        (crate::commands::release::Commit::Unknown, _) => Some(None),
+        (_, Some(src)) => Some(Some(src.encode())),
+        (_, None) => None,
+    };
+    if records_source && let Some(value) = record {
         with_retry(&retry, p, "record the deployed commit", |_| async {
             held.check()?;
             reconciler
-                .set_annotation(&name, crate::source::ANNOTATION_SOURCE, &value)
+                .put_annotation(&name, crate::source::ANNOTATION_SOURCE, value.as_deref())
                 .await
         })
         .await
@@ -1081,6 +1070,8 @@ pub fn bootstrap_spec(
             )
             .collect(),
         revision_annotations: Default::default(),
+        // A placeholder runs nothing of the app's.
+        provenance: Default::default(),
         traffic: Default::default(),
     }
 }

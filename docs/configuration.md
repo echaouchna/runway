@@ -21,8 +21,11 @@ provider:
   # `${project}-runway-sources` and `runway-build@${project}.iam.gserviceaccount.com`.
   artifact_repository: applications             # source builds
   artifact_location: europe-west1               # optional, defaults to region
+  artifact_project: my-registry-project         # optional, defaults to project (see "Where images go")
+  artifact_package: team/hello                  # optional image path, defaults to <app>, <app>-<name>
   source_bucket: "${project}-runway-sources"   # source builds, name without gs://
   build_service_account: "builds@${project}.iam.gserviceaccount.com"   # source builds
+  push_service_account: "ci@my-ci-project.iam.gserviceaccount.com"     # optional: copies and tags images
 
 buckets:                      # created and kept configured by runway: ${buckets.KEY}
   # An existing bucket is only updated if runway created it for this app
@@ -426,6 +429,43 @@ runs, after the roles each of them declared are revoked. An account is kept whil
 runway.yaml or not) runs as it. With `--only`, a schedule calling what is
 removed is deleted only if runway created it.
 
+## Where images go
+
+Builds are pushed to `provider.artifact_repository`, in `artifact_location`
+(default: the region) and `artifact_project` (default: the deployment
+project), under `artifact_package` (default `<app>` for the main service,
+`<app>-<name>` for the others). Each can be set per stage, in its
+`provider` block:
+
+```yaml
+provider:
+  project: my-app-project
+  region: europe-west1
+  artifact_project: my-registry-project   # a shared registry
+  artifact_repository: docker-dev
+  artifact_package: team/agent
+stages:
+  dev: {}
+  prod:
+    provider: {artifact_repository: docker-prod}   # prod's builds and copies go here
+```
+
+Cloud Build still runs in `provider.project`, as `build_service_account`,
+which needs `roles/artifactregistry.writer` on the repository. In another
+project, the stage's Cloud Run service agent
+(`service-PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com`)
+needs `roles/artifactregistry.reader` on it to pull. runway grants the first
+with `create_build_resources` (it then also creates the repository when it is
+missing) and never the second. `artifact_package` names one image: a stage
+that builds several (a service and a job from another `source`) is an error.
+
+A stage can also take another stage's images instead of building
+(`stages.<name>.promote.from`): it then needs only `artifact_repository`
+(where its copies go), not the source bucket, build account or Cloud Build.
+runway's own registry work can run as another account
+(`provider.push_service_account`). See
+[Releases](releases.md#promote-between-stages).
+
 ## Releases
 
 `deploy --tag` and `--tag-rc` tag the deployed image with the changelog
@@ -451,6 +491,8 @@ stages:
       flag: tag               # `runway deploy --tag` deploys this stage, and no other
       from: staging           # optional: the tag-rc stage whose candidates it releases
       repository: {project: my-prod-project, repository: releases}   # replaces the global one
+  uat:
+    promote: {from: dev}      # optional: deploy dev's image instead of building
 ```
 
 Without a `release` block, `--stage` is required and the image is tagged in

@@ -45,8 +45,9 @@ image. `deploy --tag-rc` tags `X.Y.Z-RC<n>`, `n` being one more than the
 highest existing `X.Y.Z-RC*` tag; an image that already has an RC tag for that
 version keeps it (re-running a deploy does not create RC2, RC3…). The tag is
 shown by `deploy` and `info` (annotation `runway.dev/release`). Release
-repositories, stages mapped to `--tag`/`--tag-rc` and the promotion of release
-candidates (no rebuild) are described in [Releases](releases.md).
+repositories, stages mapped to `--tag`/`--tag-rc`, the promotion of release
+candidates and of what another stage runs (`promote.from`, no rebuild) are
+described in [Releases](releases.md).
 
 1. *Scan* the build context and hash a deterministic tar stream (sorted
    entries, fixed timestamps and owners), so identical source gives an
@@ -97,7 +98,7 @@ candidates (no rebuild) are described in [Releases](releases.md).
 **Full step order of `deploy`** (each step reads the live state, changes only
 what is missing, and is retried per the `retry` policy):
 
-1. Enable missing APIs (`enable_apis`): nothing else works without them.
+1. Enable missing APIs (`provider.enable_apis`): nothing else works without them.
 2. Inspect: read the service (ownership check) while hashing the source and
    resolving the image.
 3. Bind `provider.tags` to the project and wait until they are effective
@@ -107,10 +108,10 @@ what is missing, and is retried per the `retry` policy):
    run, organization policy refusals of the service are retried while the
    policy engine catches up; otherwise they fail immediately.
 4. Create or update buckets (`buckets:`, and the build source bucket).
-5. Create the Artifact Registry repository (`create_build_resources`).
+5. Create the Artifact Registry repository (`provider.create_build_resources`).
 6. Create the build and runtime service accounts.
 7. Grant roles: the build service account's (log writer, repository writer,
-   source reader), then `identity.roles` (IAM policies via read-modify-write
+   source reader), then `service.identity.roles` (IAM policies via read-modify-write
    that preserves other bindings; BigQuery datasets via their access list).
 8. Build the image (skipped when it already exists).
 9. Create/update the service (including volumes and `iap_enabled`) and wait
@@ -121,7 +122,7 @@ what is missing, and is retried per the `retry` policy):
    are effective (before public access, so a tag that an organization policy
    requires for `allUsers` is in place first).
 11. IAP: make sure the IAP service agent exists and can invoke the service;
-    grant `roles/iap.httpsResourceAccessor` to `iap.members`.
+    grant `roles/iap.httpsResourceAccessor` to `service.iap.members`.
 12. Main deploys only, once one revision serves all traffic: remove what
     `runway.yaml` does not list on what runway owns (IAP members, tags bound
     to the service, adders of its secrets, roles of its runtime account),

@@ -241,7 +241,7 @@ pub async fn plan(
         items.push(item(
             Action::Keep,
             format!("service account {email}"),
-            "provided (identity.create is false)",
+            format!("provided (`{}.identity.create` is false)", d.yaml_path()),
         ));
     }
     for r in &s.identity.roles {
@@ -289,8 +289,8 @@ pub async fn plan(
         items.push(item(
             Action::Keep,
             format!(
-                "Artifact Registry repository {}/{}",
-                b.artifact_location, b.artifact_repository
+                "Artifact Registry repository {}/{}/{}",
+                b.artifact_location, b.artifact_project, b.artifact_repository
             ),
             "shared build infrastructure",
         ));
@@ -304,28 +304,25 @@ pub async fn plan(
             format!("service account {}", b.build_service_account),
             "shared build identity (used by every stage)",
         ));
+    }
+    if let Artifact::Promote(pr) = &d.artifact {
+        items.push(item(
+            Action::Keep,
+            format!(
+                "Artifact Registry repository {}/{}/{}",
+                pr.artifact_location, pr.artifact_project, pr.artifact_repository
+            ),
+            "shared repository of promoted images",
+        ));
+    }
+    if let Some(t) = crate::commands::release::stage_target(d) {
+        let images = format!("images {}", t.image());
         items.push(if delete_images {
-            item(
-                Action::Delete,
-                format!(
-                    "images {}-docker.pkg.dev/{}/{}/{}",
-                    b.artifact_location,
-                    d.project,
-                    b.artifact_repository,
-                    d.image_package()
-                ),
-                "--delete-images",
-            )
+            item(Action::Delete, images, "--delete-images")
         } else {
             item(
                 Action::Keep,
-                format!(
-                    "images {}-docker.pkg.dev/{}/{}/{}",
-                    b.artifact_location,
-                    d.project,
-                    b.artifact_repository,
-                    d.image_package()
-                ),
+                images,
                 "kept for a fast redeploy (use --delete-images to remove them)",
             )
         });
@@ -1146,24 +1143,14 @@ pub async fn execute(
         mark(items, &format!("service account {email}"), o);
     }
 
-    // 3. Images (opt-in).
+    // 3. Images (opt-in): builds, or a promoting stage's copies.
     if what.delete_images
-        && let Artifact::Build(b) = &d.artifact
+        && let Some(target) = crate::commands::release::stage_target(d)
     {
-        let package = d.image_package();
         p.step("Deleting images");
-        let o = with_retry(&retry, p, "delete images", |_| {
-            prov.delete_images(&b.artifact_location, &b.artifact_repository, &package)
-        })
-        .await?;
-        let res = format!(
-            "images {}-docker.pkg.dev/{}/{}/{}",
-            b.artifact_location,
-            d.project,
-            b.artifact_repository,
-            d.image_package()
-        );
-        mark(items, &res, o);
+        let package = target.package();
+        let o = with_retry(&retry, p, "delete images", |_| prov.delete_images(&package)).await?;
+        mark(items, &format!("images {}", target.image()), o);
     }
 
     Ok(())

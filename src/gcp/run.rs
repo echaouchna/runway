@@ -267,9 +267,11 @@ fn build_template(
     volumes: Vec<Volume>,
     container: Container,
 ) -> RevisionTemplate {
+    let mut annotations = spec.revision_annotations.clone();
+    annotations.extend(spec.provenance.annotations());
     let template = RevisionTemplate::new()
         .set_labels(spec.labels.clone())
-        .set_annotations(spec.revision_annotations.clone())
+        .set_annotations(annotations)
         .set_scaling(
             RevisionScaling::new()
                 .set_min_instance_count(spec.min_instances as i32)
@@ -660,6 +662,7 @@ pub fn revision_matches(
         .iter()
         .all(|(k, v)| rev.annotations.get(k) == Some(v));
     let template = RevisionTemplate::new()
+        .set_annotations(rev.annotations.clone())
         .set_containers(rev.containers.clone())
         .set_volumes(rev.volumes.clone())
         .set_or_clear_vpc_access(rev.vpc_access.clone())
@@ -764,6 +767,7 @@ pub fn observed_flat(svc: &Service) -> BTreeMap<String, String> {
     let template = svc.template.clone().unwrap_or_default();
     m.insert("containers".into(), template.containers.len().to_string());
     m.insert("ingress".into(), ingress_str(&svc.ingress));
+    m.extend(crate::plan::Provenance::from_annotations(&template.annotations).flat());
     m.extend(crate::traffic::flat(&current_traffic(svc).entries));
     if svc.invoker_iam_disabled {
         m.insert("invoker_iam_disabled".into(), "true".into());
@@ -1304,6 +1308,7 @@ pub(crate) mod tests {
                 "europe-west1-docker.pkg.dev/p/apps/hello:src-1".to_string(),
             )]),
             revision_annotations: BTreeMap::new(),
+            provenance: Default::default(),
             traffic: Default::default(),
         }
     }
@@ -2002,6 +2007,49 @@ pub(crate) mod tests {
         let observed = observed_flat(&svc);
         let changes = crate::plan::diff(&observed, &s.flatten());
         assert!(changes.is_empty(), "{changes:?}");
+    }
+
+    #[test]
+    fn a_revision_carries_its_provenance_and_a_new_one_is_a_change() {
+        let commit = |c: &str| crate::source::Source {
+            commit: c.into(),
+            time: "2026-10-01T10:00:00Z".parse().unwrap(),
+            dirty: false,
+        };
+        let mut s = spec();
+        s.provenance = crate::plan::Provenance {
+            source: Some(commit("abc123")),
+            release: Some("1.2.0-RC1".into()),
+        };
+        let live = desired_service(&s, "n", None);
+        let t = live.template.as_ref().unwrap();
+        assert_eq!(
+            crate::plan::Provenance::from_annotations(&t.annotations),
+            s.provenance,
+            "read back from the revision with its image"
+        );
+        // The same provenance: no change, the live template is sent back.
+        assert!(crate::plan::diff(&observed_flat(&live), &s.flatten()).is_empty());
+        let again = desired_service(&s, &live.name, Some(&live));
+        assert_eq!(again.template, live.template);
+        // Another commit: a revision-level change, shown and rolled out.
+        let mut next = s.clone();
+        next.provenance.source = Some(commit("def456"));
+        let changes = crate::plan::diff(&observed_flat(&live), &next.flatten());
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].field, "provenance.commit");
+        assert!(!is_service_level(&changes[0].field));
+        // A revision runs a spec only with the same provenance.
+        let rev = google_cloud_run_v2::model::Revision::new()
+            .set_annotations(t.annotations.clone())
+            .set_containers(t.containers.clone())
+            .set_volumes(t.volumes.clone())
+            .set_service_account(&t.service_account)
+            .set_max_instance_request_concurrency(t.max_instance_request_concurrency)
+            .set_or_clear_timeout(t.timeout)
+            .set_or_clear_scaling(t.scaling.clone());
+        assert!(revision_matches(&live, &rev, &s));
+        assert!(!revision_matches(&live, &rev, &next));
     }
 
     fn networked_spec() -> ServiceSpec {

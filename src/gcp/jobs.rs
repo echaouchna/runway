@@ -42,6 +42,7 @@ fn job_key(k: &str) -> bool {
         "labels.",
         "annotations.",
         "volumes.",
+        "provenance.",
     ]
     .iter()
     .any(|p| k.starts_with(p))
@@ -71,6 +72,7 @@ pub fn observed_flat(job: &Job) -> BTreeMap<String, String> {
         .set_annotations(job.annotations.clone())
         .set_template(
             RevisionTemplate::new()
+                .set_annotations(t.annotations.clone())
                 .set_containers(task.containers.clone())
                 .set_volumes(task.volumes.clone())
                 .set_service_account(&task.service_account)
@@ -148,6 +150,7 @@ pub fn desired_job(spec: &ServiceSpec, j: &JobSettings, existing: Option<&Job>) 
         .set_template(
             ExecutionTemplate::new()
                 .set_labels(spec.labels.clone())
+                .set_annotations(spec.provenance.annotations())
                 .set_task_count(j.tasks as i32)
                 .set_parallelism(j.parallelism as i32)
                 .set_template(task),
@@ -292,13 +295,21 @@ impl JobReconciler<'_> {
 
     /// Sets one annotation on the job (a read, then an update with its etag).
     pub async fn set_annotation(&self, name: &str, key: &str, value: &str) -> Result<()> {
+        self.put_annotation(name, key, Some(value)).await
+    }
+
+    /// Sets (`Some`) or removes (`None`) one annotation of the job.
+    pub async fn put_annotation(&self, name: &str, key: &str, value: Option<&str>) -> Result<()> {
         let Some(mut job) = self.get(name).await? else {
             return Ok(());
         };
-        if job.annotations.get(key).map(String::as_str) == Some(value) {
+        if job.annotations.get(key).map(String::as_str) == value {
             return Ok(());
         }
-        job.annotations.insert(key.into(), value.into());
+        match value {
+            Some(v) => job.annotations.insert(key.into(), v.into()),
+            None => job.annotations.remove(key),
+        };
         let op = self
             .jobs
             .update_job()

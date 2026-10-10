@@ -273,14 +273,7 @@ pub fn env_name(name: &str) -> Result<(), String> {
         ));
     }
     if RESERVED_ENV.contains(&name) {
-        return Err(format!(
-            "`{name}` is reserved by Cloud Run{}",
-            if name == "PORT" {
-                "; use `service.port` instead"
-            } else {
-                ""
-            }
-        ));
+        return Err(format!("`{name}` is reserved by Cloud Run"));
     }
     Ok(())
 }
@@ -868,7 +861,11 @@ mod tests {
     #[test]
     fn env_and_secrets() {
         assert!(env_name("LOG_LEVEL").is_ok());
-        assert!(env_name("PORT").unwrap_err().contains("service.port"));
+        assert!(
+            env_name("PORT")
+                .unwrap_err()
+                .contains("reserved by Cloud Run")
+        );
         assert!(env_name("1X").is_err());
         assert!(env_name("A-B").is_err());
         assert!(looks_sensitive("DB_PASSWORD"));

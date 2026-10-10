@@ -331,6 +331,11 @@ fn show_in(pointer: &str, v: &Value, base: Option<&Path>) -> String {
         {
             return format!("image {r}");
         }
+        if v["kind"] == "promote"
+            && let Some(from) = v["from"].as_str()
+        {
+            return format!("promoted from stage {from}");
+        }
         if v["kind"] == "build" {
             let b = v;
             let full = b["context_dir"].as_str().unwrap_or(".");

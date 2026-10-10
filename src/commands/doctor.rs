@@ -123,7 +123,7 @@ pub fn required_project_permissions(d: &Deployment) -> Vec<&'static str> {
     if creates_build || !d.buckets.is_empty() {
         p.push("storage.buckets.create");
     }
-    if creates_build {
+    if creates_build || matches!(&d.artifact, Artifact::Promote(x) if x.create_resources) {
         p.push("artifactregistry.repositories.create");
     }
     if d.apis.enable {
@@ -236,11 +236,12 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
             Ok::<_, crate::error::Error>((w.name().to_string(), out))
         }
     };
-    let (principal, project, apis, perms, per_workload) = tokio::join!(
+    let (principal, project, apis, perms, push, per_workload) = tokio::join!(
         principal(&session, &token),
         check_project(&session, &d),
         check_apis(&session, &d, &apis),
         check_permissions(&session, &d),
+        check_push_account(&session, &d),
         futures::future::join_all(selected.iter().map(|w| workload_checks(w))),
     );
     r.principal = principal;
@@ -258,7 +259,7 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
                 .unwrap_or_default()
         ),
     );
-    for part in [project, apis, perms] {
+    for part in [project, apis, perms, push] {
         r.checks.extend(part?.checks);
     }
     // Identical checks (a shared account or bucket) are reported once; with
@@ -387,7 +388,10 @@ async fn check_permissions(session: &Session, d: &Deployment) -> Result<Report> 
                 r.fail(
                     "deployer permissions",
                     format!("missing on project: {}", missing.join(", ")),
-                    "grant the deployer roles listed in README.md#permissions (roles/run.developer or roles/run.admin, roles/cloudbuild.builds.editor, roles/logging.viewer)",
+                    format!(
+                        "grant the deployer the roles listed in {}/permissions/ (roles/run.developer or roles/run.admin, roles/cloudbuild.builds.editor, roles/logging.viewer)",
+                        crate::DOCS_URL
+                    ),
                 );
             }
             if !d.service.public
@@ -417,10 +421,7 @@ async fn check_service_accounts(session: &Session, d: &Deployment) -> Result<Rep
     let mut r = Report::default();
     // 6. Service accounts (existence + actAs).
     let iam_client = build_client!(Iam, session)?;
-    let mut accounts = vec![("runtime service account", d.service.service_account.clone())];
-    if let Artifact::Build(b) = &d.artifact {
-        accounts.push(("build service account", b.build_service_account.clone()));
-    }
+    let accounts = accounts(d);
     let mut creates: Vec<String> = Vec::new();
     if d.service.identity.create {
         creates.push(d.service.service_account.clone());
@@ -432,7 +433,7 @@ async fn check_service_accounts(session: &Session, d: &Deployment) -> Result<Rep
     }
     let creates = &creates;
     let iam_client = &iam_client;
-    let parts = futures::future::join_all(accounts.iter().map(|(label, email)| async move {
+    let parts = futures::future::join_all(accounts.iter().map(|(label, email, create)| async move {
         let mut r = Report::default();
         let resource = crate::naming::service_account_resource(email);
         match iam_client
@@ -473,7 +474,7 @@ async fn check_service_accounts(session: &Session, d: &Deployment) -> Result<Rep
             Err(e) if is_not_found(&e) => r.fail(
                 *label,
                 format!("{email} does not exist"),
-                "create it (see README.md#prerequisites), or set identity.create / provider.create_build_resources",
+                missing_account_hint(create),
             ),
             Err(e) => r.warn(
                 *label,
@@ -490,15 +491,88 @@ async fn check_service_accounts(session: &Session, d: &Deployment) -> Result<Rep
     Ok(r)
 }
 
-/// Artifact Registry repository (source builds).
+/// The accounts a workload needs: (label, email, the setting with which
+/// runway creates it when it is missing).
+fn accounts(d: &Deployment) -> Vec<(&'static str, String, String)> {
+    let mut out = vec![(
+        "runtime service account",
+        d.service.service_account.clone(),
+        format!("set `{}.identity.create: true`", d.yaml_path()),
+    )];
+    if let Artifact::Build(b) = &d.artifact {
+        out.push((
+            "build service account",
+            b.build_service_account.clone(),
+            "set `provider.create_build_resources: true`".to_string(),
+        ));
+    }
+    out
+}
+
+fn missing_account_hint(create: &str) -> String {
+    format!(
+        "create it ({}/getting-started/#prerequisites), or let runway create it: {create}",
+        crate::DOCS_URL
+    )
+}
+
+/// `provider.push_service_account`: runway can act as it, tested the way
+/// deploy does it (impersonated from the caller's own credentials, not from
+/// an impersonated deployer).
+async fn check_push_account(session: &Session, d: &Deployment) -> Result<Report> {
+    let mut r = Report::default();
+    let Some(email) = &d.push_service_account else {
+        return Ok(r);
+    };
+    let label = "push service account";
+    if session.impersonating.as_ref().map(|i| &i.target) == Some(email) {
+        r.pass(label, format!("{email} (the impersonated account)"));
+    } else {
+        let imp = crate::gcp::Impersonation {
+            target: email.clone(),
+            delegates: Vec::new(),
+        };
+        let token = match Session::connect(Some(&imp)) {
+            Ok(push) => push.verify().await,
+            Err(e) => Err(e),
+        };
+        match token {
+            Ok(()) => r.pass(
+                label,
+                format!("{email}: your credentials can act as it for registry work"),
+            ),
+            Err(e) => r.fail(
+                label,
+                format!("cannot act as {email} from your credentials: {}", e.message),
+                format!(
+                    "grant your credentials roles/iam.serviceAccountTokenCreator on {email} (impersonating another deployer does not help: runway impersonates it from your own credentials), or remove `provider.push_service_account`"
+                ),
+            ),
+        }
+    }
+    r.warn(
+        "push service account roles",
+        format!("cannot verify the registry roles of {email} from here"),
+        "it needs roles/artifactregistry.reader on the repositories images come from and roles/artifactregistry.writer on those they go to",
+    );
+    Ok(r)
+}
+
+/// The Artifact Registry repository builds or promoted copies go to.
 async fn check_repository(session: &Session, d: &Deployment) -> Result<Report> {
     let mut r = Report::default();
-    // 7. Build infrastructure.
-    if let Artifact::Build(b) = &d.artifact {
+    // 7. Build infrastructure (a promotion only needs its repository).
+    let target = crate::commands::release::stage_target(d);
+    let create = match &d.artifact {
+        Artifact::Build(b) => b.create_resources,
+        Artifact::Promote(p) => p.create_resources,
+        Artifact::Image { .. } => false,
+    };
+    if let Some(b) = &target {
         let ar = build_client!(ArtifactRegistry, session)?;
         let repo = format!(
             "projects/{}/locations/{}/repositories/{}",
-            d.project, b.artifact_location, b.artifact_repository
+            b.project, b.location, b.repository
         );
         match ar.get_repository().set_name(&repo).send().await {
             Ok(rep) if rep.format != google_cloud_artifactregistry_v1::model::repository::Format::Docker => r.fail(
@@ -517,7 +591,7 @@ async fn check_repository(session: &Session, d: &Deployment) -> Result<Report> {
                     ),
                 }
             }
-            Err(e) if is_not_found(&e) && b.create_resources => r.warn(
+            Err(e) if is_not_found(&e) && create => r.warn(
                 "artifact repository",
                 format!("{repo} does not exist yet; deploy creates it"),
                 "requires artifactregistry.repositories.create (checked with the deployer permissions)",
@@ -527,7 +601,7 @@ async fn check_repository(session: &Session, d: &Deployment) -> Result<Report> {
                 format!("{repo} does not exist"),
                 format!(
                     "gcloud artifacts repositories create {} --repository-format=docker --location={} --project={}",
-                    b.artifact_repository, b.artifact_location, d.project
+                    b.repository, b.location, b.project
                 ),
             ),
             Err(e) => r.warn("artifact repository", short_err(&e), "verify the repository exists"),
@@ -757,7 +831,10 @@ async fn check_foreign_grants(session: &Session, d: &Deployment) -> Result<Repor
                 Ok(_) => r.fail(
                     label,
                     format!("deployer lacks resourcemanager.projects.setIamPolicy on {p}"),
-                    format!("grant roles/resourcemanager.projectIamAdmin on {p}, or have an admin grant the roles listed in identity.roles"),
+                    format!(
+                        "grant roles/resourcemanager.projectIamAdmin on {p}, or have an admin grant the roles listed in `{}.identity.roles`",
+                        d.yaml_path()
+                    ),
                 ),
                 Err(e) => r.warn(label, short_err(&e), "verify the permission manually"),
             }
@@ -842,7 +919,9 @@ mod tests {
                         path: "Dockerfile".into(),
                     },
                     artifact_location: "europe-west1".into(),
+                    artifact_project: "my-gcp-project".into(),
                     artifact_repository: "r".into(),
+                    artifact_package: None,
                     source_bucket: "b".into(),
                     build_service_account: "b@p.iam.gserviceaccount.com".into(),
                     excluded: vec![],
@@ -853,6 +932,7 @@ mod tests {
                 Artifact::Image {
                     reference: "nginx".into(),
                     parsed: ImageRef::parse("nginx").unwrap(),
+                    origin: "`service.image`".into(),
                 }
             },
             service: ServiceConfig {
@@ -902,6 +982,8 @@ mod tests {
             retry: Default::default(),
             apis: Default::default(),
             impersonate: None,
+            push_service_account: None,
+            promote: None,
             scheduler_region: "europe-west1".into(),
             release: Default::default(),
             domains: Default::default(),
@@ -909,6 +991,44 @@ mod tests {
             buckets: Default::default(),
             secrets: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_missing_account_hint_names_the_setting_that_creates_it() {
+        let hints = |d: &Deployment| -> Vec<String> {
+            accounts(d)
+                .iter()
+                .map(|(_, _, create)| missing_account_hint(create))
+                .collect()
+        };
+        let main = hints(&deployment(true, false, false));
+        assert!(
+            main[0].contains("`service.identity.create: true`"),
+            "{main:?}"
+        );
+        assert!(
+            main[1].contains("`provider.create_build_resources: true`")
+                && !main[1].contains("identity"),
+            "{main:?}"
+        );
+        assert!(
+            main.iter()
+                .all(|h| h.contains("/getting-started/#prerequisites"))
+        );
+
+        let mut job = deployment(false, false, false);
+        job.key = Some("migrate".into());
+        job.kind = crate::config::WorkloadKind::Job(crate::config::JobSettings {
+            tasks: 1,
+            parallelism: 0,
+            max_retries: 3,
+        });
+        let job = hints(&job);
+        assert_eq!(job.len(), 1, "an image deploy has no build account");
+        assert!(
+            job[0].contains("`jobs.migrate.identity.create: true`"),
+            "{job:?}"
+        );
     }
 
     #[test]

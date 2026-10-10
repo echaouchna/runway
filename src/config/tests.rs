@@ -245,7 +245,11 @@ stages: { dev: {} }
         "service.service_account",
         "not a service account"
     ));
-    assert!(has_error(&e, "service.env.PORT", "service.port"));
+    assert!(has_error(
+        &e,
+        "service.env.PORT",
+        "set `port` in the same block"
+    ));
     assert!(has_error(
         &e,
         "service.env.BAD-NAME",
@@ -295,7 +299,10 @@ fn stage_image_replaces_base_build_and_cli_image_wins() {
     );
     let prod = resolve_ok(&cfg, "prod").deployments[0].clone();
     assert!(
-        matches!(prod.artifact, Artifact::Image { ref reference, .. } if reference.ends_with("hello:1.0"))
+        matches!(prod.artifact, Artifact::Image { ref reference, ref origin, .. }
+            if reference.ends_with("hello:1.0") && origin == "`stages.prod.service.image`"),
+        "messages name where the image is set: {:?}",
+        prod.artifact
     );
     let dev = resolve_ok(&cfg, "dev").deployments[0].clone();
     assert!(matches!(dev.artifact, Artifact::Build(_)));
@@ -305,7 +312,46 @@ fn stage_image_replaces_base_build_and_cli_image_wins() {
         target: None,
     };
     let dev = resolve(&cfg, "dev", &o).unwrap().deployments[0].clone();
-    assert!(matches!(dev.artifact, Artifact::Image { ref parsed, .. } if parsed.digest.is_some()));
+    assert!(
+        matches!(dev.artifact, Artifact::Image { ref parsed, ref origin, .. }
+            if parsed.digest.is_some() && origin == "`--image`")
+    );
+}
+
+#[test]
+fn messages_name_each_workload_by_its_block() {
+    let (_d, cfg) = load_multi(MULTI);
+    let paths: Vec<String> = resolve_ok(&cfg, "prod")
+        .deployments
+        .iter()
+        .map(|d| d.yaml_path())
+        .collect();
+    assert_eq!(paths, ["service", "services.web", "jobs.migrate"]);
+
+    // `PORT` points at `port` in the block it is set in; jobs have no port.
+    let yaml = MULTI
+        .replace(
+            "    env:\n      SHARED: null\n",
+            "    env:\n      SHARED: null\n      PORT: \"8080\"\n",
+        )
+        .replace(
+            "    max_retries: 1\n",
+            "    max_retries: 1\n    env: {PORT: \"1\"}\n",
+        );
+    let (_d, cfg) = load_multi(&yaml);
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "services.web.env.PORT", "set `port` in the same block"),
+        "{e:#?}"
+    );
+    let job = e
+        .iter()
+        .find(|i| i.path == "jobs.migrate.env.PORT")
+        .unwrap();
+    assert!(
+        job.message.contains("reserved") && !job.message.contains("port"),
+        "{job:?}"
+    );
 }
 
 #[test]
@@ -1824,6 +1870,227 @@ fn a_release_repository_can_name_the_image_path() {
         has_error(&e, "release.repository.package", "not a full image name"),
         "{e:#?}"
     );
+}
+
+#[test]
+fn builds_can_go_to_another_project_and_path_per_stage() {
+    let yaml = FULL
+        .replace(
+            "  artifact_repository: applications\n",
+            "  artifact_repository: applications\n  artifact_project: my-registry-project\n  artifact_package: team/hello\n  push_service_account: ci@my-ci-project.iam.gserviceaccount.com\n",
+        )
+        .replace(
+            "  prod:\n    service:\n",
+            "  prod:\n    provider: {artifact_repository: docker-prod, artifact_project: my-prod-registry}\n    service:\n",
+        );
+    let (_d, cfg) = load_str(&yaml);
+    let dev = resolve_ok(&cfg, "dev");
+    let d = dev.first();
+    assert_eq!(
+        d.build_image().as_deref(),
+        Some("europe-west1-docker.pkg.dev/my-registry-project/applications/team/hello")
+    );
+    assert_eq!(
+        d.image_package(),
+        "hello-api",
+        "runway's own name is unchanged"
+    );
+    assert_eq!(
+        d.push_service_account.as_deref(),
+        Some("ci@my-ci-project.iam.gserviceaccount.com")
+    );
+    let t = crate::commands::release::target(d).unwrap();
+    assert_eq!(
+        t.image(),
+        d.build_image().unwrap(),
+        "without a release repository, releases are tagged where builds go"
+    );
+    let prod = resolve_ok(&cfg, "prod");
+    assert_eq!(
+        prod.first().build_image().as_deref(),
+        Some("europe-west1-docker.pkg.dev/my-prod-registry/docker-prod/team/hello")
+    );
+
+    // Without them, as before: the deployment project, runway's names.
+    let (_d, cfg) = load_str(FULL);
+    let d = resolve_ok(&cfg, "dev").first().clone();
+    assert_eq!(
+        d.build_image().as_deref(),
+        Some("europe-west1-docker.pkg.dev/my-gcp-project/applications/hello-api")
+    );
+    assert_eq!(d.push_service_account, None);
+    assert_eq!(d.promote, None);
+
+    let bad = yaml
+        .replace(
+            "artifact_project: my-registry-project",
+            "artifact_project: My_Project",
+        )
+        .replace("team/hello", "team//hello")
+        .replace("ci@my-ci-project.iam.gserviceaccount.com", "not-an-email");
+    let (_d, cfg) = load_str(&bad);
+    let e = resolve_err(&cfg, "dev");
+    for path in [
+        "provider.artifact_project",
+        "provider.artifact_package",
+        "provider.push_service_account",
+    ] {
+        assert!(has_error(&e, path, ""), "{path}: {e:#?}");
+    }
+}
+
+#[test]
+fn a_stage_promotes_from_another_one() {
+    let stages = |uat: &str, prod: &str| {
+        FULL.replace(
+            "stages:\n  dev:\n",
+            &format!("stages:\n  uat:\n{uat}  dev:\n"),
+        )
+        .replace(
+            "  prod:\n    service:\n",
+            &format!("  prod:\n{prod}    service:\n"),
+        )
+    };
+    let (_d, cfg) = load_str(&stages(
+        "    promote: {from: dev}\n",
+        "    promote: {from: uat}\n",
+    ));
+    assert_eq!(
+        resolve_ok(&cfg, "uat").first().promote.as_deref(),
+        Some("dev")
+    );
+    assert_eq!(
+        resolve_ok(&cfg, "prod").first().promote.as_deref(),
+        Some("uat")
+    );
+    assert_eq!(resolve_ok(&cfg, "dev").first().promote, None, "dev builds");
+    let matching =
+        |r: &Resolved| matches!(&r.first().artifact, Artifact::Promote(p) if p.match_commit);
+    assert!(
+        !matching(&resolve_ok(&cfg, "prod")),
+        "by default, what uat serves"
+    );
+
+    // Matching the commit being deployed.
+    let (_d, cfg) = load_str(&stages(
+        "    promote: {from: dev}\n",
+        "    promote: {from: uat, commit: checkout}\n",
+    ));
+    assert!(matching(&resolve_ok(&cfg, "prod")));
+    let (_d, cfg) = load_str(&stages(
+        "    promote: {from: dev}\n",
+        "    promote: {from: uat, commit: latest}\n",
+    ));
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "stages.prod.promote.commit", "must be `checkout`"),
+        "{e:#?}"
+    );
+
+    // Mistakes, each reported where it is written.
+    let cases = [
+        (
+            "    promote: {from: staging}\n",
+            "",
+            "uat",
+            "not a stage of this file",
+        ),
+        ("    promote: {from: uat}\n", "", "uat", "itself"),
+        (
+            "    promote: {from: prod}\n",
+            "    promote: {from: uat}\n",
+            "uat",
+            "uat -> prod -> uat",
+        ),
+    ];
+    for (uat, prod, stage, needle) in cases {
+        let (_d, cfg) = load_str(&stages(uat, prod));
+        let e = resolve_err(&cfg, stage);
+        assert!(
+            has_error(&e, &format!("stages.{stage}.promote.from"), needle),
+            "{needle}: {e:#?}"
+        );
+    }
+    let (_d, cfg) = load_str(&stages(
+        "    release: {flag: tag-rc}\n",
+        "    promote: {from: uat}\n    release: {flag: tag, from: uat}\n",
+    ));
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "stages.prod.release.from", "remove `release.from`"),
+        "{e:#?}"
+    );
+}
+
+#[test]
+fn the_image_source_is_decided_once_per_workload() {
+    // A promoting stage needs only the repository its copies go to.
+    let yaml = MULTI
+        .replace(
+            "  source_bucket: my-gcp-build-sources\n  build_service_account: builds@my-gcp-project.iam.gserviceaccount.com\n",
+            "",
+        )
+        .replace("  dev:\n", "  dev:\n    promote: {from: prod}\n");
+    let (_d, cfg) = load_multi(&yaml);
+    let dev = resolve_ok(&cfg, "dev");
+    for d in &dev.deployments {
+        let Artifact::Promote(p) = &d.artifact else {
+            panic!("{} is promoted: {:?}", d.what(), d.artifact)
+        };
+        assert_eq!(p.from, "prod");
+        assert_eq!(p.artifact_repository, "applications");
+    }
+    // Each takes what its own counterpart serves, even when they would
+    // share a build here: they may not share one in the source stage.
+    let (main, job) = (&dev.deployments[0], &dev.deployments[1]);
+    assert!(std::ptr::eq(dev.build_owner(job), job));
+    assert_ne!(main.build_key(), job.build_key());
+    // prod builds, so it still needs the build settings.
+    let e = resolve_err(&cfg, "prod");
+    assert!(has_error(&e, "provider.source_bucket", ""), "{e:#?}");
+
+    // A configured image wins over the promotion, in every deploy path.
+    let with_image = yaml.replace(
+        "    promote: {from: prod}\n",
+        "    promote: {from: prod}\n    jobs:\n      migrate: {image: \"europe-west1-docker.pkg.dev/p/apps/tool:1\"}\n",
+    );
+    let (_d, cfg) = load_multi(&with_image);
+    let dev = resolve_ok(&cfg, "dev");
+    assert!(matches!(dev.deployments[0].artifact, Artifact::Promote(_)));
+    assert!(matches!(
+        dev.deployments[1].artifact,
+        Artifact::Image { .. }
+    ));
+    let o = Overrides {
+        image: Some(format!("nginx@sha256:{}", "b".repeat(64))),
+        target: Some("shop".into()),
+    };
+    let (_d, cfg) = load_multi(&yaml);
+    let r = resolve(&cfg, "dev", &o).unwrap();
+    assert!(
+        matches!(r.deployments[0].artifact, Artifact::Image { ref origin, .. } if origin == "`--image`"),
+        "--image targets the main service and wins: {:?}",
+        r.deployments[0].artifact
+    );
+}
+
+#[test]
+fn a_build_package_names_one_image() {
+    let yaml = MULTI.replace(
+        "  artifact_repository: applications\n",
+        "  artifact_repository: applications\n  artifact_package: shop/app\n",
+    );
+    let (_d, cfg) = load_multi(&yaml);
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(
+            &e,
+            "provider.artifact_package",
+            "builds 2 (service, service web)"
+        ),
+        "{e:#?}"
+    );
+    resolve_ok(&cfg, "dev");
 }
 
 #[test]

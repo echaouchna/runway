@@ -84,7 +84,7 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
   environment variables for buildpacks are not configurable yet.
 - Builds run in the service region on the default worker pool; machine types
   and private pools are not configurable yet.
-- Grants made for `create_build_resources` assume the build service account
+- Grants made for `provider.create_build_resources` assume the build service account
   lives in the deployment project.
 - Images in third-party registries other than Docker Hub must be reachable by
   Cloud Run (typically through an Artifact Registry remote repository).

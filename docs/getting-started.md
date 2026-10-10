@@ -166,20 +166,22 @@ By default you provide the project-level infrastructure and runway checks it
 APIs (`provider.enable_apis`), the Artifact Registry repository, build source
 bucket and build service account (`provider.create_build_resources`), other
 buckets (`buckets:`), and the runtime service account with its grants
-(`service.identity`). runway never deletes any of them.
+(`service.identity`). runway never deletes any of them. Keys written
+`service.…` work the same in `services.<name>.…`, `jobs.<name>.…` and
+`defaults.…`.
 
 | You provide (once per project)          | Needed for            |
 |-----------------------------------------|-----------------------|
 | GCP project with billing                | always                |
-| Enabled APIs                            | always, unless `enable_apis: true` |
-| Runtime service account                 | always, unless `identity.create: true` |
-| Artifact Registry Docker repository     | source builds, unless `create_build_resources: true` |
-| Cloud Storage bucket for build sources  | source builds, unless `create_build_resources: true` |
-| Build service account                   | source builds, unless `create_build_resources: true` |
-| Secret Manager secrets and versions     | if `secrets` are used |
-| Buckets, datasets, projects that roles are granted on | if `identity.roles` / `volumes` are used |
-| Tag keys and values (and any org policy using them) | if `tags` are used |
-| IAP-capable project (organization, `iap.googleapis.com`) | if `iap` is used |
+| Enabled APIs                            | always, unless `provider.enable_apis: true` |
+| Runtime service account                 | always, unless `service.identity.create: true` |
+| Artifact Registry Docker repository     | source builds, unless `provider.create_build_resources: true` |
+| Cloud Storage bucket for build sources  | source builds, unless `provider.create_build_resources: true` |
+| Build service account                   | source builds, unless `provider.create_build_resources: true` |
+| Secret Manager secrets and versions     | if `service.secrets` are used |
+| Buckets, datasets, projects that roles are granted on | if `service.identity.roles` / `service.volumes` are used |
+| Tag keys and values (and any org policy using them) | if `provider.tags` / `service.tags` are used |
+| IAP-capable project (organization, `iap.googleapis.com`) | if `service.iap` is used |
 
 | runway manages                                                      | How it is identified |
 |---------------------------------------------------------------------|----------------------|

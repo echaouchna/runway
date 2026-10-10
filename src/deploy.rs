@@ -67,6 +67,15 @@ pub struct Reconciler<'a> {
     pub timeout: Duration,
 }
 
+/// The block of runway.yaml a deployed service comes from: `services.<name>`
+/// for a named one (it carries its name as a label), else `service`.
+fn service_block(svc: &Service) -> String {
+    match svc.labels.get(crate::naming::LABEL_NAME) {
+        Some(name) => format!("services.{name}"),
+        None => "service".into(),
+    }
+}
+
 /// Fails unless the service is owned by this app/stage (or `adopt` allows taking over an unlabeled one).
 pub fn check_ownership(svc: &Service, app: &str, stage: &str, adopt: bool) -> Result<()> {
     match run::ownership(svc, app, stage) {
@@ -509,7 +518,10 @@ impl Reconciler<'_> {
         let mut e = Error::new(ErrorKind::Deploy, msg.clone());
         let lower = msg.to_ascii_lowercase();
         if lower.contains("listen on the port") || lower.contains("failed to start") {
-            e = e.hint("make sure the container listens on 0.0.0.0:$PORT (runway sets PORT from `service.port`) and starts within the startup timeout");
+            e = e.hint(format!(
+                "make sure the container listens on 0.0.0.0:$PORT (runway sets PORT from `{}.port`) and starts within the startup timeout",
+                service_block(svc)
+            ));
         }
         if lower.contains("secret") {
             e = e.hint("grant the runtime service account roles/secretmanager.secretAccessor on the secret, and check the secret version exists and is enabled");

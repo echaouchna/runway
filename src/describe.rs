@@ -34,14 +34,23 @@ fn access_label(d: &Deployment) -> String {
 fn image_label(d: &Deployment) -> String {
     match &d.artifact {
         Artifact::Image { reference, .. } => reference.clone(),
-        Artifact::Build(b) => format!(
-            "{}:src-<hash>",
-            naming::build_image_name(
-                &b.artifact_location,
-                &d.project,
-                &b.artifact_repository,
-                &d.app
-            )
+        Artifact::Build(_) => format!("{}:src-<hash>", d.build_image().unwrap_or_default()),
+        Artifact::Promote(p) => format!(
+            "{}@<digest stage {} serves>",
+            d.build_image().unwrap_or_default(),
+            p.from
+        ),
+    }
+}
+
+/// `LOCATION/REPOSITORY` of the build repository, with its project when it
+/// is not the deployment project.
+fn build_repository(d: &Deployment, b: &crate::config::BuildConfig) -> String {
+    match b.artifact_project == d.project {
+        true => format!("{}/{}", b.artifact_location, b.artifact_repository),
+        false => format!(
+            "{}/{}/{}",
+            b.artifact_location, b.artifact_project, b.artifact_repository
         ),
     }
 }
@@ -344,10 +353,7 @@ pub fn ascii_with(d: &Deployment, p: Painter) -> String {
                     },
                     b.build_service_account
                 ),
-                format!(
-                    "Artifact Registry {}/{}",
-                    b.artifact_location, b.artifact_repository
-                ),
+                format!("Artifact Registry {}", build_repository(d, b)),
                 "Cloud Run revision".to_string(),
             ];
             for (i, st) in stages.iter().enumerate() {
@@ -367,6 +373,17 @@ pub fn ascii_with(d: &Deployment, p: Painter) -> String {
                 p.bold("Image:"),
                 p.cyan(reference),
                 p.dim("(resolved to an immutable digest at deploy)")
+            ));
+        }
+        Artifact::Promote(pr) => {
+            out.push(format!(
+                "  {} {} {}",
+                p.bold("Image:"),
+                p.cyan(&format!("what stage {} serves", pr.from)),
+                p.dim(&format!(
+                    "(copied into {}, no build)",
+                    d.build_image().unwrap_or_default()
+                ))
             ));
         }
     }
@@ -452,8 +469,8 @@ pub fn mermaid(d: &Deployment) -> String {
             b.build_service_account
         ));
         m.push(format!(
-            "    ar[(\"Artifact Registry<br/>{}/{}\")]",
-            b.artifact_location, b.artifact_repository
+            "    ar[(\"Artifact Registry<br/>{}\")]",
+            build_repository(d, b)
         ));
         m.push("    src --> srcb --> cb --> ar".into());
         m.push("  end".into());
@@ -510,8 +527,8 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
     match &d.artifact {
         Artifact::Build(b) => {
             build.push(format!(
-                "The image is built from `{}` with {}: the source is uploaded to `gs://{}`, built by Cloud Build as `{}`, pushed to Artifact Registry `{}/{}`, then deployed by digest.",
-                b.context_dir.display(), b.strategy, b.source_bucket, b.build_service_account, b.artifact_location, b.artifact_repository
+                "The image is built from `{}` with {}: the source is uploaded to `gs://{}`, built by Cloud Build as `{}`, pushed to `{}`, then deployed by digest.",
+                b.context_dir.display(), b.strategy, b.source_bucket, b.build_service_account, d.build_image().unwrap_or_default()
             ));
             build.push("Unchanged source is not rebuilt: the image tag is derived from a hash of the source.".into());
             if b.create_resources {
@@ -524,6 +541,16 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
             build.push(format!(
                 "The existing image `{reference}` is deployed, pinned to its immutable digest."
             ));
+        }
+        Artifact::Promote(p) => {
+            build.push(format!(
+                "Nothing is built: the image stage `{}` serves (its one revision with all the traffic) is copied, same digest, into `{}` and deployed from there. With `--tag-rc`/`--tag`, it must be that stage's candidate of the version, or come from the commit being deployed.",
+                p.from,
+                d.build_image().unwrap_or_default()
+            ));
+            if p.create_resources {
+                build.push("runway creates that repository if it is missing; no source bucket, build account or Cloud Build are needed.".into());
+            }
         }
     }
     out.push(Section {
@@ -813,6 +840,9 @@ pub fn explain_job(d: &Deployment, r: &crate::config::Resolved) -> Vec<Section> 
             crate::config::Artifact::Image { reference, .. } => format!("Image `{reference}`."),
             crate::config::Artifact::Build(b) => {
                 format!("Built from `{}` ({}).", b.context_dir.display(), b.strategy)
+            }
+            crate::config::Artifact::Promote(p) => {
+                format!("Promoted from stage `{}` (no build).", p.from)
             }
         },
         format!("Runs as `{}`.", s.service_account),

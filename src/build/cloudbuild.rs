@@ -140,9 +140,9 @@ pub struct Builder<'a> {
 pub fn image_target(inp: &BuildInputs<'_>) -> (String, String) {
     let name = naming::build_image_name(
         &inp.config.artifact_location,
-        inp.project,
+        &inp.config.artifact_project,
         &inp.config.artifact_repository,
-        inp.app,
+        inp.config.artifact_package.as_deref().unwrap_or(inp.app),
     );
     let tagged = format!(
         "{name}:{}",

@@ -168,7 +168,9 @@ fn config() -> BuildConfig {
             path: "docker/Dockerfile".into(),
         },
         artifact_location: "europe-west1".into(),
+        artifact_project: "p".into(),
         artifact_repository: "apps".into(),
+        artifact_package: None,
         source_bucket: "my-sources".into(),
         build_service_account: "builds@p.iam.gserviceaccount.com".into(),
         excluded: vec![],
@@ -485,5 +487,44 @@ fn buildpacks_build_step_uses_pack_and_pushes_through_images() {
     assert!(
         !step.args.iter().any(|a| a == "--publish"),
         "Cloud Build pushes `images` and reports digests"
+    );
+}
+
+#[test]
+fn builds_are_pushed_where_the_file_says_and_keep_runways_names_elsewhere() {
+    let cfg = BuildConfig {
+        artifact_project: "my-registry-project".into(),
+        artifact_package: Some("team/hello".into()),
+        ..config()
+    };
+    let (_dir, source) = fixture();
+    let inp = BuildInputs {
+        project: "p",
+        region: "europe-west1",
+        app: "hello",
+        stage: "dev",
+        config: &cfg,
+        source: &source,
+        image_checked: false,
+        timeout: Duration::from_secs(600),
+        force: false,
+    };
+    let (name, _) = image_target(&inp);
+    assert_eq!(
+        name,
+        "europe-west1-docker.pkg.dev/my-registry-project/apps/team/hello"
+    );
+    let b = build_request(&inp, 1);
+    assert!(
+        b.images[0].starts_with(&format!("{name}:src-")),
+        "{:?}",
+        b.images
+    );
+    // Cloud Build tags allow no `/`, and the build runs in the deployment project.
+    assert!(b.tags.iter().all(|t| !t.contains('/')), "{:?}", b.tags);
+    assert!(
+        b.service_account.starts_with("projects/p/"),
+        "{}",
+        b.service_account
     );
 }

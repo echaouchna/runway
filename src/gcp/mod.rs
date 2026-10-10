@@ -346,7 +346,7 @@ pub fn api_error(e: GaxError, action: &str) -> Error {
         )
         .permanent();
         if constraint == "constraints/run.allowedIngress" {
-            err = err.hint("set `service.ingress` to a value the policy allows (usually `internal` or `internal-and-cloud-load-balancing`)");
+            err = err.hint("set the service's `ingress` in runway.yaml (`service.ingress`, or `services.<name>.ingress`) to a value the policy allows (usually `internal` or `internal-and-cloud-load-balancing`)");
         }
         return err
             .hint(format!(

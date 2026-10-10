@@ -94,6 +94,61 @@ pub fn current(dir: &Path) -> Option<Source> {
     })
 }
 
+/// The git tags on `commit` (HEAD when unknown): the CI's tag when the
+/// pipeline runs for one (GitLab `CI_COMMIT_TAG`, GitHub `GITHUB_REF_NAME`
+/// with `GITHUB_REF_TYPE=tag`), else `git tag --points-at`.
+pub fn tags(dir: &Path, commit: Option<&str>) -> Vec<String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    if let Some(t) = env("CI_COMMIT_TAG") {
+        return vec![t];
+    }
+    if env("GITHUB_REF_TYPE").as_deref() == Some("tag")
+        && let Some(t) = env("GITHUB_REF_NAME")
+    {
+        return vec![t];
+    }
+    git(dir, &["tag", "--points-at", commit.unwrap_or("HEAD")])
+        .map(|out| out.lines().map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// `X.Y.Z` of a version written `X.Y.Z` or `vX.Y.Z`, with any `-rc.1` or
+/// `+build` suffix dropped; `None` for anything else.
+fn version_core(s: &str) -> Option<&str> {
+    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let core = s.split(['-', '+']).next()?;
+    let parts: Vec<&str> = core.split('.').collect();
+    (parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+    .then_some(core)
+}
+
+/// On a commit tagged with a version, the changelog's `version` must be it:
+/// a release named after the changelog must not contradict the git tag.
+/// Tags that are not versions are ignored.
+pub fn check_tag_version(version: &str, tags: &[String]) -> Result<()> {
+    let versions: Vec<&String> = tags.iter().filter(|t| version_core(t).is_some()).collect();
+    if versions.is_empty()
+        || versions
+            .iter()
+            .any(|t| version_core(t) == version_core(version))
+    {
+        return Ok(());
+    }
+    Err(Error::config(format!(
+        "the commit is tagged {}, but the changelog's version is {version}",
+        versions
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+    .hint("make the changelog's latest version match the tag (or tag the commit with the changelog's version)")
+    .permanent())
+}
+
 /// How `ours` relates to what is deployed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Order {
@@ -188,6 +243,29 @@ pub fn plan_note(dir: &Path, ours: Option<&Source>, live: Option<&Source>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_tag_must_match_the_changelog() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(check_tag_version("1.2.0", &t(&["v1.2.0"])).is_ok());
+        assert!(check_tag_version("v1.2.0", &t(&["1.2.0", "latest"])).is_ok());
+        assert!(
+            check_tag_version("1.2.0", &t(&["v1.2.0-rc.1"])).is_ok(),
+            "a candidate of it"
+        );
+        assert!(
+            check_tag_version("1.2.0", &t(&["latest", "prod"])).is_ok(),
+            "not versions"
+        );
+        assert!(check_tag_version("1.2.0", &[]).is_ok(), "not on a tag");
+        let e = check_tag_version("1.2.0", &t(&["v1.3.0"])).unwrap_err();
+        assert!(
+            e.message.contains("tagged v1.3.0") && e.message.contains("version is 1.2.0"),
+            "{}",
+            e.message
+        );
+        assert!(e.permanent);
+    }
 
     fn s(commit: &str, secs: i64) -> Source {
         Source {

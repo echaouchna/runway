@@ -271,6 +271,7 @@ fn spec(image: &str) -> ServiceSpec {
         custom_audiences: Vec::new(),
         annotations: BTreeMap::new(),
         revision_annotations: BTreeMap::new(),
+        provenance: Default::default(),
         traffic: Default::default(),
     }
 }
@@ -620,4 +621,11 @@ async fn forced_apply_creates_new_revision_for_failed_unchanged_service() {
         .as_ref()
         .unwrap();
     assert_eq!(tmpl.annotations["runway.dev/redeploy-at"], "now");
+}
+
+#[test]
+fn a_service_is_named_by_its_block() {
+    let named = Service::new().set_labels([(crate::naming::LABEL_NAME, "web")]);
+    assert_eq!(service_block(&named), "services.web");
+    assert_eq!(service_block(&Service::new()), "service");
 }

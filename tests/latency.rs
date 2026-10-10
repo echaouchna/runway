@@ -82,6 +82,7 @@ async fn remote_plan_costs_one_round_trip_not_three() {
         &Default::default(),
         &progress,
         None,
+        None,
     )
     .await
     .unwrap();

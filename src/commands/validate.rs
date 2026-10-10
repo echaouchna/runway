@@ -64,6 +64,13 @@ pub fn run(ctx: &Context, args: ValidateArgs) -> Result<()> {
                             .iter()
                             .any(|d| matches!(d.artifact, Artifact::Build(_))),
                     ) {
+                        _ if res
+                            .deployments
+                            .iter()
+                            .any(|d| matches!(d.artifact, Artifact::Promote(_))) =>
+                        {
+                            "promotion"
+                        }
                         (true, true) => "images and source builds",
                         (true, false) => "image",
                         _ => "source build",
