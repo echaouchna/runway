@@ -230,12 +230,16 @@ provider:
   push_service_account: gitlab-ci@my-ci-project.iam.gserviceaccount.com
 ```
 
-It can be your CI's account or one you create; runway does not create it or
-grant it anything. Your credentials need
-`roles/iam.serviceAccountTokenCreator` on it (unless it is the account
-`impersonate_service_account` names), and it needs
+It can be your CI's account or one you create; runway does not create it.
+Your credentials need `roles/iam.serviceAccountTokenCreator` on it (unless it
+is the account `impersonate_service_account` names), and it needs
 `roles/artifactregistry.reader` on the repositories images come from and
-`roles/artifactregistry.writer` on those they go to.
+`roles/artifactregistry.writer` on those they go to. With
+`create_build_resources`, runway grants it that on the stage's own repository
+(reader when builds are only copied out to a release repository, writer when
+releases are tagged there or promoted images copied in); elsewhere, such as a
+shared release registry, grant it yourself. `runway doctor` tests each repository as
+that account and prints the exact `gcloud` command for what is missing.
 
 ## In CI
 

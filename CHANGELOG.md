@@ -34,7 +34,10 @@ migration notes.
   stage without `promote` builds, as before. `provider.push_service_account`
   runs the registry work runway does itself (finding, copying, tagging) as
   another account, such as the CI's; `doctor` checks it by impersonating it
-  from your own credentials, as deploy does.
+  from your own credentials, as deploy does. With `create_build_resources`,
+  runway grants it on the stage's repository what it does there: reader when
+  builds are only copied out to a release repository, writer when releases
+  are tagged there or promoted images copied in.
 - **Promote the tagged commit.** `stages.<name>.promote.commit: checkout`
   promotes the image the source stage ran built from the commit being
   deployed (HEAD, or `RUNWAY_SOURCE_COMMIT` on a tag pipeline), found in its
@@ -200,6 +203,12 @@ migration notes.
 - Development: local builds keep line tables only and no debug info for
   dependencies, so `target/` takes 3.9 GB instead of 8.5 GB from scratch and
   builds about 30% faster (`docs/development.md` has the clean-up commands).
+- A redesigned homepage: a live terminal session, a deploy you scroll
+  through step by step, animated feature cards, a traffic playground
+  (preview, canary, promote, roll back) and the promotion from dev to prod.
+  The documentation home has a hero, feature and page cards; every page gets
+  smoother transitions and clearer navigation. Still no external fonts,
+  scripts or trackers, and nothing moves when reduced motion is requested.
 
 ### Changed
 
@@ -264,6 +273,18 @@ migration notes.
 
 ### Fixed
 
+- **`doctor` says who lacks which permission, where, and how to grant it.**
+  A missing project permission names the account (the impersonated one, or
+  your credentials), the project, the predefined role that grants it, what it
+  is needed for, and the `gcloud` command. Repositories are checked in every
+  project they live in: an unreadable one says who cannot read it and what to
+  grant; the account that pushes (`push_service_account`, else the deployer)
+  is tested on each repository for what deploy does there (a permission
+  counts as granted by deploy only when the grant deploy makes covers it);
+  and Cloud Run's service agent is checked for pull access to a repository
+  in another project, granted on the repository or its project (a grant
+  found nowhere is a warning: it may come from a folder, the organization or
+  a group), with its project number in the command.
 - **Messages name keys by their full path.** `doctor` said "set
   identity.create / provider.create_build_resources" for any missing account:
   it now names the one setting that creates it (`service.identity.create`,

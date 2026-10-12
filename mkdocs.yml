@@ -41,6 +41,10 @@ theme:
 extra_css:
   - assets/stylesheets/runway.css
 
+# Card spotlight and reveal; the pages read the same without it.
+extra_javascript:
+  - assets/javascripts/runway.js
+
 nav:
   - Home: index.md
   - Getting started: getting-started.md
@@ -65,6 +69,11 @@ nav:
 markdown_extensions:
   - admonition
   - attr_list
+  - md_in_html
+  # Icons are inlined as SVG: nothing is loaded from elsewhere.
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - tables
   - toc:
       permalink: true
