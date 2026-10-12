@@ -41,7 +41,16 @@ pub fn workload_id(app: &str, name: Option<&str>, stage: &str) -> String {
 /// Default account ID (6-30 characters) of the Cloud Scheduler invoker:
 /// `{app}-{stage}-sched`, shortened with a hash when too long.
 pub fn scheduler_account_id(app: &str, stage: &str) -> String {
-    let full = format!("{app}-{stage}-sched");
+    account_id(format!("{app}-{stage}-sched"))
+}
+
+/// Default account ID of the stage's workflows: `{app}-{stage}-wf`,
+/// shortened with a hash when too long.
+pub fn workflow_account_id(app: &str, stage: &str) -> String {
+    account_id(format!("{app}-{stage}-wf"))
+}
+
+fn account_id(full: String) -> String {
     if full.len() <= 30 {
         return full;
     }

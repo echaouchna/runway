@@ -151,6 +151,7 @@ service:
 # services: {web: {...}}      # <app>-<name>-<stage>
 # jobs: {migrate: {...}}      # <app>-<name>-<stage>
 # schedules: {nightly: {schedule: "0 3 * * *", job: migrate}}
+# workflows: {etl: {source: workflows/etl.yaml}}   # see "Workflows" below
 
 # release:                    # `deploy --tag` / `--tag-rc`: see "Releases" below
 #   repository: {project: my-release-project, repository: releases}
@@ -347,6 +348,10 @@ schedules:
     service: web              # ...or call a service (the main one is named after the app)
     path: /tasks/warm         # default /
     method: POST              # default POST; also body, headers
+  # export:
+  #   schedule: "0 4 * * *"
+  #   workflow: nightly       # ...or start a workflow (see "Workflows" below)
+  #   argument: '{"full": true}'
     # retries: 2              # 0-5, default 0
     # attempt_deadline_seconds: 300   # 15-1800, default 180
     # paused: true
@@ -391,9 +396,12 @@ used by several is created once and gets every role they need.
 
 **Schedules.** A job is run through the Cloud Run Admin API with an OAuth
 token; a service is called at its URL plus `path`, with an ID token for its
-URL. Both use one account per app and stage (`scheduler.service_account`),
-which gets `roles/run.invoker` on each target only, and runway enables
-`cloudscheduler.googleapis.com`. Scheduler jobs are named
+URL; a workflow (`workflow:`, optional JSON `argument`) is started through
+the Workflow Executions API with an OAuth token (see [Workflows](#workflows)).
+They use one account per app and stage (`scheduler.service_account`), which
+gets `roles/run.invoker` on each job and service only (and
+`roles/workflows.invoker` on the project to start workflows), and runway
+enables `cloudscheduler.googleapis.com`. Scheduler jobs are named
 `<app>-<name>-<stage>` and marked as runway's in their description (they have
 no labels). A schedule removed from runway.yaml is deleted by the next full
 deploy, and its grant revoked.
@@ -425,9 +433,71 @@ the next full deploy deletes it (in `scheduler.region` if it is still set).
 
 **Undeploy.** Services and jobs go first, then runtime accounts, then
 images, so an account shared by two services is only deleted once neither
-runs, after the roles each of them declared are revoked. An account is kept while any live service or job (listed in
+runs, after the roles each of them declared are revoked. An account is kept while any live service, job or workflow (listed in
 runway.yaml or not) runs as it. With `--only`, a schedule calling what is
 removed is deleted only if runway created it.
+
+## Workflows
+
+[Google Cloud Workflows](https://cloud.google.com/workflows) deployed from
+files in the repository (the [Workflows](workflows.md) guide shows how):
+
+```yaml
+workflow_defaults:            # optional; every workflow inherits these
+  service_account: ...        # default: <app>-<stage>-wf@PROJECT, created by runway
+  region: europe-west1        # default: provider.region
+  call_log_level: errors-only # none (default), errors-only, all-calls
+  invokers: [group:ops@example.com]   # roles/workflows.invoker, on the project
+
+workflows:
+  nightly:                    # shop-nightly-<stage>
+    source: workflows/nightly.yaml    # YAML or JSON, relative to runway.yaml
+    description: Nightly export
+    env:                      # user-defined environment variables
+      API_URL: ${services.api.url}
+      EXPORT_JOB: ${jobs.export.name}
+    # service_account: nightly-wf@my-gcp-project.iam.gserviceaccount.com
+    # identity: {create: true, roles: [{role: roles/bigquery.jobUser, project: my-gcp-project}]}
+
+schedules:
+  every-night: {schedule: "0 3 * * *", workflow: nightly, argument: '{"full": true}'}
+
+stages:
+  dev:
+    workflows: { nightly: { call_log_level: all-calls } }
+```
+
+**References.** `env` values and `${runway.…}` in the workflow file can use
+`${services.NAME.url}` (known once the service exists), `.id` and `.name`,
+`${jobs.NAME.name}` (what the Cloud Run connector takes), `.id` and `.url`,
+plus the usual variables. In the workflow file, any other `${…}` is a
+Workflows expression and runway leaves it alone. An unknown name is an
+error, with the line.
+
+**Access.** The workflow's account gets `roles/run.invoker` on each service
+it references, and `roles/run.jobsExecutorWithOverrides` and
+`roles/run.viewer` on each job. It gets `roles/logging.logWriter` on the
+project when it logs calls, plus its `identity.roles`. `invokers` and a
+schedule's account get `roles/workflows.invoker` on the project: Workflows
+has no per-workflow access, so they can run every workflow of the project.
+
+**Precedence.** Lowest first: `workflow_defaults`, `stages.S.workflow_defaults`,
+the workflow, `stages.S.workflows.NAME`. `env` merges key by key and `null`
+removes an inherited key. `null` for a workflow removes it from the stage.
+`source` and `description` are set on each workflow.
+
+| Rule | Why |
+|---|---|
+| `source` is required and at most 128 KiB, valid YAML or JSON | Workflows' limit |
+| At most 20 `env` variables, `NAME=value` at most 4 KiB, no `GOOGLE_` prefix | Workflows' limits and reserved names |
+| The workflow ID `<app>-<name>-<stage>` is at most 64 characters | Workflows' limit |
+| A schedule's `argument` is JSON | it is the execution's argument |
+
+Workflows change with a full deploy, not a preview or canary (with `--only`:
+those referencing a selected service or job). They carry runway's labels.
+One removed from runway.yaml (or moved to another region) is found in any
+region and deleted by the next full deploy, and `undeploy` deletes them with
+the stage. `undeploy` keeps an account that a remaining workflow runs as.
 
 ## Where images go
 

@@ -47,6 +47,22 @@ pub fn target_uri(
         ScheduleTarget::Service { path, .. } => {
             service_url.map(|u| format!("{}{path}", u.trim_end_matches('/')))
         }
+        ScheduleTarget::Workflow {
+            workflow_id,
+            region,
+            ..
+        } => Some(format!(
+            "https://workflowexecutions.googleapis.com/v1/projects/{project}/locations/{region}/workflows/{workflow_id}/executions"
+        )),
+    }
+}
+
+/// Body of a request starting a workflow execution: the argument is sent
+/// as a JSON string, as the Workflow Executions API expects.
+fn execution_body(argument: Option<&str>) -> String {
+    match argument {
+        None => "{}".into(),
+        Some(a) => serde_json::json!({ "argument": a }).to_string(),
     }
 }
 
@@ -80,6 +96,15 @@ pub fn desired(
                 .set_service_account_email(invoker)
                 .set_scope(CLOUD_PLATFORM),
         ),
+        ScheduleTarget::Workflow { argument, .. } => target
+            .set_http_method(HttpMethod::Post)
+            .set_headers([("Content-Type".to_string(), "application/json".to_string())])
+            .set_body(bytes::Bytes::from(execution_body(argument.as_deref())))
+            .set_oauth_token(
+                OAuthToken::new()
+                    .set_service_account_email(invoker)
+                    .set_scope(CLOUD_PLATFORM),
+            ),
         ScheduleTarget::Service {
             method: m,
             body,
@@ -355,6 +380,32 @@ mod tests {
         );
         assert!(crate::plan::diff(&f, &desired_flat(&j, false)).is_empty());
         assert_eq!(desired_flat(&j, true)["paused"], "true");
+    }
+
+    #[test]
+    fn a_workflow_is_started_through_the_executions_api_with_an_oauth_token() {
+        let s = schedule(ScheduleTarget::Workflow {
+            name: "etl".into(),
+            workflow_id: "shop-etl-prod".into(),
+            region: "europe-west4".into(),
+            argument: Some(r#"{"full": true}"#.into()),
+        });
+        let uri = target_uri(&s, "my-gcp-project", "europe-west1", None).unwrap();
+        assert_eq!(
+            uri,
+            "https://workflowexecutions.googleapis.com/v1/projects/my-gcp-project/locations/europe-west4/workflows/shop-etl-prod/executions",
+            "in the workflow's region, not Cloud Run's"
+        );
+        let j = desired(&s, "n", "shop", "prod", INVOKER, &uri, None);
+        let f = flat(&j);
+        assert_eq!(f["target"], format!("POST {uri}"));
+        assert_eq!(f["auth"], format!("OAuth token as {INVOKER}"));
+        // The argument goes as a JSON string, as the API expects.
+        let body: serde_json::Value = serde_json::from_str(&f["body"]).unwrap();
+        assert_eq!(body["argument"], r#"{"full": true}"#);
+        assert_eq!(f["headers.Content-Type"], "application/json");
+        assert!(crate::plan::diff(&f, &desired_flat(&j, false)).is_empty());
+        assert_eq!(execution_body(None), "{}");
     }
 
     #[test]

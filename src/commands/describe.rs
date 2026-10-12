@@ -3,7 +3,8 @@
 use crate::cli::{Context, DescribeArgs, DiagramFormat};
 use crate::config::{self, Overrides};
 use crate::describe::{
-    ascii, ascii_with, explain, explain_job, explain_schedules, explanation_text, mermaid,
+    ascii, ascii_with, explain, explain_job, explain_schedules, explain_workflows,
+    explanation_text, mermaid,
 };
 use crate::error::{Error, Result};
 use crate::output::{OutputFormat, print_json};
@@ -21,6 +22,8 @@ struct Description {
     workloads: Vec<Workload>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     schedules: Vec<crate::describe::Section>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    workflows: Vec<crate::describe::Section>,
 }
 
 #[derive(Serialize)]
@@ -59,7 +62,8 @@ pub fn run(ctx: &Context, args: DescribeArgs) -> Result<()> {
         ))
     })?;
     let selected = resolved.select(&args.only)?;
-    let several = selected.len() > 1 || !resolved.schedules.is_empty();
+    let several =
+        selected.len() > 1 || !resolved.schedules.is_empty() || !resolved.workflows.is_empty();
     let diagram_of = |d: &config::Deployment| match (d.is_job(), args.format) {
         (true, _) => String::new(),
         (false, DiagramFormat::Ascii) => ascii(d),
@@ -75,6 +79,7 @@ pub fn run(ctx: &Context, args: DescribeArgs) -> Result<()> {
     };
     let d = selected[0];
     let schedules = explain_schedules(&resolved);
+    let workflows = explain_workflows(&resolved);
     match ctx.output {
         OutputFormat::Json => print_json(&Description {
             app: d.app.clone(),
@@ -96,6 +101,7 @@ pub fn run(ctx: &Context, args: DescribeArgs) -> Result<()> {
                     .collect(),
             },
             schedules,
+            workflows,
         }),
         OutputFormat::Text => {
             let p = crate::style::out();
@@ -130,6 +136,9 @@ pub fn run(ctx: &Context, args: DescribeArgs) -> Result<()> {
                 if several {
                     println!();
                 }
+            }
+            if !workflows.is_empty() && !args.diagram_only {
+                print!("{}", explanation_text(&workflows));
             }
             if !schedules.is_empty() && !args.diagram_only {
                 print!("{}", explanation_text(&schedules));

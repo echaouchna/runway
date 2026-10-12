@@ -243,6 +243,8 @@ pub enum Command {
     Undeploy(UndeployArgs),
     /// Run a Cloud Run job of the stage now (optionally wait for it to finish).
     RunJob(RunJobArgs),
+    /// Start a workflow of the stage now (optionally wait for its result).
+    RunWorkflow(RunWorkflowArgs),
     /// Show who holds the stage's lease, or remove it (a run that was killed).
     Unlock(UnlockArgs),
     /// Print a shell completion script (bash, zsh, fish, nushell, xonsh, elvish, powershell).
@@ -474,6 +476,23 @@ pub struct RunJobArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RunWorkflowArgs {
+    #[command(flatten)]
+    pub stage: StageArg,
+    /// The workflow (a key of `workflows`).
+    pub name: String,
+    /// JSON argument of the execution, e.g. `{"full": true}`.
+    #[arg(long, value_name = "JSON")]
+    pub data: Option<String>,
+    /// Wait until the execution finishes, print its result, and fail if it fails.
+    #[arg(long)]
+    pub wait: bool,
+    /// How long to wait with `--wait`.
+    #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
+    pub timeout: std::time::Duration,
+}
+
+#[derive(Debug, Args)]
 pub struct ValidateArgs {
     /// Validate only this stage (default: all stages).
     #[arg(short, long, env = "RUNWAY_STAGE")]
@@ -667,6 +686,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Deploy(a) => commands::deploy::run(&ctx, a).await,
         Command::Info(a) => commands::info::run(&ctx, a).await,
         Command::RunJob(a) => commands::run_job::run(&ctx, a).await,
+        Command::RunWorkflow(a) => commands::run_workflow::run(&ctx, a).await,
         Command::Unlock(a) => commands::unlock::run(&ctx, a).await,
         Command::Logs(a) => commands::logs::run(&ctx, a).await,
         Command::Describe(a) => commands::describe::run(&ctx, a),

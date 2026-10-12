@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>runway: Cloud Run deployments from one file</title>
-<meta name="description" content="runway deploys applications to Google Cloud Run from a single runway.yaml: services, jobs and schedules, builds, identity, secrets, branch previews, canaries, promotions and releases, with no state file and no cluster.">
+<meta name="description" content="runway deploys applications to Google Cloud Run from a single runway.yaml: services, jobs, schedules and workflows, builds, identity, secrets, branch previews, canaries, promotions and releases, with no state file and no cluster.">
 <link rel="canonical" href="https://runway.echaouchna.dev/">
 <meta property="og:title" content="runway: Cloud Run deployments from one file">
-<meta property="og:description" content="Services, jobs, schedules, builds, identity, secrets, branch previews, canaries, promotions and releases for Google Cloud Run, in one runway.yaml.">
+<meta property="og:description" content="Services, jobs, schedules, workflows, builds, identity, secrets, branch previews, canaries, promotions and releases for Google Cloud Run, in one runway.yaml.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://runway.echaouchna.dev/">
 <meta name="theme-color" content="#070b18">
@@ -57,9 +57,9 @@
       <h1 data-reveal style="--i:1">Ship to Cloud Run<br>from <span class="grad shimmer">one file</span>.</h1>
       <p class="rotator" data-reveal style="--i:2" aria-live="off">
         <span class="muted">One <code>runway.yaml</code> for your</span>
-        <span class="words"><b class="on">services</b><b>jobs</b><b>schedules</b><b>secrets</b><b>branch previews</b><b>canaries</b><b>releases</b></span>
+        <span class="words"><b class="on">services</b><b>jobs</b><b>schedules</b><b>workflows</b><b>secrets</b><b>branch previews</b><b>canaries</b><b>releases</b></span>
       </p>
-      <p class="lead" data-reveal style="--i:3">runway builds your code, creates what it needs (identity, grants, secrets, buckets, schedules, domains), rolls it out, waits until it is healthy and manages traffic and releases. <strong>No state file. No cluster.</strong> Every run reads the live project and changes only what differs.</p>
+      <p class="lead" data-reveal style="--i:3">runway builds your code, creates what it needs (identity, grants, secrets, buckets, schedules, workflows, domains), rolls it out, waits until it is healthy and manages traffic and releases. <strong>No state file. No cluster.</strong> Every run reads the live project and changes only what differs.</p>
       <div class="cta" data-reveal style="--i:4">
         <a class="btn primary" href="docs/getting-started/">Get started <span class="arrow">→</span></a>
         <a class="btn ghost" href="#demo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg> Watch the demo</a>
@@ -96,8 +96,8 @@
 <!-- ============================================================ marquee -->
 <section class="marquee" aria-label="Google Cloud services runway drives">
   <div class="track">
-    <span>Cloud Run</span><span>Cloud Build</span><span>Artifact Registry</span><span>Secret Manager</span><span>Cloud Scheduler</span><span>IAM</span><span>Identity-Aware Proxy</span><span>Cloud Storage</span><span>Load Balancing</span><span>Certificate Manager</span><span>Cloud DNS</span><span>Cloud SQL</span><span>Direct VPC egress</span><span>OpenTelemetry</span><span>Resource Manager tags</span>
-    <span aria-hidden="true">Cloud Run</span><span aria-hidden="true">Cloud Build</span><span aria-hidden="true">Artifact Registry</span><span aria-hidden="true">Secret Manager</span><span aria-hidden="true">Cloud Scheduler</span><span aria-hidden="true">IAM</span><span aria-hidden="true">Identity-Aware Proxy</span><span aria-hidden="true">Cloud Storage</span><span aria-hidden="true">Load Balancing</span><span aria-hidden="true">Certificate Manager</span><span aria-hidden="true">Cloud DNS</span><span aria-hidden="true">Cloud SQL</span><span aria-hidden="true">Direct VPC egress</span><span aria-hidden="true">OpenTelemetry</span><span aria-hidden="true">Resource Manager tags</span>
+    <span>Cloud Run</span><span>Cloud Build</span><span>Artifact Registry</span><span>Secret Manager</span><span>Cloud Scheduler</span><span>Workflows</span><span>IAM</span><span>Identity-Aware Proxy</span><span>Cloud Storage</span><span>Load Balancing</span><span>Certificate Manager</span><span>Cloud DNS</span><span>Cloud SQL</span><span>Direct VPC egress</span><span>OpenTelemetry</span><span>Resource Manager tags</span>
+    <span aria-hidden="true">Cloud Run</span><span aria-hidden="true">Cloud Build</span><span aria-hidden="true">Artifact Registry</span><span aria-hidden="true">Secret Manager</span><span aria-hidden="true">Cloud Scheduler</span><span aria-hidden="true">Workflows</span><span aria-hidden="true">IAM</span><span aria-hidden="true">Identity-Aware Proxy</span><span aria-hidden="true">Cloud Storage</span><span aria-hidden="true">Load Balancing</span><span aria-hidden="true">Certificate Manager</span><span aria-hidden="true">Cloud DNS</span><span aria-hidden="true">Cloud SQL</span><span aria-hidden="true">Direct VPC egress</span><span aria-hidden="true">OpenTelemetry</span><span aria-hidden="true">Resource Manager tags</span>
   </div>
 </section>
 
@@ -155,7 +155,7 @@
     <div class="head" data-reveal>
       <div class="kicker">Features</div>
       <h2>Everything a Cloud Run app needs, <span class="grad">nothing to glue</span>.</h2>
-      <p class="sub">Services, jobs and schedules, the build, least-privilege identity, secrets, storage, networking, domains, traffic and releases: one configuration, one command.</p>
+      <p class="sub">Services, jobs, schedules and workflows, the build, least-privilege identity, secrets, storage, networking, domains, traffic and releases: one configuration, one command.</p>
     </div>
 
     <div class="bento">
@@ -205,12 +205,12 @@
         <p>Private by default, IAP when you want it, one role on one resource, revoked when removed.</p>
       </article>
 
-      <article class="cell spot" data-reveal style="--i:3">
+      <article class="cell spot wide" data-reveal style="--i:3">
         <div class="viz cron-viz" aria-hidden="true">
           <div class="clock"><i class="hand"></i></div><code>0 3 * * *</code>
         </div>
         <h3>Services, jobs, schedules</h3>
-        <p>Several services, Cloud Run jobs and Cloud Scheduler in one file. <code>--only apps/web</code> in a monorepo.</p>
+        <p>Several services, Cloud Run jobs and Cloud Scheduler in one file. A schedule runs a job, calls a service or starts a workflow. <code>--only apps/web</code> in a monorepo.</p>
       </article>
 
       <article class="cell spot wide" data-reveal>
@@ -240,7 +240,16 @@
         <p>Load balancer and managed certificates, DNS records, direct VPC egress, Cloud SQL, sandboxes.</p>
       </article>
 
-      <article class="cell spot" data-reveal style="--i:3">
+      <article class="cell spot wide" data-reveal>
+        <div class="viz wf-viz" aria-hidden="true">
+          <div class="wf-steps"><span class="wf-step w1">run job export</span><i>→</i><span class="wf-step w2">POST api/done</span><i>→</i><span class="wf-step w3">✓</span></div>
+          <div class="wf-env"><span class="wf-k">API_URL</span> = https://shop-api-prod-…run.app</div>
+        </div>
+        <h3>Workflows that know your stack</h3>
+        <p>Deploy Google Cloud Workflows from your repository. runway puts in the URLs of your services and the names of your jobs, grants each workflow access to exactly what it calls, and can start it on a schedule.</p>
+      </article>
+
+      <article class="cell spot wide" data-reveal style="--i:1">
         <div class="viz explain-viz" aria-hidden="true">
           <span class="q">/ keep an instance warm</span><span class="r">service.min_instances</span>
         </div>

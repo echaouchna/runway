@@ -1207,7 +1207,7 @@ also: cron, cron job, every night, nightly, every hour, daily, periodic, recurri
 type: map
 docs: services-and-jobs.md#run-a-job-every-night
 see: scheduler, jobs
-Cloud Scheduler jobs that run a job or call a service on a timetable, named `<app>-<name>-<stage>`.
+Cloud Scheduler jobs that run a job, call a service or start a workflow on a timetable, named `<app>-<name>-<stage>`.
 Example:
   schedules:
     nightly:
@@ -1221,7 +1221,7 @@ Rules:
 @ schedules.<name>
 type: block
 docs: services-and-jobs.md#run-a-job-every-night
-One schedule, with exactly one target: `job` or `service`.
+One schedule, with exactly one target: `job`, `service` or `workflow`.
 
 @ schedules.<name>.schedule
 also: cron expression, crontab, every day
@@ -1255,6 +1255,22 @@ docs: services-and-jobs.md#call-a-service-on-a-schedule
 Call this service (a key of `services`, or the app name for the main service) at its URL plus `path`, with an ID token.
 Example:
   service: web
+
+@ schedules.<name>.workflow
+type: workflow name
+docs: workflows.md#start-a-workflow-on-a-schedule
+Start an execution of this workflow (a key of `workflows`) through the Workflow Executions API. The scheduler's account gets `roles/workflows.invoker` on the project.
+Example:
+  workflow: nightly
+
+@ schedules.<name>.argument
+type: JSON string
+docs: workflows.md#start-a-workflow-on-a-schedule
+The argument of the workflow execution.
+Example:
+  argument: '{"full": true}'
+Rules:
+- Only with `workflow`; must be valid JSON.
 
 @ schedules.<name>.path
 type: path
@@ -1331,6 +1347,177 @@ docs: configuration.md#several-services-jobs-and-schedules
 The Cloud Scheduler region (not every Cloud Run region has Cloud Scheduler).
 Example:
   region: europe-west1
+
+@ workflows
+also: orchestration, orchestrate, pipeline, step functions, chain jobs, google workflows, cloud workflows
+type: map
+docs: workflows.md
+see: workflow_defaults, schedules.<name>.workflow
+Google Cloud Workflows deployed from files in the repository, by name (`<app>-<name>-<stage>`). A workflow can call the stage's services and run its jobs: runway puts their URLs and names in it and grants its account access to each of them. `runway run-workflow NAME --wait` runs one.
+Example:
+  workflows:
+    nightly:
+      source: workflows/nightly.yaml
+      env:
+        API_URL: ${services.api.url}
+        EXPORT_JOB: ${jobs.export.name}
+Rules:
+- Workflows change with a full deploy (with `--only`: those referencing a selected service or job); one removed from runway.yaml is deleted by the next one.
+- A stage block overrides keys of the inherited one; `null` removes the workflow from the stage.
+
+@ workflows.<name>
+type: block
+docs: workflows.md#deploy-a-workflow
+One workflow. Every key of `workflow_defaults` works here too, plus `source` and `description`.
+Rules:
+- Names are lowercase letters, digits and hyphens; the ID `<app>-<name>-<stage>` is at most 64 characters.
+
+@ workflows.<name>.source
+also: workflow file, workflow yaml, definition
+type: path
+docs: workflows.md#deploy-a-workflow
+The workflow definition (YAML or JSON), relative to runway.yaml. In it, `${runway.services.api.url}` and the other references are replaced by runway; any other `${…}` is a Workflows expression, left alone.
+Example:
+  source: workflows/nightly.yaml
+Rules:
+- Required; at most 128 KiB; valid YAML or JSON.
+- An unknown `${runway.…}` reference is an error, with its line.
+
+@ workflows.<name>.description
+type: string
+docs: workflows.md#deploy-a-workflow
+The workflow's description.
+
+@ workflows.<name>.env
+also: environment variables, sys.get_env, service url, job name, inject url
+type: map
+docs: workflows.md#call-services-and-jobs
+User-defined environment variables, read in the workflow with `sys.get_env("NAME")`. Values may use `${services.NAME.url}`, `.id`, `.name`, `${jobs.NAME.name}`, `.id`, `.url` and the usual variables. Each service or job referenced gets the workflow's account access to it.
+Example:
+  env:
+    API_URL: ${services.api.url}
+    EXPORT_JOB: ${jobs.export.name}
+Rules:
+- At most 20 variables; `NAME=value` at most 4 KiB; names starting with `GOOGLE_` are reserved.
+- A service's URL is known once it exists: a plan made before says so.
+- In stage overrides a `null` value removes an inherited variable.
+
+@ workflows.<name>.call_log_level
+also: logging, call logs, debug workflow
+type: none | errors-only | all-calls
+default: none
+docs: configuration.md#workflows
+Which calls and responses Workflows logs to Cloud Logging. Other than `none`, the account gets `roles/logging.logWriter` on the project.
+Example:
+  call_log_level: errors-only
+
+@ workflows.<name>.service_account
+type: email
+default: <app>-<stage>-wf@<project>.iam.gserviceaccount.com
+docs: workflows.md#permissions
+The account the workflow runs as. The default one is shared by the stage's workflows and created by runway.
+Example:
+  service_account: nightly-wf@my-gcp-project.iam.gserviceaccount.com
+
+@ workflows.<name>.identity
+type: block
+docs: workflows.md#permissions
+Create the workflow's account (`create`, default true for the default account) and grant it roles (`roles`, as for a service's account).
+Example:
+  identity:
+    create: true
+    roles:
+      - {role: roles/bigquery.jobUser, project: my-gcp-project}
+
+@ workflows.<name>.identity.create
+type: boolean
+default: true for the default account
+docs: workflows.md#permissions
+Create the account when missing (a user-managed account of the form NAME@PROJECT.iam.gserviceaccount.com).
+
+@ workflows.<name>.identity.display_name
+type: string
+docs: workflows.md#permissions
+The display name of the account runway creates.
+
+@ workflows.<name>.identity.roles
+type: list
+docs: workflows.md#permissions
+Roles granted to the workflow's account, each on exactly one `project`, `bucket`, `dataset` or `secret`.
+
+@ workflows.<name>.invokers
+also: who can run, execute workflow, workflows invoker
+type: list of members
+docs: workflows.md#permissions
+Principals allowed to run the workflow: granted `roles/workflows.invoker` on the project.
+Example:
+  invokers: [group:data-team@example.com]
+Rules:
+- Workflows has no per-workflow access: these members can run every workflow of the project (runway warns).
+- Kept by `undeploy` (other workflows of the project may rely on the role); removing a member from runway.yaml revokes it if runway granted it.
+
+@ workflows.<name>.region
+type: string
+default: workflow_defaults.region, else provider.region
+docs: configuration.md#workflows
+The Workflows region.
+
+@ workflow_defaults
+type: block
+docs: configuration.md#workflows
+see: workflows
+Settings every workflow inherits: `service_account`, `identity`, `env`, `call_log_level`, `invokers`, `region`.
+Example:
+  workflow_defaults:
+    call_log_level: errors-only
+    region: europe-west1
+Rules:
+- `source` and `description` are set on each workflow, not here.
+
+@ workflow_defaults.source
+type: path
+docs: configuration.md#workflows
+Not allowed here: each workflow sets its own `source`.
+
+@ workflow_defaults.description
+type: string
+docs: configuration.md#workflows
+Not allowed here: each workflow sets its own `description`.
+
+@ workflow_defaults.env
+type: map
+docs: workflows.md#call-services-and-jobs
+Environment variables every workflow gets (see `workflows.<name>.env`).
+
+@ workflow_defaults.call_log_level
+type: none | errors-only | all-calls
+default: none
+docs: configuration.md#workflows
+The call logging of every workflow.
+
+@ workflow_defaults.service_account
+type: email
+default: <app>-<stage>-wf@<project>.iam.gserviceaccount.com
+resolved: -
+docs: workflows.md#permissions
+The account every workflow runs as, unless it sets its own.
+
+@ workflow_defaults.identity
+type: block
+docs: workflows.md#permissions
+Create the workflows' account and grant it roles.
+
+@ workflow_defaults.invokers
+type: list of members
+docs: workflows.md#permissions
+Principals allowed to run every workflow (`roles/workflows.invoker` on the project).
+
+@ workflow_defaults.region
+type: string
+default: provider.region
+resolved: /workflow_region
+docs: configuration.md#workflows
+The Workflows region. Workflows removed from runway.yaml, or moved to another region, are found in every region.
 
 @ release
 also: promote, promotion, release candidate, rc, version tag, semver, production release
@@ -1673,6 +1860,16 @@ Schedules in this stage: an entry replaces the inherited one, `null` removes it.
 type: block
 docs: configuration.md#several-services-jobs-and-schedules
 The scheduler settings of this stage.
+
+@ stages.<name>.workflows
+type: map
+docs: configuration.md#workflows
+Workflows in this stage: only what differs, or `null` to leave one out.
+
+@ stages.<name>.workflow_defaults
+type: block
+docs: configuration.md#workflows
+What every workflow of this stage inherits, over `workflow_defaults`.
 
 @ stages.<name>.release
 type: block

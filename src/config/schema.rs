@@ -32,6 +32,12 @@ pub struct RawConfig {
     pub schedules: BTreeMap<String, Option<RawSchedule>>,
     /// The account Cloud Scheduler uses to call its targets.
     pub scheduler: Option<RawScheduler>,
+    /// Google Cloud Workflows deployed from files in the repository, by name:
+    /// `<app>-<name>-<stage>`.
+    #[serde(default)]
+    pub workflows: BTreeMap<String, Option<RawWorkflow>>,
+    /// Settings every workflow inherits (account, region, logging, invokers).
+    pub workflow_defaults: Option<RawWorkflow>,
     /// Release images (`deploy --tag`, `--tag-rc`): where they are published.
     pub release: Option<RawRelease>,
     /// How custom domains are served (a stage block replaces it).
@@ -149,6 +155,10 @@ pub struct RawStage {
     #[serde(default)]
     pub schedules: BTreeMap<String, Option<RawSchedule>>,
     pub scheduler: Option<RawScheduler>,
+    /// Field overrides of workflows; `null` removes one from the stage.
+    #[serde(default)]
+    pub workflows: BTreeMap<String, Option<RawWorkflow>>,
+    pub workflow_defaults: Option<RawWorkflow>,
     /// `flag` maps the stage to `deploy --tag` or `--tag-rc`; `repository`
     /// replaces the global one.
     pub release: Option<RawRelease>,
@@ -317,7 +327,32 @@ impl RawService {
     }
 }
 
-/// A Cloud Scheduler job. Exactly one target: `job` or `service`.
+/// A Google Cloud Workflows workflow (also the shape of `workflow_defaults`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawWorkflow {
+    /// The workflow definition (YAML or JSON), relative to runway.yaml.
+    pub source: Option<String>,
+    pub description: Option<String>,
+    /// User-defined environment variables, read with `sys.get_env("NAME")`.
+    /// Values may use `${services.NAME.url}`, `${jobs.NAME.name}`, …. In
+    /// stage overrides a `null` value removes an inherited variable.
+    pub env: Option<BTreeMap<String, Option<String>>>,
+    /// `none` (default), `errors-only` or `all-calls`.
+    pub call_log_level: Option<String>,
+    /// The account the workflow runs as. Default: the stage's workflow
+    /// account `<app>-<stage>-wf@PROJECT.iam.gserviceaccount.com`.
+    pub service_account: Option<String>,
+    /// Create the account and grant it roles.
+    pub identity: Option<RawIdentity>,
+    /// Principals allowed to run it (`roles/workflows.invoker`, on the project:
+    /// Workflows has no per-workflow access).
+    pub invokers: Option<Vec<String>>,
+    /// Workflows region (default: `provider.region`).
+    pub region: Option<String>,
+}
+
+/// A Cloud Scheduler job. Exactly one target: `job`, `service` or `workflow`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSchedule {
@@ -330,6 +365,10 @@ pub struct RawSchedule {
     /// Calls this service (a key of `services`, or the app name for the main
     /// service) with an ID token.
     pub service: Option<String>,
+    /// Starts an execution of this workflow (a key of `workflows`).
+    pub workflow: Option<String>,
+    /// JSON argument of the workflow execution.
+    pub argument: Option<String>,
     /// Path on the service (default `/`).
     pub path: Option<String>,
     /// HTTP method for a service (default `POST`).

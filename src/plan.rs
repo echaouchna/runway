@@ -1288,6 +1288,7 @@ mod tests {
             push_service_account: None,
             promote: None,
             scheduler_region: "europe-west1".into(),
+            workflow_region: "europe-west1".into(),
             release: Default::default(),
             domains: Default::default(),
             project_tags: Default::default(),

@@ -737,6 +737,17 @@ async fn run_single(
                 e.message
             )),
         }
+        // Likewise workflows.
+        match provisioner.orphan_workflows().await {
+            Ok(left) => removals.extend(left),
+            Err(e) if e.kind == ErrorKind::Prerequisite => {
+                tracing::debug!(error = %e.message, "workflows not checked");
+            }
+            Err(e) => p.warn(format!(
+                "could not check for workflows runway created ({}); none deleted",
+                e.message
+            )),
+        }
         removals
     } else {
         Vec::new()

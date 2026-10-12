@@ -1,7 +1,8 @@
 # Services, jobs and schedules
 
-One `runway.yaml` can deploy several Cloud Run services, Cloud Run jobs, and
-Cloud Scheduler jobs that run a job or call a service. They share the build
+One `runway.yaml` can deploy several Cloud Run services, Cloud Run jobs,
+[workflows](workflows.md) that orchestrate them, and Cloud Scheduler jobs
+that run a job, call a service or start a workflow. They share the build
 settings, identity, secrets and stages you give them, and `plan`, `deploy`,
 previews and `undeploy` handle them together. This page shows how to do the
 common things; every option is in the
@@ -104,6 +105,22 @@ one account per app and stage (`<app>-<stage>-sched`, created by runway),
 which gets `roles/run.invoker` on each target only: the service stays
 private. `paused: true` creates a schedule paused; a schedule removed from
 `runway.yaml` is deleted by the next full deploy.
+
+## Chain jobs and services with a workflow
+
+When one job must run after another, or a job's result decides what a
+service does next, deploy a [workflow](workflows.md) next to them. runway
+gives it the URLs of your services and the names of your jobs, and the
+access to call them. A schedule can start it:
+
+```yaml
+workflows:
+  nightly:
+    source: workflows/nightly.yaml
+    env: {API_URL: "${services.web.url}", MIGRATE_JOB: "${jobs.migrate.name}"}
+schedules:
+  every-night: {schedule: "0 3 * * *", workflow: nightly}
+```
 
 ## Deploy only what changed
 

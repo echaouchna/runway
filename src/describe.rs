@@ -887,6 +887,13 @@ pub fn explain_schedules(r: &crate::config::Resolved) -> Vec<Section> {
                 crate::config::ScheduleTarget::Service {
                     name, method, path, ..
                 } => format!("calls `{method} {path}` on service `{name}` with an ID token"),
+                crate::config::ScheduleTarget::Workflow { name, argument, .. } => format!(
+                    "starts workflow `{name}`{}",
+                    argument
+                        .as_ref()
+                        .map(|a| format!(" with argument `{a}`"))
+                        .unwrap_or_default()
+                ),
             };
             format!(
                 "`{}` ({}, {}{}) {what}.",
@@ -907,10 +914,85 @@ pub fn explain_schedules(r: &crate::config::Resolved) -> Vec<Section> {
             ""
         }
     ));
+    if r.schedules
+        .iter()
+        .any(|s| matches!(s.target, crate::config::ScheduleTarget::Workflow { .. }))
+    {
+        items.push(format!(
+            "To start workflows it also gets `roles/workflows.invoker` on project {} (Workflows has no per-workflow access).",
+            r.first().project
+        ));
+    }
     vec![Section {
         title: "Schedules".into(),
         items,
     }]
+}
+
+/// Each workflow: its file, account, what it calls and who may run it.
+pub fn explain_workflows(r: &crate::config::Resolved) -> Vec<Section> {
+    let d = r.first();
+    r.workflows
+        .iter()
+        .map(|w| {
+            let mut items = vec![
+                format!(
+                    "Workflow `{}` in {}/{}, from `{}`.",
+                    w.id, d.project, w.region, w.source_file
+                ),
+                format!(
+                    "Runs as `{}`{}.",
+                    w.service_account,
+                    if w.identity.create {
+                        " (created by runway)"
+                    } else {
+                        ""
+                    }
+                ),
+            ];
+            for (k, v) in &w.env {
+                items.push(format!("`{k}` = `{}` (read with `sys.get_env(\"{k}\")`).", v.display()));
+            }
+            for t in &w.targets {
+                items.push(match t {
+                    crate::config::WorkflowTarget::Service { name, .. } => {
+                        format!("Calls service `{name}`: its account gets `roles/run.invoker` on it.")
+                    }
+                    crate::config::WorkflowTarget::Job { name, .. } => format!(
+                        "Runs job `{name}`: its account gets `{}` and `{}` on it.",
+                        crate::provision::JOBS_EXECUTOR_ROLE,
+                        crate::provision::RUN_VIEWER_ROLE
+                    ),
+                });
+            }
+            for b in &w.identity.roles {
+                items.push(format!("Its account gets `{}` on {}.", b.role, b.target));
+            }
+            if w.call_log_level != crate::config::CallLogLevel::None {
+                items.push(format!(
+                    "Logs calls ({}): its account gets `roles/logging.logWriter` on the project.",
+                    w.call_log_level.as_str()
+                ));
+            }
+            if !w.invokers.is_empty() {
+                items.push(format!(
+                    "Can be run by {} (`roles/workflows.invoker` on project {}: every workflow of the project).",
+                    w.invokers.join(", "),
+                    d.project
+                ));
+            }
+            for sch in r.schedules.iter().filter(|x| x.target.resource_id() == w.id) {
+                items.push(format!(
+                    "Started by schedule `{}`: `{}` ({}).",
+                    sch.key, sch.schedule, sch.time_zone
+                ));
+            }
+            Section {
+                title: format!("Workflow {}", w.key),
+                items,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

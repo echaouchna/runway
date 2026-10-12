@@ -38,6 +38,7 @@ work the same in `services.<name>.…`, `jobs.<name>.…` and `defaults.…`):
 | `undeploy` | also `run.jobs.list` (in `roles/run.developer`), to keep an account a job still runs as; without it the account is kept |
 | `jobs` | `run.jobs.*` (in `roles/run.developer`) and `iam.serviceAccounts.actAs` on the job's runtime account |
 | `schedules` | `roles/cloudscheduler.admin`, `iam.serviceAccounts.actAs` (`roles/iam.serviceAccountUser`) on the scheduler account, `run.services.setIamPolicy`/`run.jobs.setIamPolicy` on the targets (`roles/run.admin`), and with the default account `roles/iam.serviceAccountAdmin` to create it |
+| `workflows` | `roles/workflows.editor`, `iam.serviceAccounts.actAs` on each workflow's account, and the grants below; see [Workflows](#workflows) |
 | `domains` (load balancer modes) | `roles/compute.loadBalancerAdmin` (NEGs, backend services, URL maps, proxies, forwarding rules, addresses) and `roles/certificatemanager.owner` on the deployment project; with an existing load balancer, `compute.urlMaps.get`/`update` on its URL map |
 | `domains` (domain mappings, custom URLs) | `run.domainmappings.*` (in `roles/run.admin`); domain mappings also need the domain verified in Search Console with the deployer as an owner |
 | `domains.dns` | `roles/dns.admin` on the zone's project (without it, runway prints the records to create elsewhere) |
@@ -49,3 +50,29 @@ work the same in `services.<name>.…`, `jobs.<name>.…` and `defaults.…`):
 | `provider.enable_apis` | `roles/serviceusage.serviceUsageAdmin` on the deployment project |
 | `buckets` | `roles/storage.admin` on the project (`storage.buckets.create`, `update`, `setIamPolicy`) |
 | `provider.create_build_resources` | `roles/artifactregistry.admin` (repository + its IAM), `roles/storage.admin`, `roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin` (log writer grant) |
+
+## Workflows
+
+| Who | Needs | Why |
+|-----|-------|-----|
+| Deployer | `roles/workflows.editor` on the project | create, update, list (in every region, to find leftovers) and delete workflows |
+| Deployer | `workflows.workflows.list` (`roles/workflows.viewer`) | `undeploy`: keep an account a workflow runs as (also one runway.yaml no longer lists); without it, undeploy keeps every account it would have deleted, whether or not runway.yaml has workflows. With the Workflows API disabled, there are no workflows to check |
+| Deployer | `iam.serviceAccounts.actAs` (`roles/iam.serviceAccountUser`) on each workflow's account | a workflow runs as it |
+| Deployer | `roles/iam.serviceAccountAdmin` | with the default account (`<app>-<stage>-wf`) or `identity.create` |
+| Deployer | `run.services.setIamPolicy` / `run.jobs.setIamPolicy` (`roles/run.admin`) on the services and jobs a workflow references | grant the workflow's account access to them |
+| Deployer | `roles/resourcemanager.projectIamAdmin` on the project | with `invokers`, `call_log_level`, project `identity.roles`, or a schedule starting a workflow |
+| Workflow account | `roles/run.invoker` on each service it references | call it (runway grants it) |
+| Workflow account | `roles/run.jobsExecutorWithOverrides` and `roles/run.viewer` on each job it references | run it, with overrides, and follow the execution (runway grants them) |
+| Workflow account | `roles/logging.logWriter` on the project | with `call_log_level` (runway grants it) |
+| `invokers`, the scheduler account | `roles/workflows.invoker` on the project | run the workflow (runway grants it) |
+
+Workflows has no per-workflow access, so `roles/workflows.invoker` lets its
+holders run every workflow of the project. To run a workflow with
+`runway run-workflow`, the caller needs `workflows.executions.create`
+(`roles/workflows.invoker`).
+
+If a workflow that runs a job fails while waiting for it with a
+`run.operations.get` permission error, grant its account `roles/run.viewer`
+on the project with `identity.roles`. runway grants it on the job only, and
+this has not been checked against every way of calling the Cloud Run
+connector.

@@ -26,6 +26,15 @@ impl Interp {
         self.vars.insert(name.into(), value.into());
     }
 
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.vars.get(name).map(String::as_str)
+    }
+
+    /// Every variable, as `${name}`.
+    pub fn known(&self) -> Vec<String> {
+        self.vars.keys().map(|k| format!("${{{k}}}")).collect()
+    }
+
     /// Replaces every `${name}`; errors on unknown or malformed references.
     pub fn apply(&self, s: &str) -> Result<String, String> {
         let mut out = String::with_capacity(s.len());

@@ -213,6 +213,8 @@ const STAGE_BLOCKS: &[&str] = &[
     "jobs",
     "schedules",
     "scheduler",
+    "workflows",
+    "workflow_defaults",
     "release",
     "domains",
 ];

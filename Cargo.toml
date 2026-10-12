@@ -63,6 +63,8 @@ google-cloud-compute-v1 = { version = "4", default-features = false, features = 
 google-cloud-certificatemanager-v1 = "1.15"
 google-cloud-dns-v1 = "2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache", "unstable-rendered-line-info"] }
+google-cloud-workflows-v1 = "1.14"
+google-cloud-workflows-executions-v1 = "1.13"
 
 [dev-dependencies]
 flate2 = "1.1"

@@ -28,6 +28,7 @@ deploy:
           the build starts once its own prerequisites exist and runs ║ the rest
        ─► service tags ─► create/update (update mask, etag, template reuse)
        ─► wait until ready ─► tags ║ IAP ─► public/private access
+       ─► workflows' and schedules' grants ─► workflows ║ schedules ─► removals
   (║ = concurrently)
 ```
 
@@ -36,7 +37,7 @@ deploy:
 | Module | Responsibility |
 |---|---|
 | `cli`, `output`, `style` | clap definitions, dispatch, text/JSON rendering, colors, exit codes |
-| `config` | Schema (`deny_unknown_fields`), stage merge, `${…}` interpolation (`interp`), defaults, validation with precise paths |
+| `config` | Schema (`deny_unknown_fields`), stage merge, `${…}` interpolation (`interp`), defaults, validation with precise paths; workflows and their templates (`workflow`), where a service URL stays a placeholder until deploy reads it |
 | `naming` | Deterministic names: service, image, labels, source objects, build tags, IAM resource names |
 | `plan` | Desired state (`ServiceSpec`), normalized flat representation, diff, plan rendering |
 | `traffic` | Pure traffic logic: full rollouts, previews, canaries, promote, splits, tag names |
@@ -52,7 +53,8 @@ deploy:
 
 - **Official SDKs first.** Cloud Run, Cloud Build, Cloud Storage, Logging,
   Resource Manager, IAM, Secret Manager, Service Usage, Artifact Registry,
-  BigQuery and IAP use the official `google-cloud-*` Rust crates. Small REST
+  BigQuery, IAP, Cloud Scheduler, Workflows and Workflow Executions use the
+  official `google-cloud-*` Rust crates. Small REST
   adapters exist only where no SDK call exists: the OCI registry v2 protocol
   (digest lookup, tag listing), Service Usage `v1beta1
   generateServiceIdentity`, and Cloud Run domain mappings (only in the
@@ -68,7 +70,10 @@ deploy:
   accounts runway creates. runway refuses to modify what it does not own.
   Compute resources (load balancer parts, host rules and path matchers in a
   shared URL map) and Cloud Scheduler jobs carry the marker
-  `managed-by=runway app=… stage=…` in their description. DNS records cannot
+  `managed-by=runway app=… stage=…` in their description. Workflows carry
+  the ownership labels, and the workflows' account the description marker
+  `role=workflows`. Workflows has no per-workflow IAM: `roles/workflows.invoker`
+  (invokers, the scheduler account) is granted on the project. DNS records cannot
   carry one: runway changes or deletes a record only when its data is what
   runway set. The URL and certificate maps runway added routes to are
   recorded on the service (`runway.dev/domains`).

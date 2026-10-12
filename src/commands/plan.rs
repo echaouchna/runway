@@ -678,6 +678,12 @@ pub async fn compute(
                         e.message
                     )),
                 }
+                // And workflows (silent when they cannot be listed).
+                if let Ok(left) = prov.orphan_workflows().await {
+                    for s in left {
+                        unlisted.push(prov.check(&s, true).await);
+                    }
+                }
                 // Custom domains runway.yaml no longer has.
                 if let Some(previous) = domains_previous {
                     let step = Step::Domains {
@@ -761,6 +767,7 @@ pub(crate) fn is_single(r: &Resolved) -> bool {
     r.deployments.len() == 1
         && !r.first().is_job()
         && r.schedules.is_empty()
+        && r.workflows.is_empty()
         && !crate::domains::configured(r)
 }
 
@@ -1074,27 +1081,23 @@ async fn stack_plan(
         .into_iter()
         .chain(crate::provision::stack_pre_steps(r))
         .collect();
-    // Schedules change with a full deploy, for the targets it deploys.
+    // Workflows and schedules change with a full deploy, for the targets it
+    // deploys.
     let schedule_steps: Vec<Step> = match full {
         false => Vec::new(),
-        true => crate::provision::schedule_steps(r)
-            .into_iter()
-            .filter(|s| match s {
-                Step::Schedule(sc) => selected
-                    .iter()
-                    .any(|d| d.service_id == sc.target.resource_id()),
-                Step::Grant { binding, .. } => selected.iter().any(|d| {
-                    binding
-                        .target
-                        .to_string()
-                        .ends_with(&format!(" {}", d.service_id))
-                }),
-                _ => true,
-            })
-            .collect(),
+        true => crate::provision::post_rollout_steps(r, &selected),
     };
     if !full && !r.schedules.is_empty() {
         notes.push("schedules change with a full deploy, not a preview or canary".into());
+    }
+    if !full && !r.workflows.is_empty() {
+        notes.push("workflows change with a full deploy, not a preview or canary".into());
+    }
+    let skipped = r.workflows.len() - crate::provision::workflows_for(r, &selected).len();
+    if full && skipped > 0 {
+        notes.push(format!(
+            "{skipped} workflow(s) reference nothing selected by --only: a deploy of everything updates them"
+        ));
     }
     let cfg = crate::config::load(&ctx.config)?;
     let owners: Vec<&Deployment> = selected.iter().map(|d| r.build_owner(d)).collect();
@@ -1231,6 +1234,19 @@ async fn stack_plan(
             }
             Err(e) => notes.push(format!(
                 "could not check for schedules runway created ({})",
+                e.message
+            )),
+        }
+        match prov.orphan_workflows().await {
+            Ok(left) => {
+                for s in left {
+                    steps.push(prov.check(&s, true).await);
+                }
+            }
+            Err(e) if r.workflows.is_empty() && e.kind == crate::error::ErrorKind::Prerequisite => {
+            }
+            Err(e) => notes.push(format!(
+                "could not check for workflows runway created ({})",
                 e.message
             )),
         }
