@@ -273,6 +273,12 @@ migration notes.
 
 ### Fixed
 
+- **Doctor checks repository creation where it is needed.** An existing
+  repository no longer requires `artifactregistry.repositories.create` on the
+  deployment project. Missing repositories are checked in their own project.
+  Text output puts failures first, separates warnings from passed checks,
+  wraps details and prints grant commands with shell line continuations.
+  JSON output is unchanged.
 - **`doctor` says who lacks which permission, where, and how to grant it.**
   A missing project permission names the account (the impersonated one, or
   your credentials), the project, the predefined role that grants it, what it

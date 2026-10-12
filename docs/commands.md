@@ -58,6 +58,20 @@ separate with commas; `RUNWAY_ONLY` in CI). `info` and `logs` need it when
 there are several services (`logs` also reads a job's logs); `traffic --set`
 needs it to name one service.
 
+## Reading doctor output
+
+`runway doctor --stage S` lists failures first, then warnings and passed
+checks. Details wrap to the terminal width; grant commands use shell line
+continuations so they can be copied as a whole. `-o json` keeps the structured
+check list for scripts.
+
+A warning means a prerequisite is not yet verified or deploy will create a
+resource; it does not necessarily mean access is missing. Repository creation
+permission is checked only for a missing repository that deploy will create,
+on that repository's project. An existing shared repository does not require
+`artifactregistry.repositories.create` on the Cloud Run project. Cloud Build
+permissions are still checked on the project where the build runs.
+
 ## Reading plan and deploy output
 
 Both use the same marks: `+` added or created, `~` changed (`before ->
