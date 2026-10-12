@@ -481,6 +481,50 @@ pub fn has_sa_marker(description: &str, app: &str, stage: Option<&str>, role: &s
         && stage.is_none_or(|s| tokens.contains(format!("stage={s}").as_str()))
 }
 
+/// What the push account gets on the stage repository runway creates
+/// (`create_build_resources`), and nowhere else: reader when it only copies
+/// builds out (to a release repository), writer when it also tags releases
+/// there (no release repository) or copies promoted images in.
+pub fn push_grant(d: &Deployment) -> Option<(String, RoleBinding)> {
+    let push = d.push_service_account.as_ref()?;
+    let (create, project, location, repository) = match &d.artifact {
+        Artifact::Build(b) => (
+            b.create_resources,
+            &b.artifact_project,
+            &b.artifact_location,
+            &b.artifact_repository,
+        ),
+        Artifact::Promote(p) => (
+            p.create_resources,
+            &p.artifact_project,
+            &p.artifact_location,
+            &p.artifact_repository,
+        ),
+        Artifact::Image { .. } => return None,
+    };
+    if !create {
+        return None;
+    }
+    // Releases tagged in this repository (whether `release.repository` is
+    // unset or names it) need writer, as do promoted copies.
+    let tags_here = crate::commands::release::tags_in_stage_repository(d);
+    let role = match (&d.artifact, tags_here) {
+        (Artifact::Build(_), false) => "roles/artifactregistry.reader",
+        _ => "roles/artifactregistry.writer",
+    };
+    Some((
+        push.clone(),
+        RoleBinding {
+            role: role.into(),
+            target: RoleTarget::Repository {
+                project: project.clone(),
+                location: location.clone(),
+                repository: repository.clone(),
+            },
+        },
+    ))
+}
+
 /// APIs the deployment project needs for this configuration, plus declared extras.
 pub fn required_apis(d: &Deployment) -> Vec<String> {
     let mut apis: Vec<String> = [
@@ -685,6 +729,9 @@ pub fn pre_steps(d: &Deployment) -> Vec<Step> {
                 bucket: b.source_bucket.clone(),
             },
         ));
+    }
+    if let Some((email, binding)) = push_grant(d) {
+        grants.push(Step::Grant { email, binding });
     }
     if d.service.identity.create {
         accounts.push(Step::CreateServiceAccount {

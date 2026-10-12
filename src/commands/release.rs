@@ -100,6 +100,17 @@ pub fn target(d: &Deployment) -> Option<Target> {
     }
 }
 
+/// `--tag`/`--tag-rc` tag in the stage's own repository: without a release
+/// repository, or with one naming that same repository (any package).
+pub fn tags_in_stage_repository(d: &Deployment) -> bool {
+    match (stage_target(d), target(d)) {
+        (Some(s), Some(t)) => {
+            (&s.project, &s.location, &s.repository) == (&t.project, &t.location, &t.repository)
+        }
+        _ => false,
+    }
+}
+
 /// Where `d`'s builds are pushed (its stage's build repository).
 pub fn build_target(d: &Deployment, b: &crate::config::BuildConfig) -> Target {
     Target {
