@@ -12,6 +12,34 @@ migration notes.
 
 ### Added
 
+- **Google Cloud Workflows.** `workflows.<name>.source` deploys a workflow
+  file from the repository as `<app>-<name>-<stage>`, after the services and
+  jobs it calls exist. `env` sets user-defined environment variables (read
+  with `sys.get_env`), and `${runway.…}` in the file is replaced inline. Both
+  can use `${services.NAME.url}` (the live URL), `.id`, `.name`, and
+  `${jobs.NAME.name}` (what the Cloud Run connector takes), `.id`, `.url`.
+  runway grants the workflow's account `roles/run.invoker` on each service it
+  references and `roles/run.jobsExecutorWithOverrides` and `roles/run.viewer`
+  on each job. With `call_log_level` it also gets `roles/logging.logWriter`,
+  plus its `identity.roles`. `invokers` get `roles/workflows.invoker` (on the
+  project: Workflows has no per-workflow access, and runway warns about it).
+  The workflows of a stage share an account, `<app>-<stage>-wf`, created by
+  runway, unless a workflow (or `workflow_defaults`) sets its own. `plan`
+  shows each workflow's changes and says when a service URL is not known yet;
+  an unchanged workflow gets no new revision. Workflows removed from
+  runway.yaml (or moved to another region) are found in every region and
+  deleted by the next full deploy or `undeploy --orphans`; `undeploy`
+  deletes them with the stage, and keeps any account a remaining workflow
+  runs as. The APIs a workflow account's `identity.roles` need are enabled
+  with the others. `describe`, `info` and `doctor`
+  cover them.
+- **`runway run-workflow NAME`** starts a workflow (`--data` for its JSON
+  argument), and with `--wait` follows it and prints its result.
+- **Schedules can start workflows:** `schedules.<name>.workflow` (with an
+  optional JSON `argument`) starts an execution through the Workflow
+  Executions API; the scheduler account gets `roles/workflows.invoker` on the
+  project.
+
 - **Where images go, promotion and who pushes, all optional.**
   `provider.artifact_project` and `provider.artifact_package` (global or per
   stage) push builds to a repository in another project (a shared registry)

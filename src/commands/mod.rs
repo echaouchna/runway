@@ -12,6 +12,7 @@ pub mod plan;
 pub mod preview;
 pub mod release;
 pub mod run_job;
+pub mod run_workflow;
 pub mod summary;
 pub mod traffic;
 pub mod undeploy;

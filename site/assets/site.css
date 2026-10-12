@@ -423,6 +423,16 @@ pre {
 .globe-viz .host { color: var(--text); padding: 6px 12px; border: 1px solid var(--line2); border-radius: 9px; }
 .globe-viz .cert { color: var(--green); animation: pop 3.4s var(--ease) infinite; }
 
+.wf-viz { flex-direction: column; gap: 14px; padding: 0 14px; }
+.wf-viz .wf-steps { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.wf-viz .wf-steps i { color: var(--muted); font-style: normal; }
+.wf-viz .wf-step { padding: 6px 11px; border-radius: 9px; border: 1px solid var(--line2); color: var(--cyan); background: rgba(34, 211, 238, .08); animation: wfstep 4.5s var(--ease) infinite; }
+.wf-viz .w2 { color: var(--violet); background: rgba(167, 139, 250, .08); animation-delay: 1s; }
+.wf-viz .w3 { color: var(--green); background: rgba(52, 211, 153, .1); animation-delay: 2s; }
+.wf-viz .wf-env { color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-viz .wf-k { color: var(--amber); }
+@keyframes wfstep { 0%, 100% { border-color: var(--line2); box-shadow: none; } 12%, 30% { border-color: currentColor; box-shadow: 0 0 16px -2px currentColor; } }
+
 .explain-viz { flex-direction: column; gap: 10px; }
 .explain-viz .q { color: var(--cyan); border-right: 2px solid var(--cyan); padding-right: 3px; overflow: hidden; white-space: nowrap; width: 0; animation: typing 4s steps(22) infinite; }
 .explain-viz .r { color: var(--violet); opacity: 0; animation: pop 4s var(--ease) infinite; animation-delay: .6s; }

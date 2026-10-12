@@ -25,7 +25,7 @@ use crate::plan::{ImagePlan, ServiceSpec};
 use crate::poll::PollConfig;
 use crate::provision::{
     ANNOTATION_GRANTS, ManagedGrant, Provisioner, Step, StepOutcome, StepResult, domains_step,
-    encode_grants, grant_record, merge_removals, schedule_steps, stack_api_step,
+    encode_grants, grant_record, merge_removals, post_rollout_steps, stack_api_step,
     stack_managed_grants, stack_pre_steps, stack_revoke_steps,
 };
 use crate::retry::{RetryConfig, with_retry};
@@ -259,7 +259,10 @@ pub async fn run(
         first.stage,
         first.project,
         first.region,
-        match (full, r.schedules.len()) {
+        match (full, crate::provision::workflows_for(r, selected).len()) {
+            (true, n) if n > 0 => format!(", {n} workflow(s)"),
+            _ => String::new(),
+        } + &match (full, r.schedules.len()) {
             (true, n) if n > 0 => format!(", {n} schedule(s)"),
             _ => String::new(),
         },
@@ -842,20 +845,7 @@ pub async fn run(
     //    one revision (a preview, canary or partial rollout may need access).
     let mut post: Vec<Step> = Vec::new();
     if full {
-        post.extend(schedule_steps(r).into_iter().filter(|s| {
-            match s {
-                Step::Schedule(sc) => selected
-                    .iter()
-                    .any(|d| d.service_id == sc.target.resource_id()),
-                Step::Grant { binding, .. } => selected.iter().any(|d| {
-                    binding
-                        .target
-                        .to_string()
-                        .ends_with(&format!(" {}", d.service_id))
-                }),
-                _ => true,
-            }
-        }));
+        post.extend(post_rollout_steps(r, selected));
     }
     let revoke_now = full
         && everything
@@ -885,6 +875,18 @@ pub async fn run(
             Ok(left) => removals.extend(left),
             Err(e) => p.warn(format!(
                 "could not check for schedules runway created ({}); none deleted",
+                e.message
+            )),
+        }
+        match provisioner.orphan_workflows().await {
+            Ok(left) => removals.extend(left),
+            // Without permission to list them (a stage that never had any),
+            // nothing is said.
+            Err(e) if r.workflows.is_empty() && e.kind == ErrorKind::Prerequisite => {
+                tracing::debug!(error = %e.message, "workflows not checked");
+            }
+            Err(e) => p.warn(format!(
+                "could not check for workflows runway created ({}); none deleted",
                 e.message
             )),
         }

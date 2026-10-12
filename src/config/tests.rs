@@ -2332,3 +2332,249 @@ fn a_default_domain_is_for_services_not_jobs() {
         "a default domain is for services"
     );
 }
+
+const WORKFLOWS: &str = r#"
+version: 1
+app: shop
+provider: {project: my-gcp-project, region: europe-west1}
+defaults:
+  image: europe-west1-docker.pkg.dev/my-gcp-project/apps/shop:1
+  service_account: shop-runtime@my-gcp-project.iam.gserviceaccount.com
+service: {}
+services:
+  api: {}
+jobs:
+  export: {command: [python, export.py]}
+workflow_defaults:
+  env: {STAGE: "${stage}"}
+workflows:
+  nightly:
+    source: workflows/nightly.yaml
+    description: Nightly export
+    env:
+      API_URL: "${services.api.url}/v1"
+      EXPORT_JOB: ${jobs.export.name}
+    invokers: [group:data-team@example.com]
+schedules:
+  every-night: {schedule: "0 3 * * *", workflow: nightly, argument: '{"full": true}'}
+stages:
+  prod: {}
+  dev:
+    workflows:
+      nightly:
+        call_log_level: all-calls
+        env: {STAGE: null}
+"#;
+
+const NIGHTLY: &str = r#"main:
+  steps:
+    - export:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${sys.get_env("EXPORT_JOB")}
+    - ping:
+        call: http.get
+        args:
+          url: ${runway.services.shop.url}/health
+          headers: {X-Project: "${runway.project}"}
+"#;
+
+/// [`load_str`] with workflow files (relative path, contents).
+fn load_with_files(yaml: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, LoadedConfig) {
+    let (dir, _) = load_str(yaml);
+    for (p, text) in files {
+        let path = dir.path().join(p);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let cfg = load(&dir.path().join("runway.yaml")).unwrap();
+    (dir, cfg)
+}
+
+#[test]
+fn a_workflow_gets_references_to_services_and_jobs() {
+    let (_d, cfg) = load_with_files(WORKFLOWS, &[("workflows/nightly.yaml", NIGHTLY)]);
+    let r = resolve_ok(&cfg, "prod");
+    let w = &r.workflows[0];
+    assert_eq!(
+        (w.id.as_str(), w.region.as_str()),
+        ("shop-nightly-prod", "europe-west1")
+    );
+    assert_eq!(w.description, "Nightly export");
+    // The default account, shared by the stage's workflows and created by runway.
+    assert_eq!(
+        w.service_account,
+        "shop-prod-wf@my-gcp-project.iam.gserviceaccount.com"
+    );
+    assert!(w.identity.create);
+    // A service URL waits for deploy; a job's name is known now.
+    assert_eq!(
+        w.env["API_URL"],
+        Template(vec![
+            TemplatePart::ServiceUrl("shop-api-prod".into()),
+            TemplatePart::Text("/v1".into())
+        ])
+    );
+    assert_eq!(
+        w.env["EXPORT_JOB"],
+        Template::text("projects/my-gcp-project/locations/europe-west1/jobs/shop-export-prod")
+    );
+    assert_eq!(w.env["STAGE"], Template::text("prod"));
+    // In the file, only `${runway.…}` is runway's.
+    let url = |id: &str| Some(format!("https://{id}.a.run.app"));
+    let source = w.source.render(&url).unwrap();
+    assert!(
+        source.contains(r#"name: ${sys.get_env("EXPORT_JOB")}"#),
+        "{source}"
+    );
+    assert!(
+        source.contains("url: https://shop-prod.a.run.app/health"),
+        "{source}"
+    );
+    assert!(
+        source.contains(r#"X-Project: "my-gcp-project""#),
+        "{source}"
+    );
+    let ids: Vec<&str> = w.targets.iter().map(|t| t.resource_id()).collect();
+    assert_eq!(ids, ["shop-prod", "shop-api-prod", "shop-export-prod"]);
+    assert_eq!(w.service_urls(), ["shop-prod", "shop-api-prod"]);
+    assert_eq!(w.invokers, ["group:data-team@example.com"]);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|i| i.path == "workflows.nightly.invokers" && i.message.contains("every workflow")),
+        "{:#?}",
+        r.warnings
+    );
+    // The schedule starts it.
+    assert_eq!(
+        r.schedules[0].target,
+        ScheduleTarget::Workflow {
+            name: "nightly".into(),
+            workflow_id: "shop-nightly-prod".into(),
+            region: "europe-west1".into(),
+            argument: Some(r#"{"full": true}"#.into()),
+        }
+    );
+    assert!(r.first().workflow_region == "europe-west1");
+}
+
+#[test]
+fn a_stage_overrides_workflow_keys_and_can_drop_one() {
+    let (_d, cfg) = load_with_files(WORKFLOWS, &[("workflows/nightly.yaml", NIGHTLY)]);
+    let w = &resolve_ok(&cfg, "dev").workflows[0];
+    assert_eq!(w.call_log_level, CallLogLevel::AllCalls);
+    assert!(
+        !w.env.contains_key("STAGE"),
+        "null removes an inherited variable"
+    );
+    assert!(w.env.contains_key("API_URL"));
+    let yaml = WORKFLOWS.replace(
+        "        env: {STAGE: null}\n",
+        "        env: {STAGE: null}\n    schedules: {every-night: null}\n",
+    );
+    let yaml = yaml.replace(
+        "    workflows:\n      nightly:\n        call_log_level",
+        "    workflows:\n      nightly: null\n      x:\n        call_log_level",
+    );
+    let (_d, cfg) = load_with_files(&yaml, &[("workflows/nightly.yaml", NIGHTLY)]);
+    let e = resolve_err(&cfg, "dev");
+    assert!(has_error(&e, "workflows.x.source", "required"), "{e:#?}");
+}
+
+#[test]
+fn an_own_account_is_not_created_unless_asked() {
+    let yaml = WORKFLOWS.replace(
+        "    description: Nightly export\n",
+        "    description: Nightly export\n    service_account: etl@my-gcp-project.iam.gserviceaccount.com\n",
+    );
+    let (_d, cfg) = load_with_files(&yaml, &[("workflows/nightly.yaml", NIGHTLY)]);
+    let w = &resolve_ok(&cfg, "prod").workflows[0];
+    assert_eq!(
+        w.service_account,
+        "etl@my-gcp-project.iam.gserviceaccount.com"
+    );
+    assert!(!w.identity.create);
+    let yaml = yaml.replace(
+        "    service_account: etl@",
+        "    identity: {create: true, roles: [{role: roles/bigquery.jobUser, project: my-gcp-project}]}\n    service_account: etl@",
+    );
+    let (_d, cfg) = load_with_files(&yaml, &[("workflows/nightly.yaml", NIGHTLY)]);
+    let w = &resolve_ok(&cfg, "prod").workflows[0];
+    assert!(w.identity.create);
+    assert_eq!(w.identity.roles[0].role, "roles/bigquery.jobUser");
+}
+
+#[test]
+fn workflow_mistakes_are_reported_with_their_path() {
+    let bad_file = "main:\n  steps:\n    - a:\n        return: ${runway.jobs.nope.name}\n";
+    let yaml = WORKFLOWS
+        .replace(
+            "EXPORT_JOB: ${jobs.export.name}",
+            "GOOGLE_X: ${jobs.export.bogus}",
+        )
+        .replace("env: {STAGE: \"${stage}\"}", "source: x.yaml")
+        .replace("argument: '{\"full\": true}'", "argument: 'not json'");
+    let (_d, cfg) = load_with_files(&yaml, &[("workflows/nightly.yaml", bad_file)]);
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(
+            &e,
+            "workflows.nightly.source",
+            "line 4: `${runway.jobs.nope.name}`: `nope` is not a job"
+        ),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "workflows.nightly.env.GOOGLE_X", "reserved"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "workflows.nightly.env.GOOGLE_X", "not `bogus`"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "workflow_defaults.source", "on each workflow"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(&e, "schedules.every-night.argument", "not valid JSON"),
+        "{e:#?}"
+    );
+
+    let yaml = WORKFLOWS.replace("workflow: nightly", "workflow: other");
+    let (_d, cfg) = load_with_files(&yaml, &[]);
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "workflows.nightly.source", "cannot read"),
+        "{e:#?}"
+    );
+    assert!(
+        has_error(
+            &e,
+            "schedules.every-night.workflow",
+            "`other` is not a workflow"
+        ),
+        "{e:#?}"
+    );
+    let yaml = WORKFLOWS.replace("workflow: nightly, argument", "job: export, argument");
+    let (_d, cfg) = load_with_files(&yaml, &[("workflows/nightly.yaml", NIGHTLY)]);
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(
+            &e,
+            "schedules.every-night.argument",
+            "only for a `workflow` target"
+        ),
+        "{e:#?}"
+    );
+    let (_d, cfg) = load_with_files(
+        WORKFLOWS,
+        &[("workflows/nightly.yaml", "main: [unclosed\n")],
+    );
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(&e, "workflows.nightly.source", "not valid YAML"),
+        "{e:#?}"
+    );
+}

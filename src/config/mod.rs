@@ -9,6 +9,11 @@
 pub mod interp;
 pub mod schema;
 pub mod validate;
+mod workflow;
+
+pub use workflow::{
+    CallLogLevel, MAX_ENV_DEFINITION_BYTES, Template, TemplatePart, WorkflowConfig, WorkflowTarget,
+};
 
 use crate::error::{Error, Result};
 use crate::image_ref::ImageRef;
@@ -192,6 +197,9 @@ pub struct Deployment {
     /// Where the stage's Cloud Scheduler jobs live (`scheduler.region`, else
     /// `provider.region`), also when none is configured any more.
     pub scheduler_region: String,
+    /// The default Workflows region (`workflow_defaults.region`, else
+    /// `provider.region`), also when no workflow is configured any more.
+    pub workflow_region: String,
     /// Release flag of the stage and where its released images go.
     pub release: ReleaseSettings,
     /// How the stage serves custom domains.
@@ -881,6 +889,7 @@ pub struct Resolved {
     pub schedules: Vec<ScheduleConfig>,
     /// The Cloud Scheduler invoker; `Some` when there are schedules.
     pub scheduler: Option<SchedulerConfig>,
+    pub workflows: Vec<WorkflowConfig>,
     pub warnings: Vec<Issue>,
 }
 
@@ -1011,19 +1020,30 @@ pub enum ScheduleTarget {
         body: Option<String>,
         headers: BTreeMap<String, String>,
     },
+    /// Starts an execution of a workflow with an OAuth token.
+    Workflow {
+        name: String,
+        workflow_id: String,
+        region: String,
+        /// JSON argument of the execution.
+        argument: Option<String>,
+    },
 }
 
 impl ScheduleTarget {
-    /// The Cloud Run service or job ID it calls.
+    /// The Cloud Run service or job ID, or the workflow ID, it calls.
     pub fn resource_id(&self) -> &str {
         match self {
             ScheduleTarget::Job { job_id, .. } => job_id,
             ScheduleTarget::Service { service_id, .. } => service_id,
+            ScheduleTarget::Workflow { workflow_id, .. } => workflow_id,
         }
     }
     pub fn name(&self) -> &str {
         match self {
-            ScheduleTarget::Job { name, .. } | ScheduleTarget::Service { name, .. } => name,
+            ScheduleTarget::Job { name, .. }
+            | ScheduleTarget::Service { name, .. }
+            | ScheduleTarget::Workflow { name, .. } => name,
         }
     }
 }
@@ -1363,9 +1383,13 @@ pub fn resolve(
             );
         }
     }
-    // ---- schedules ----
-    let (schedules, scheduler, scheduler_region) =
-        resolve_schedules(&mut d, raw, st, stage, &project, &region, &ix, &inputs);
+    // ---- workflows, then schedules (which may start them) ----
+    let (workflows, workflow_region) = workflow::resolve_workflows(
+        &mut d, &cfg.dir, raw, st, stage, &project, &region, &ix, &inputs,
+    );
+    let (schedules, scheduler, scheduler_region) = resolve_schedules(
+        &mut d, raw, st, stage, &project, &region, &ix, &inputs, &workflows,
+    );
     // ---- retry ----
     let retry = resolve_retry(&mut d, raw.retry.as_ref());
 
@@ -1414,6 +1438,7 @@ pub fn resolve(
             push_service_account: push_service_account.clone(),
             promote: promote.clone(),
             scheduler_region: scheduler_region.clone(),
+            workflow_region: workflow_region.clone(),
             release: release.clone(),
             domains: domains_settings.clone(),
             project_tags: project_tags.clone(),
@@ -1432,6 +1457,7 @@ pub fn resolve(
         deployments,
         schedules,
         scheduler,
+        workflows,
         warnings: d.warnings,
     })
 }
@@ -2400,78 +2426,13 @@ fn resolve_workload(
                     "service account names must be 6-30 characters to be created",
                 );
             }
-            let mut roles = Vec::new();
-            for (i, mut rb) in raw_id.roles.unwrap_or_default().into_iter().enumerate() {
-                let rp = format!("{path}.roles[{i}]");
-                for (field, val) in [
-                    ("project", &mut rb.project),
-                    ("bucket", &mut rb.bucket),
-                    ("dataset", &mut rb.dataset),
-                    ("secret", &mut rb.secret),
-                ] {
-                    if let Some(v) = val.as_mut() {
-                        *v = ixs(&mut d, v, &format!("{rp}.{field}"));
-                    }
-                }
-                if let Err(e) = validate::role_name(&rb.role) {
-                    d.error(format!("{rp}.role"), e);
-                }
-                let set = [
-                    rb.project.is_some(),
-                    rb.bucket.is_some(),
-                    rb.dataset.is_some(),
-                    rb.secret.is_some(),
-                ]
-                .iter()
-                .filter(|x| **x)
-                .count();
-                if set != 1 {
-                    d.error(
-                        rp.clone(),
-                        "set exactly one of `project`, `bucket`, `dataset` or `secret`",
-                    );
-                    continue;
-                }
-                let target = if let Some(p) = rb.project {
-                    if let Err(e) = validate::project_id(&p) {
-                        d.error(format!("{rp}.project"), e);
-                    }
-                    RoleTarget::Project { project: p }
-                } else if let Some(b) = rb.bucket {
-                    if let Err(e) = validate::bucket_name(&b) {
-                        d.error(format!("{rp}.bucket"), e);
-                    }
-                    RoleTarget::Bucket { bucket: b }
-                } else if let Some(ds) = rb.dataset {
-                    match validate::dataset_ref(&ds) {
-                        Ok((project, dataset)) => RoleTarget::Dataset { project, dataset },
-                        Err(e) => {
-                            d.error(format!("{rp}.dataset"), e);
-                            continue;
-                        }
-                    }
-                } else {
-                    let sname = rb.secret.unwrap_or_default();
-                    if let Err(e) = validate::secret_name(&sname) {
-                        d.error(format!("{rp}.secret"), e);
-                    }
-                    let name = if sname.starts_with("projects/") {
-                        sname
-                    } else {
-                        format!("projects/{project}/secrets/{sname}")
-                    };
-                    RoleTarget::Secret { name }
-                };
-                let binding = RoleBinding {
-                    role: rb.role,
-                    target,
-                };
-                if roles.contains(&binding) {
-                    d.warn(rp, "duplicate role binding");
-                } else {
-                    roles.push(binding);
-                }
-            }
+            let roles = resolve_roles(
+                &mut d,
+                ix,
+                &project,
+                raw_id.roles.unwrap_or_default(),
+                &path,
+            );
             IdentityConfig {
                 create,
                 display_name: raw_id
@@ -2556,6 +2517,92 @@ fn resolve_workload(
     diags.errors.extend(d.errors);
     diags.warnings.extend(d.warnings);
     out
+}
+
+/// `identity.roles` of an account (`path` is the `identity` block).
+fn resolve_roles(
+    d: &mut Diagnostics,
+    ix: &interp::Interp,
+    project: &str,
+    raw: Vec<schema::RawRoleBinding>,
+    path: &str,
+) -> Vec<RoleBinding> {
+    let mut roles = Vec::new();
+    for (i, mut rb) in raw.into_iter().enumerate() {
+        let rp = format!("{path}.roles[{i}]");
+        for (field, val) in [
+            ("project", &mut rb.project),
+            ("bucket", &mut rb.bucket),
+            ("dataset", &mut rb.dataset),
+            ("secret", &mut rb.secret),
+        ] {
+            if let Some(v) = val.as_mut() {
+                match ix.apply(v) {
+                    Ok(x) => *v = x,
+                    Err(e) => d.error(format!("{rp}.{field}"), e),
+                }
+            }
+        }
+        if let Err(e) = validate::role_name(&rb.role) {
+            d.error(format!("{rp}.role"), e);
+        }
+        let set = [
+            rb.project.is_some(),
+            rb.bucket.is_some(),
+            rb.dataset.is_some(),
+            rb.secret.is_some(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
+        if set != 1 {
+            d.error(
+                rp.clone(),
+                "set exactly one of `project`, `bucket`, `dataset` or `secret`",
+            );
+            continue;
+        }
+        let target = if let Some(p) = rb.project {
+            if let Err(e) = validate::project_id(&p) {
+                d.error(format!("{rp}.project"), e);
+            }
+            RoleTarget::Project { project: p }
+        } else if let Some(b) = rb.bucket {
+            if let Err(e) = validate::bucket_name(&b) {
+                d.error(format!("{rp}.bucket"), e);
+            }
+            RoleTarget::Bucket { bucket: b }
+        } else if let Some(ds) = rb.dataset {
+            match validate::dataset_ref(&ds) {
+                Ok((project, dataset)) => RoleTarget::Dataset { project, dataset },
+                Err(e) => {
+                    d.error(format!("{rp}.dataset"), e);
+                    continue;
+                }
+            }
+        } else {
+            let sname = rb.secret.unwrap_or_default();
+            if let Err(e) = validate::secret_name(&sname) {
+                d.error(format!("{rp}.secret"), e);
+            }
+            let name = if sname.starts_with("projects/") {
+                sname
+            } else {
+                format!("projects/{project}/secrets/{sname}")
+            };
+            RoleTarget::Secret { name }
+        };
+        let binding = RoleBinding {
+            role: rb.role,
+            target,
+        };
+        if roles.contains(&binding) {
+            d.warn(rp, "duplicate role binding");
+        } else {
+            roles.push(binding);
+        }
+    }
+    roles
 }
 
 /// Tasks, parallelism and retries of a job.
@@ -3703,6 +3750,7 @@ fn resolve_schedules(
     region: &str,
     ix: &interp::Interp,
     inputs: &[WorkloadInput],
+    workflows: &[WorkflowConfig],
 ) -> (Vec<ScheduleConfig>, Option<SchedulerConfig>, String) {
     let ixs = |d: &mut Diagnostics, v: &str, path: &str| -> String {
         ix.apply(v).unwrap_or_else(|e| {
@@ -3749,14 +3797,50 @@ fn resolve_schedules(
                 .iter()
                 .find(|w| w.job.is_some() == job && w.key.as_deref() == key)
         };
-        let target = match (&sch.job, &sch.service) {
-            (Some(j), None) => {
-                for f in [
-                    ("path", sch.path.is_some()),
-                    ("method", sch.method.is_some()),
-                    ("body", sch.body.is_some()),
-                    ("headers", sch.headers.is_some()),
-                ] {
+        let http_fields = [
+            ("path", sch.path.is_some()),
+            ("method", sch.method.is_some()),
+            ("body", sch.body.is_some()),
+            ("headers", sch.headers.is_some()),
+        ];
+        if sch.argument.is_some() && sch.workflow.is_none() {
+            d.error(format!("{path}.argument"), "only for a `workflow` target");
+        }
+        let target = match (&sch.job, &sch.service, &sch.workflow) {
+            (None, None, Some(w)) => {
+                for f in http_fields {
+                    if f.1 {
+                        d.error(format!("{path}.{}", f.0), "only for a `service` target");
+                    }
+                }
+                let argument = sch.argument.as_ref().map(|a| {
+                    let a = ixs(d, a, &format!("{path}.argument"));
+                    if let Err(e) = serde_json::from_str::<serde_json::Value>(&a) {
+                        d.error(
+                            format!("{path}.argument"),
+                            format!("not valid JSON ({e}); for example '{{\"full\": true}}'"),
+                        );
+                    }
+                    a
+                });
+                match workflows.iter().find(|x| &x.key == w) {
+                    Some(wf) => Some(ScheduleTarget::Workflow {
+                        name: w.clone(),
+                        workflow_id: wf.id.clone(),
+                        region: wf.region.clone(),
+                        argument,
+                    }),
+                    None => {
+                        d.error(
+                            format!("{path}.workflow"),
+                            format!("`{w}` is not a workflow of stage `{stage}`"),
+                        );
+                        None
+                    }
+                }
+            }
+            (Some(j), None, None) => {
+                for f in http_fields {
                     if f.1 {
                         d.error(format!("{path}.{}", f.0), "only for a `service` target");
                     }
@@ -3775,7 +3859,7 @@ fn resolve_schedules(
                     }
                 }
             }
-            (None, Some(svc)) => {
+            (None, Some(svc), None) => {
                 let key = (svc != &raw.app).then_some(svc.as_str());
                 if find(key, false).is_none() {
                     d.error(
@@ -3836,7 +3920,10 @@ fn resolve_schedules(
                 })
             }
             _ => {
-                d.error(path.clone(), "set exactly one target: `job` or `service`");
+                d.error(
+                    path.clone(),
+                    "set exactly one target: `job`, `service` or `workflow`",
+                );
                 None
             }
         };

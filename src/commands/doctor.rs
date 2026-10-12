@@ -200,6 +200,10 @@ fn grant_for(permission: &str) -> (&'static str, &'static str) {
         "resourcemanager.projects.createTagBinding" => {
             ("roles/resourcemanager.tagUser", "binding `provider.tags`")
         }
+        p if p.starts_with("workflows.") => (
+            "roles/workflows.editor",
+            "deploying workflows (`workflows`)",
+        ),
         p if p.starts_with("cloudbuild.") => (
             "roles/cloudbuild.builds.editor",
             "building images from source (`source`)",
@@ -355,12 +359,13 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
             Ok::<_, crate::error::Error>((w.name().to_string(), out))
         }
     };
-    let (principal, project, apis, perms, push, per_workload) = tokio::join!(
+    let (principal, project, apis, perms, push, workflows, per_workload) = tokio::join!(
         principal(&session, &token),
         check_project(&session, &d),
         check_apis(&session, &d, &apis),
         check_permissions(&session, &d),
         check_push_account(&session, &d),
+        check_workflows(&session, &resolved),
         futures::future::join_all(selected.iter().map(|w| workload_checks(w))),
     );
     r.principal = principal;
@@ -378,7 +383,7 @@ pub async fn run(ctx: &Context, args: DoctorArgs) -> Result<()> {
                 .unwrap_or_default()
         ),
     );
-    for part in [project, apis, perms, push] {
+    for part in [project, apis, perms, push, workflows] {
         r.checks.extend(part?.checks);
     }
     // Identical checks (a shared account or bucket) are reported once; with
@@ -545,7 +550,6 @@ async fn check_permissions(session: &Session, d: &Deployment) -> Result<Report> 
 
 /// Service accounts exist and the deployer can act as them.
 async fn check_service_accounts(session: &Session, d: &Deployment) -> Result<Report> {
-    let mut r = Report::default();
     // 6. Service accounts (existence + actAs).
     let iam_client = build_client!(Iam, session)?;
     let accounts = accounts(d);
@@ -558,12 +562,129 @@ async fn check_service_accounts(session: &Session, d: &Deployment) -> Result<Rep
     {
         creates.push(b.build_service_account.clone());
     }
-    let creates = &creates;
-    let iam_client = &iam_client;
+    check_accounts(session, &iam_client, &d.project, &accounts, &creates).await
+}
+
+/// Project permissions deploying the stage's workflows needs (none
+/// without workflows).
+pub fn workflow_permissions(r: &crate::config::Resolved) -> Vec<&'static str> {
+    let starts = r
+        .schedules
+        .iter()
+        .any(|s| matches!(s.target, crate::config::ScheduleTarget::Workflow { .. }));
+    if r.workflows.is_empty() && !starts {
+        return Vec::new();
+    }
+    let mut p = vec![
+        "workflows.workflows.get",
+        "workflows.workflows.list",
+        "workflows.workflows.create",
+        "workflows.workflows.update",
+        "workflows.operations.get",
+    ];
+    let project_roles = starts
+        || r.workflows.iter().any(|w| {
+            !w.invokers.is_empty()
+                || w.call_log_level != crate::config::CallLogLevel::None
+                || w.identity
+                    .roles
+                    .iter()
+                    .any(|b| matches!(b.target, RoleTarget::Project { .. }))
+        });
+    if project_roles {
+        p.push("resourcemanager.projects.setIamPolicy");
+    }
+    if r.workflows.iter().any(|w| w.identity.create) {
+        p.push("iam.serviceAccounts.create");
+    }
+    p
+}
+
+/// What deploying the workflows needs: project permissions, and the
+/// accounts they run as (existence, and that the deployer can act as them).
+async fn check_workflows(session: &Session, r: &crate::config::Resolved) -> Result<Report> {
+    let mut out = Report::default();
+    let wanted = workflow_permissions(r);
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    let d = r.first();
+    let projects = build_client!(Projects, session)?;
+    match projects
+        .test_iam_permissions()
+        .set_resource(format!("projects/{}", d.project))
+        .set_permissions(wanted.iter().map(|s| s.to_string()))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let missing: Vec<&str> = wanted
+                .iter()
+                .filter(|p| !resp.permissions.iter().any(|g| g == *p))
+                .copied()
+                .collect();
+            let who = Who::of(session);
+            match missing.is_empty() {
+                true => out.pass(
+                    "workflow permissions",
+                    format!("{} can deploy the stage's workflows", who.name),
+                ),
+                false => out.fail(
+                    "workflow permissions",
+                    format!(
+                        "{} lacks on project {}: {}",
+                        who.name,
+                        d.project,
+                        missing.join(", ")
+                    ),
+                    project_grants(&who, &d.project, &missing),
+                ),
+            }
+        }
+        Err(e) => out.warn(
+            "workflow permissions",
+            format!("cannot test permissions: {}", short_err(&e)),
+            "is cloudresourcemanager.googleapis.com enabled?",
+        ),
+    }
+    let mut accounts: Vec<(&'static str, String, String)> = Vec::new();
+    let mut creates = Vec::new();
+    for w in &r.workflows {
+        if accounts.iter().any(|(_, e, _)| *e == w.service_account) {
+            continue;
+        }
+        accounts.push((
+            "workflow service account",
+            w.service_account.clone(),
+            format!("set `workflows.{}.identity.create: true`", w.key),
+        ));
+        if w.identity.create {
+            creates.push(w.service_account.clone());
+        }
+    }
+    let iam_client = build_client!(Iam, session)?;
+    out.checks.extend(
+        check_accounts(session, &iam_client, &d.project, &accounts, &creates)
+            .await?
+            .checks,
+    );
+    Ok(out)
+}
+
+/// Each account exists (or deploy creates it, `creates`) and the deployer
+/// can act as it.
+async fn check_accounts(
+    session: &Session,
+    iam_client: &Iam,
+    project: &str,
+    accounts: &[(&'static str, String, String)],
+    creates: &[String],
+) -> Result<Report> {
+    let mut r = Report::default();
     let who = Who::of(session);
     let act_as = &format!(
         "{} must be able to act as it once created: grant roles/iam.serviceAccountUser on project {} (covers accounts created later):\n  gcloud projects add-iam-policy-binding {} --member={} --role=roles/iam.serviceAccountUser",
-        who.name, d.project, d.project, who.member
+        who.name, project, project, who.member
     );
     let parts = futures::future::join_all(accounts.iter().map(|(label, email, create)| async move {
         let mut r = Report::default();
@@ -1504,6 +1625,7 @@ mod tests {
             push_service_account: None,
             promote: None,
             scheduler_region: "europe-west1".into(),
+            workflow_region: "europe-west1".into(),
             release: Default::default(),
             domains: Default::default(),
             project_tags: Default::default(),

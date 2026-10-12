@@ -12,7 +12,7 @@
 use crate::build_client_at;
 use crate::config::{
     Artifact, BucketConfig, Deployment, ManagedSecret, Resolved, RoleBinding, RoleTarget,
-    ScheduleConfig, ScheduleTarget,
+    ScheduleConfig, ScheduleTarget, WorkflowConfig, WorkflowTarget,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::bucket;
@@ -113,6 +113,13 @@ pub enum Step {
     /// Delete a Cloud Scheduler job runway created that is no longer configured.
     Unschedule {
         /// Full name `projects/P/locations/R/jobs/ID`.
+        name: String,
+    },
+    /// Create or update a workflow (after the services it calls exist).
+    Workflow(Box<WorkflowConfig>),
+    /// Delete a workflow runway created that is no longer configured.
+    Unworkflow {
+        /// Full name `projects/P/locations/R/workflows/ID`.
         name: String,
     },
     /// Custom domains of the stage: load balancer, certificates, domain
@@ -350,6 +357,10 @@ impl Step {
                     name.rsplit('/').next().unwrap_or(name)
                 )
             }
+            Step::Workflow(w) => format!("workflow {} ({})", w.key, w.source_file),
+            Step::Unworkflow { name } => {
+                format!("delete workflow {}", crate::gcp::workflows::short(name))
+            }
             Step::Domains { want, .. } if want.is_empty() => "remove custom domains".into(),
             Step::Domains { want, .. } => format!(
                 "custom domains ({})",
@@ -384,9 +395,15 @@ impl Step {
             | Step::IapInvoker
             | Step::IapAccess => 1,
             Step::Grant { .. } | Step::GrantMembers { .. } => 2,
-            Step::SecretValues(_) | Step::Schedule(_) | Step::Domains { .. } => 3,
+            Step::SecretValues(_)
+            | Step::Schedule(_)
+            | Step::Workflow(_)
+            | Step::Domains { .. } => 3,
             // After the rollout, once the new revision no longer needs it.
-            Step::Revoke(_) | Step::Untag { .. } | Step::Unschedule { .. } => 4,
+            Step::Revoke(_)
+            | Step::Untag { .. }
+            | Step::Unschedule { .. }
+            | Step::Unworkflow { .. } => 4,
         }
     }
 
@@ -863,9 +880,42 @@ pub fn stack_required_apis(r: &Resolved) -> Vec<String> {
     if !r.schedules.is_empty() {
         apis.push("cloudscheduler.googleapis.com".into());
     }
+    let starts_workflows = r
+        .schedules
+        .iter()
+        .any(|s| matches!(s.target, ScheduleTarget::Workflow { .. }));
+    if !r.workflows.is_empty() || starts_workflows {
+        apis.push("workflows.googleapis.com".into());
+        // Executions (`run-workflow`, schedules) and project-level grants.
+        apis.push("workflowexecutions.googleapis.com".into());
+        apis.push("cloudresourcemanager.googleapis.com".into());
+    }
+    if r.workflows
+        .iter()
+        .any(|w| w.call_log_level != crate::config::CallLogLevel::None)
+    {
+        apis.push("logging.googleapis.com".into());
+    }
+    // Granting a workflow account's roles needs the API of each resource,
+    // as for a service's account (see `required_apis`).
+    for b in r.workflows.iter().flat_map(|w| &w.identity.roles) {
+        apis.extend(role_api(&b.target).map(String::from));
+    }
     apis.sort();
     apis.dedup();
     apis
+}
+
+/// The API holding the IAM policy of a role's resource (beyond Cloud Run).
+fn role_api(t: &RoleTarget) -> Option<&'static str> {
+    match t {
+        RoleTarget::Project { .. } => Some("cloudresourcemanager.googleapis.com"),
+        RoleTarget::Bucket { .. } => Some("storage.googleapis.com"),
+        RoleTarget::Dataset { .. } => Some("bigquery.googleapis.com"),
+        RoleTarget::Secret { .. } => Some("secretmanager.googleapis.com"),
+        RoleTarget::Repository { .. } => Some("artifactregistry.googleapis.com"),
+        RoleTarget::RunService { .. } | RoleTarget::RunJob { .. } => None,
+    }
 }
 
 pub fn stack_api_step(r: &Resolved) -> Option<Step> {
@@ -889,7 +939,13 @@ pub fn stack_pre_steps(r: &Resolved) -> Vec<Step> {
                 display_name: format!("runway scheduler ({} {})", d.app, d.stage),
                 description: sa_marker(&d.app, Some(&d.stage), "scheduler"),
             });
-    for step in r.deployments.iter().flat_map(pre_steps).chain(invoker) {
+    for step in r
+        .deployments
+        .iter()
+        .flat_map(pre_steps)
+        .chain(invoker)
+        .chain(workflow_pre_steps(r))
+    {
         let dup = out.iter().any(|x| match (x, &step) {
             (
                 Step::CreateServiceAccount { email: a, .. },
@@ -911,23 +967,32 @@ pub fn schedule_grant_steps(r: &Resolved) -> Vec<Step> {
     };
     let mut out: Vec<Step> = Vec::new();
     for s in &r.schedules {
-        let name = format!(
-            "{}/{}/{}",
-            d.parent(),
-            match s.target {
-                ScheduleTarget::Job { .. } => "jobs",
-                ScheduleTarget::Service { .. } => "services",
-            },
-            s.target.resource_id()
-        );
-        let target = match s.target {
-            ScheduleTarget::Job { .. } => RoleTarget::RunJob { name },
-            ScheduleTarget::Service { .. } => RoleTarget::RunService { name },
+        let id = s.target.resource_id();
+        let (role, target) = match s.target {
+            ScheduleTarget::Job { .. } => (
+                INVOKER_ROLE,
+                RoleTarget::RunJob {
+                    name: format!("{}/jobs/{id}", d.parent()),
+                },
+            ),
+            ScheduleTarget::Service { .. } => (
+                INVOKER_ROLE,
+                RoleTarget::RunService {
+                    name: format!("{}/services/{id}", d.parent()),
+                },
+            ),
+            // Workflows has no per-workflow access.
+            ScheduleTarget::Workflow { .. } => (
+                WORKFLOWS_INVOKER_ROLE,
+                RoleTarget::Project {
+                    project: d.project.clone(),
+                },
+            ),
         };
         let step = Step::Grant {
             email: sc.service_account.clone(),
             binding: RoleBinding {
-                role: INVOKER_ROLE.into(),
+                role: role.into(),
                 target,
             },
         };
@@ -945,8 +1010,192 @@ pub fn schedule_steps(r: &Resolved) -> Vec<Step> {
     out
 }
 
+/// Role the scheduler and workflow invokers get on the project.
+pub const WORKFLOWS_INVOKER_ROLE: &str = "roles/workflows.invoker";
+/// Roles a workflow's account gets on each job it references: running it
+/// (with overrides), and reading it, its executions and operations while
+/// it waits.
+pub const JOBS_EXECUTOR_ROLE: &str = "roles/run.jobsExecutorWithOverrides";
+pub const RUN_VIEWER_ROLE: &str = "roles/run.viewer";
+/// Role a workflow's account gets on the project to log its calls.
+pub const LOG_WRITER_ROLE: &str = "roles/logging.logWriter";
+
+/// The workflows a deploy of `selected` changes: all of them when it
+/// deploys every service and job, else those that reference one it deploys.
+pub fn workflows_for<'r>(r: &'r Resolved, selected: &[&Deployment]) -> Vec<&'r WorkflowConfig> {
+    let everything = selected.len() == r.deployments.len();
+    r.workflows
+        .iter()
+        .filter(|w| everything || selected.iter().any(|d| w.references(&d.service_id)))
+        .collect()
+}
+
+/// Steps before the rollout: the workflows' accounts, their roles, logging
+/// and invokers (nothing here needs a service or job to exist).
+pub fn workflow_pre_steps(r: &Resolved) -> Vec<Step> {
+    let Some(d) = r.deployments.first() else {
+        return Vec::new();
+    };
+    let project = || RoleTarget::Project {
+        project: d.project.clone(),
+    };
+    let (mut accounts, mut grants, mut invokers) = (Vec::new(), Vec::new(), Vec::new());
+    for w in &r.workflows {
+        if w.identity.create {
+            accounts.push(Step::CreateServiceAccount {
+                email: w.service_account.clone(),
+                display_name: w
+                    .identity
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| format!("runway workflows ({} {})", d.app, d.stage)),
+                description: sa_marker(&d.app, Some(&d.stage), "workflows"),
+            });
+        }
+        let mut bindings = w.identity.roles.clone();
+        if w.call_log_level != crate::config::CallLogLevel::None {
+            bindings.push(RoleBinding {
+                role: LOG_WRITER_ROLE.into(),
+                target: project(),
+            });
+        }
+        for binding in bindings {
+            let step = Step::Grant {
+                email: w.service_account.clone(),
+                binding,
+            };
+            if !grants.contains(&step) {
+                grants.push(step);
+            }
+        }
+        for m in &w.invokers {
+            if !invokers.contains(m) {
+                invokers.push(m.clone());
+            }
+        }
+    }
+    let mut out = accounts;
+    out.extend(grants);
+    if !invokers.is_empty() {
+        out.push(Step::GrantMembers {
+            members: invokers,
+            binding: RoleBinding {
+                role: WORKFLOWS_INVOKER_ROLE.into(),
+                target: project(),
+            },
+        });
+    }
+    out
+}
+
+/// What each workflow's account gets on the services and jobs it
+/// references (once they exist): `run.invoker` on a service, running and
+/// reading a job.
+pub fn workflow_target_grants(r: &Resolved, workflows: &[&WorkflowConfig]) -> Vec<Step> {
+    let Some(d) = r.deployments.first() else {
+        return Vec::new();
+    };
+    let mut out: Vec<Step> = Vec::new();
+    for w in workflows {
+        for t in &w.targets {
+            let bindings = match t {
+                WorkflowTarget::Service { service_id, .. } => vec![RoleBinding {
+                    role: INVOKER_ROLE.into(),
+                    target: RoleTarget::RunService {
+                        name: format!("{}/services/{service_id}", d.parent()),
+                    },
+                }],
+                WorkflowTarget::Job { job_id, .. } => [JOBS_EXECUTOR_ROLE, RUN_VIEWER_ROLE]
+                    .map(|role| RoleBinding {
+                        role: role.into(),
+                        target: RoleTarget::RunJob {
+                            name: format!("{}/jobs/{job_id}", d.parent()),
+                        },
+                    })
+                    .to_vec(),
+            };
+            for binding in bindings {
+                let step = Step::Grant {
+                    email: w.service_account.clone(),
+                    binding,
+                };
+                if !out.contains(&step) {
+                    out.push(step);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// After the services and jobs exist, for a deploy of `selected`: the
+/// workflows' grants and the workflows, then the schedules' grants and the
+/// schedules (of the targets deployed).
+pub fn post_rollout_steps(r: &Resolved, selected: &[&Deployment]) -> Vec<Step> {
+    let workflows = workflows_for(r, selected);
+    let deployed = |id: &str| {
+        selected.iter().any(|d| d.service_id == id) || workflows.iter().any(|w| w.id == id)
+    };
+    let mut out = workflow_target_grants(r, &workflows);
+    out.extend(
+        workflows
+            .iter()
+            .map(|w| Step::Workflow(Box::new((*w).clone()))),
+    );
+    let schedules: Vec<&ScheduleConfig> = r
+        .schedules
+        .iter()
+        .filter(|s| deployed(s.target.resource_id()))
+        .collect();
+    out.extend(schedule_grant_steps(r).into_iter().filter(|g| {
+        // A grant some schedule of this deploy needs.
+        let Step::Grant { binding, .. } = g else {
+            return false;
+        };
+        schedules
+            .iter()
+            .any(|s| match (&s.target, &binding.target) {
+                (ScheduleTarget::Workflow { .. }, RoleTarget::Project { .. }) => true,
+                (_, RoleTarget::RunJob { name } | RoleTarget::RunService { name }) => {
+                    name.rsplit('/').next() == Some(s.target.resource_id())
+                }
+                _ => false,
+            })
+    }));
+    out.extend(schedules.into_iter().cloned().map(Step::Schedule));
+    out
+}
+
+/// The workflow grant steps as the managed grants runway records: a role of
+/// a workflow's account is `runtime`, as [`Provisioner::apply`] records it.
+fn grants_of(steps: Vec<Step>) -> Vec<ManagedGrant> {
+    let mut out = Vec::new();
+    for s in steps {
+        match s {
+            Step::Grant { email, binding } => out.push(ManagedGrant {
+                runtime: true,
+                member: format!("serviceAccount:{email}"),
+                role: binding.role,
+                target: Some(binding.target),
+                service: None,
+            }),
+            Step::GrantMembers { members, binding } => {
+                out.extend(members.into_iter().map(|member| ManagedGrant {
+                    member,
+                    role: binding.role.clone(),
+                    target: Some(binding.target.clone()),
+                    runtime: false,
+                    service: None,
+                }));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// What runway records and revokes for the whole stage: every workload's
-/// managed grants and the scheduler invoker's.
+/// managed grants, the scheduler invoker's and the workflows'.
 pub fn stack_managed_grants(r: &Resolved) -> Vec<ManagedGrant> {
     let mut out: Vec<ManagedGrant> = Vec::new();
     let invoker = schedule_grant_steps(r).into_iter().filter_map(|s| match s {
@@ -959,7 +1208,17 @@ pub fn stack_managed_grants(r: &Resolved) -> Vec<ManagedGrant> {
         }),
         _ => None,
     });
-    for g in r.deployments.iter().flat_map(managed_grants).chain(invoker) {
+    let all: Vec<&WorkflowConfig> = r.workflows.iter().collect();
+    let mut workflow_steps = workflow_pre_steps(r);
+    workflow_steps.extend(workflow_target_grants(r, &all));
+    let workflows = grants_of(workflow_steps);
+    for g in r
+        .deployments
+        .iter()
+        .flat_map(managed_grants)
+        .chain(invoker)
+        .chain(workflows)
+    {
         if !out.contains(&g) {
             out.push(g);
         }
@@ -1134,6 +1393,7 @@ struct Clients {
     artifact: Option<ArtifactRegistry>,
     jobs: Option<google_cloud_run_v2::client::Jobs>,
     scheduler: Option<google_cloud_scheduler_v1::client::CloudScheduler>,
+    workflows: Option<google_cloud_workflows_v1::client::Workflows>,
 }
 
 /// Optional API endpoint overrides (tests, private endpoints).
@@ -1153,6 +1413,7 @@ pub struct Endpoints {
     /// Cloud Run (jobs; services use the client given to the provisioner).
     pub run: Option<String>,
     pub scheduler: Option<String>,
+    pub workflows: Option<String>,
     pub compute: Option<String>,
     pub certificate_manager: Option<String>,
     pub dns: Option<String>,
@@ -1298,6 +1559,11 @@ impl<'a> Provisioner<'a> {
             google_cloud_scheduler_v1::client::CloudScheduler,
             session,
             ep.scheduler.clone()
+        )?);
+        c.workflows = Some(build_client_at!(
+            google_cloud_workflows_v1::client::Workflows,
+            session,
+            ep.workflows.clone()
         )?);
         Ok(Self {
             d,
@@ -2025,6 +2291,36 @@ impl<'a> Provisioner<'a> {
                     None => (StepState::InSync, "already deleted".into()),
                 }
             }
+            Step::Workflow(w) => {
+                let (live, desired) = self.workflow_request(w).await?;
+                match (live, desired) {
+                    (_, Err(service)) => (
+                        StepState::Pending,
+                        format!("after {service} is created (its URL goes into the workflow)"),
+                    ),
+                    (None, Ok(_)) => (StepState::Pending, "create".into()),
+                    (Some(live), Ok(want)) => {
+                        let changes = crate::plan::diff(
+                            &crate::gcp::workflows::flat(&live),
+                            &crate::gcp::workflows::flat(&want),
+                        );
+                        if changes.is_empty() {
+                            (StepState::InSync, "up to date".into())
+                        } else {
+                            (StepState::Pending, change_summary(&changes))
+                        }
+                    }
+                }
+            }
+            Step::Unworkflow { name } => {
+                match crate::gcp::workflows::get(&self.workflows_client()?, name).await? {
+                    Some(_) => (
+                        StepState::PendingRemoval,
+                        "not in runway.yaml: delete".into(),
+                    ),
+                    None => (StepState::InSync, "already deleted".into()),
+                }
+            }
             Step::Domains {
                 want,
                 previous,
@@ -2114,7 +2410,7 @@ impl<'a> Provisioner<'a> {
                     Err(e) => return Err(api_error(e, &format!("reading service {service_id}"))),
                 }
             }
-            ScheduleTarget::Job { .. } => None,
+            ScheduleTarget::Job { .. } | ScheduleTarget::Workflow { .. } => None,
         };
         let Some(uri) =
             crate::gcp::scheduler::target_uri(sc, &d.project, &d.region, service_url.as_deref())
@@ -2156,6 +2452,106 @@ impl<'a> Provisioner<'a> {
                 .map(|j| Step::Unschedule { name: j.name })
                 .collect(),
         )
+    }
+
+    pub fn workflows_client(&self) -> Result<google_cloud_workflows_v1::client::Workflows> {
+        missing(&self.clients.workflows, "Workflows")
+    }
+
+    /// The live workflow and what runway would send; `Err(service ID)` while
+    /// a service it needs the URL of does not exist. Fails on a workflow
+    /// runway does not own.
+    async fn workflow_request(
+        &self,
+        w: &WorkflowConfig,
+    ) -> Result<(
+        Option<google_cloud_workflows_v1::model::Workflow>,
+        std::result::Result<google_cloud_workflows_v1::model::Workflow, String>,
+    )> {
+        let d = self.d;
+        let name = w.name(&d.project);
+        let live = crate::gcp::workflows::get(&self.workflows_client()?, &name).await?;
+        if let Some(l) = &live
+            && !crate::gcp::workflows::owned(l, &d.app, &d.stage)
+        {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                format!(
+                    "workflow {} exists and was not created by runway for this app and stage",
+                    w.id
+                ),
+            )
+            .permanent()
+            .hint("rename the workflow in runway.yaml, or delete the existing one"));
+        }
+        let mut urls = std::collections::BTreeMap::new();
+        for id in w.service_urls() {
+            let svc_name = format!("{}/services/{id}", d.parent());
+            match self.run.get_service().set_name(&svc_name).send().await {
+                Ok(svc) if !svc.uri.is_empty() => {
+                    urls.insert(id.to_string(), svc.uri);
+                }
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(api_error(e, &format!("reading service {id}"))),
+            }
+        }
+        let desired = crate::gcp::workflows::render(w, &urls).map(|(source, env)| {
+            crate::gcp::workflows::desired(w, &d.project, &d.app, &d.stage, source, env)
+        });
+        Ok((live, desired))
+    }
+
+    /// The regions runway.yaml names for workflows: the default one and every
+    /// configured workflow's (the others are found by listing them).
+    fn workflow_regions(&self) -> Vec<String> {
+        let mut regions = vec![self.d.workflow_region.clone()];
+        for w in self
+            .stack
+            .map(|r| r.workflows.as_slice())
+            .unwrap_or_default()
+        {
+            if !regions.contains(&w.region) {
+                regions.push(w.region.clone());
+            }
+        }
+        regions
+    }
+
+    /// Workflows runway created for this stage that are not configured, in
+    /// any region (one removed from runway.yaml, or moved to another region).
+    pub async fn orphan_workflows(&self) -> Result<Vec<Step>> {
+        let d = self.d;
+        let wanted: Vec<String> = self
+            .stack
+            .map(|r| r.workflows.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|w| w.name(&d.project))
+            .collect();
+        let client = self.workflows_client()?;
+        let owned = crate::gcp::workflows::list_owned(
+            &client,
+            &d.project,
+            &self.workflow_regions(),
+            &d.app,
+            &d.stage,
+        )
+        .await?;
+        Ok(owned
+            .into_iter()
+            .filter(|w| !wanted.contains(&w.name))
+            .map(|w| Step::Unworkflow { name: w.name })
+            .collect())
+    }
+
+    /// Every workflow of the project, in any region, whoever created it.
+    pub async fn live_workflows(&self) -> Result<Vec<google_cloud_workflows_v1::model::Workflow>> {
+        let client = self.workflows_client()?;
+        let regions =
+            crate::gcp::workflows::regions(&client, &self.d.project, &self.workflow_regions())
+                .await?;
+        crate::gcp::workflows::list_all(&client, &self.d.project, &regions).await
     }
 
     // ---------- applies (idempotent) ----------
@@ -2407,12 +2803,60 @@ impl<'a> Provisioner<'a> {
                     false => (StepOutcome::Unchanged, "already deleted".into()),
                 }
             }
+            Step::Workflow(w) => self.ensure_workflow(w).await?,
+            Step::Unworkflow { name } => {
+                let (app, stage) = (&self.d.app, &self.d.stage);
+                let client = self.workflows_client()?;
+                match crate::gcp::workflows::delete_owned(&client, name, app, stage).await? {
+                    true => (StepOutcome::Changed, "deleted".into()),
+                    false => (StepOutcome::Unchanged, "already deleted".into()),
+                }
+            }
         };
         Ok(StepResult {
             step: name,
             outcome,
             detail,
         })
+    }
+
+    async fn ensure_workflow(&self, w: &WorkflowConfig) -> Result<(StepOutcome, String)> {
+        let (live, desired) = self.workflow_request(w).await?;
+        let desired = desired.map_err(|service| {
+            Error::new(
+                ErrorKind::Deploy,
+                format!("workflow {}: service {service} has no URL yet", w.key),
+            )
+            .permanent()
+            .hint(format!(
+                "deploy the service first (runway deploy --stage {}, without --only or with the service)",
+                self.d.stage
+            ))
+        })?;
+        crate::gcp::workflows::check_rendered(w, &desired)?;
+        let want = crate::gcp::workflows::flat(&desired);
+        if let Some(l) = &live
+            && crate::plan::diff(&crate::gcp::workflows::flat(l), &want).is_empty()
+        {
+            return Ok((StepOutcome::Unchanged, "up to date".into()));
+        }
+        let parent = crate::gcp::workflows::parent(&self.d.project, &w.region);
+        let deployed = crate::gcp::workflows::apply(
+            &self.workflows_client()?,
+            &parent,
+            &w.id,
+            desired,
+            live.is_some(),
+        )
+        .await?;
+        let what = if live.is_some() { "updated" } else { "created" };
+        Ok((
+            StepOutcome::Changed,
+            match deployed.revision_id.as_str() {
+                "" => what.to_string(),
+                rev => format!("{what} (revision {rev})"),
+            },
+        ))
     }
 
     async fn ensure_service_account(
@@ -2495,6 +2939,12 @@ impl<'a> Provisioner<'a> {
             .stack
             .and_then(|r| r.scheduler.as_ref())
             .is_some_and(|sc| sc.service_account == email);
+        // A workflow's account is recorded like a runtime account: its roles
+        // are revoked only if runway created it for this stage.
+        let workflow = self
+            .stack
+            .is_some_and(|r| r.workflows.iter().any(|w| w.service_account == email));
+        let runtime = runtime || workflow;
         let managed = runtime || invoker;
         let grant = |m: &str| ManagedGrant {
             member: m.into(),
@@ -3186,12 +3636,22 @@ impl<'a> Provisioner<'a> {
         Ok(out)
     }
 
-    /// Roles of the runtime accounts runway created for this stage.
+    /// Roles of the runtime and workflow accounts runway created for this
+    /// stage.
     async fn unlisted_roles(&self, recorded: &[ManagedGrant]) -> Result<Vec<Step>> {
         let mut accounts: Vec<&str> = Vec::new();
-        for w in self.workloads() {
-            if !accounts.contains(&w.service.service_account.as_str()) {
-                accounts.push(&w.service.service_account);
+        let workflows = self
+            .stack
+            .map(|r| r.workflows.as_slice())
+            .unwrap_or_default();
+        let emails = self
+            .workloads()
+            .into_iter()
+            .map(|w| w.service.service_account.as_str())
+            .chain(workflows.iter().map(|w| w.service_account.as_str()));
+        for email in emails {
+            if !accounts.contains(&email) {
+                accounts.push(email);
             }
         }
         let mut out = Vec::new();
@@ -3201,11 +3661,20 @@ impl<'a> Provisioner<'a> {
         Ok(out)
     }
 
+    /// Whether runway created the account for this stage, as a runtime or
+    /// workflow account (whose roles are then runway's to remove).
+    fn owns_account(&self, description: &str) -> bool {
+        let d = self.d;
+        ["runtime", "workflows"]
+            .iter()
+            .any(|role| has_sa_marker(description, &d.app, Some(&d.stage), role))
+    }
+
     async fn unlisted_roles_of(&self, email: &str, recorded: &[ManagedGrant]) -> Result<Vec<Step>> {
         let d = self.d;
         let mut out = Vec::new();
         let owned = match self.service_account_description(email).await? {
-            Some(desc) => has_sa_marker(&desc, &d.app, Some(&d.stage), "runtime"),
+            Some(desc) => self.owns_account(&desc),
             None => false,
         };
         if owned {
@@ -3409,7 +3878,7 @@ impl<'a> Provisioner<'a> {
             return Ok(None);
         };
         Ok(match self.service_account_description(email).await? {
-            Some(desc) if has_sa_marker(&desc, &self.d.app, Some(&self.d.stage), "runtime") => None,
+            Some(desc) if self.owns_account(&desc) => None,
             Some(_) => Some(format!(
                 "kept: {email} was not created by runway for this service"
             )),
@@ -4422,6 +4891,216 @@ stages: { prod: {} }
         assert_eq!(
             iap_service_agent("123"),
             "service-123@gcp-sa-iap.iam.gserviceaccount.com"
+        );
+    }
+
+    /// [`STACK`] plus two workflows: `etl` calls `web` and runs `report`,
+    /// logs and has invokers; `ping` calls nothing; a schedule starts `etl`.
+    fn workflow_stack() -> (tempfile::TempDir, crate::config::Resolved) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(
+            dir.path().join("etl.yaml"),
+            "main:\n  steps:\n    - a:\n        return: 1\n",
+        )
+        .unwrap();
+        let yaml = STACK
+            .replace(
+                "  warm: {schedule: \"*/5 * * * *\", service: web}\n",
+                "  warm: {schedule: \"*/5 * * * *\", service: web}\n  start-etl: {schedule: \"0 4 * * *\", workflow: etl}\n",
+            )
+            .replace(
+                "stages: { prod: {} }",
+                r#"workflows:
+  etl:
+    source: etl.yaml
+    env: {WEB: "${services.web.url}", REPORT: "${jobs.report.name}"}
+    call_log_level: errors-only
+    invokers: [group:data@example.com]
+    identity: {roles: [{role: roles/bigquery.jobUser, project: my-gcp-project}]}
+  ping:
+    source: etl.yaml
+stages: { prod: {} }"#,
+            );
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let r = crate::config::load_and_resolve(&p, "prod", &Default::default())
+            .unwrap_or_else(|e| panic!("{e:?}"))
+            .1;
+        (dir, r)
+    }
+
+    const WF: &str = "shop-prod-wf@my-gcp-project.iam.gserviceaccount.com";
+
+    #[test]
+    fn workflows_get_an_account_its_roles_and_their_invokers_before_the_rollout() {
+        let (_dir, r) = workflow_stack();
+        let steps = stack_pre_steps(&r);
+        let created: Vec<&Step> = steps
+            .iter()
+            .filter(|s| matches!(s, Step::CreateServiceAccount { email, .. } if email == WF))
+            .collect();
+        assert_eq!(created.len(), 1, "one account for the stage's workflows");
+        assert!(
+            matches!(created[0], Step::CreateServiceAccount { description, .. } if has_sa_marker(description, "shop", Some("prod"), "workflows"))
+        );
+        let to_wf: Vec<String> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Grant { email, binding } if email == WF => {
+                    Some(format!("{} on {}", binding.role, binding.target))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            to_wf,
+            [
+                "roles/bigquery.jobUser on project my-gcp-project",
+                "roles/logging.logWriter on project my-gcp-project"
+            ]
+        );
+        assert!(
+            steps.iter().any(|s| matches!(s,
+            Step::GrantMembers { members, binding }
+                if members == &["group:data@example.com".to_string()]
+                    && binding.role == WORKFLOWS_INVOKER_ROLE
+                    && binding.target == RoleTarget::Project { project: "my-gcp-project".into() }))
+        );
+        let apis = stack_required_apis(&r);
+        for a in [
+            "workflows.googleapis.com",
+            "workflowexecutions.googleapis.com",
+        ] {
+            assert!(apis.contains(&a.to_string()), "{a}");
+        }
+    }
+
+    #[test]
+    fn after_the_rollout_workflows_get_access_to_what_they_call_then_deploy() {
+        let (_dir, r) = workflow_stack();
+        let all: Vec<&Deployment> = r.deployments.iter().collect();
+        let steps = post_rollout_steps(&r, &all);
+        let grants: Vec<String> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Grant { email, binding } => Some(format!(
+                    "{} {} on {}",
+                    email.split('@').next().unwrap(),
+                    binding.role,
+                    binding.target
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants,
+            [
+                "shop-prod-wf roles/run.jobsExecutorWithOverrides on job shop-report-prod",
+                "shop-prod-wf roles/run.viewer on job shop-report-prod",
+                "shop-prod-wf roles/run.invoker on service shop-web-prod",
+                "shop-prod-sched roles/run.invoker on job shop-report-prod",
+                "shop-prod-sched roles/workflows.invoker on project my-gcp-project",
+                "shop-prod-sched roles/run.invoker on service shop-web-prod",
+            ]
+        );
+        let workflows: Vec<&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Workflow(w) => Some(w.key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(workflows, ["etl", "ping"]);
+        // Grants come in an earlier wave than the workflows they serve.
+        let w = waves(&steps, r.first());
+        assert!(
+            w[0].iter()
+                .flatten()
+                .all(|(_, s)| matches!(s, Step::Grant { .. }))
+        );
+        // Recorded: removing a workflow revokes what runway granted for it.
+        // The workflow account's roles are recorded like a runtime account's
+        // (revoked only if runway created it); invokers' are not.
+        let managed = stack_managed_grants(&r);
+        let wf = |role: &str| {
+            managed
+                .iter()
+                .find(|g| g.role == role && g.member == format!("serviceAccount:{WF}"))
+                .unwrap_or_else(|| panic!("{role}"))
+                .runtime
+        };
+        assert!(wf(INVOKER_ROLE) && wf(JOBS_EXECUTOR_ROLE) && wf(LOG_WRITER_ROLE));
+        assert!(
+            managed
+                .iter()
+                .any(|g| g.member == "group:data@example.com" && !g.runtime)
+        );
+        assert!(managed.iter().any(|g| g.role == WORKFLOWS_INVOKER_ROLE
+            && g.member.contains("-sched@")
+            && !g.runtime));
+    }
+
+    #[test]
+    fn workflow_roles_enable_the_apis_of_their_resources() {
+        let (_dir, mut r) = workflow_stack();
+        let has =
+            |r: &crate::config::Resolved, a: &str| stack_required_apis(r).contains(&a.to_string());
+        // STACK's services already need storage; check the others.
+        assert!(!has(&r, "secretmanager.googleapis.com"));
+        r.workflows[0].identity.roles.extend([
+            RoleBinding {
+                role: "roles/secretmanager.secretAccessor".into(),
+                target: RoleTarget::Secret {
+                    name: "projects/my-gcp-project/secrets/token".into(),
+                },
+            },
+            RoleBinding {
+                role: "roles/bigquery.dataViewer".into(),
+                target: RoleTarget::Dataset {
+                    project: "my-gcp-project".into(),
+                    dataset: "sales".into(),
+                },
+            },
+        ]);
+        for a in [
+            "secretmanager.googleapis.com",
+            "bigquery.googleapis.com",
+            "cloudresourcemanager.googleapis.com",
+        ] {
+            assert!(has(&r, a), "{a}");
+        }
+        assert_eq!(
+            role_api(&RoleTarget::Bucket { bucket: "b".into() }),
+            Some("storage.googleapis.com")
+        );
+    }
+
+    #[test]
+    fn only_deploys_the_workflows_calling_what_it_selects() {
+        let (_dir, r) = workflow_stack();
+        let web: Vec<&Deployment> = r.deployments.iter().filter(|d| d.name() == "web").collect();
+        let keys = |sel: &[&Deployment]| -> Vec<String> {
+            post_rollout_steps(&r, sel)
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Workflow(w) => Some(w.key.clone()),
+                    Step::Schedule(s) => Some(format!("schedule {}", s.key)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // `ping` calls nothing: only a deploy of everything changes it. The
+        // schedule starting `etl` comes with it.
+        assert_eq!(keys(&web), ["etl", "schedule start-etl", "schedule warm"]);
+        let report: Vec<&Deployment> = r
+            .deployments
+            .iter()
+            .filter(|d| d.name() == "report")
+            .collect();
+        assert_eq!(
+            keys(&report),
+            ["etl", "schedule nightly", "schedule start-etl"]
         );
     }
 }

@@ -473,6 +473,35 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
             .await?
         }
     };
+    // Workflows: all of them with the whole stage, those runway.yaml no
+    // longer lists with --orphans. Likewise, no call without any.
+    let (workflows, mut workflow_accounts) =
+        match !resolved.workflows.is_empty() || args.orphans || whole {
+            false => (Vec::new(), Vec::new()),
+            true => plan_workflows(&resolved, &prov, &targets, whole, args.orphans, &mut items)
+                .await?,
+        };
+    // An account a remaining workflow runs as (in any region, runway's or
+    // not) is kept, as one a remaining service or job runs as.
+    if plans.iter().any(|(_, _, delete_sa)| *delete_sa) || !workflow_accounts.is_empty() {
+        let live = remaining_workflows(&prov, &workflows).await?;
+        // The workflows' account may also be a service's or job's.
+        let mut workload_users: Vec<(String, Vec<String>)> = Vec::new();
+        for (email, _) in &workflow_accounts {
+            let u = services_using(&run_client, &jobs_client, first, email, &removing).await?;
+            workload_users.push((email.clone(), u));
+        }
+        let users = |email: &str| -> Vec<String> {
+            let mut out: Vec<String> = workload_users
+                .iter()
+                .filter(|(e, _)| e == email)
+                .flat_map(|(_, u)| u.clone())
+                .collect();
+            out.extend(workflow_users(live.as_deref(), email));
+            out
+        };
+        keep_accounts_used_by_workflows(&mut plans, &mut workflow_accounts, &mut items, &users);
+    }
     // Custom domains go with the whole stage, first: the load balancer
     // routes to the services.
     let domains_previous = match whole {
@@ -559,9 +588,52 @@ pub async fn run(ctx: &Context, args: UndeployArgs) -> Result<()> {
         .await?;
         mark(&mut items, &format!("schedule {id}"), o);
     }
+    // Then the workflows they start, and the workflows' accounts.
+    let client = match workflows.is_empty() && workflow_accounts.is_empty() {
+        true => None,
+        false => Some(prov.workflows_client()?),
+    };
+    for name in &workflows {
+        let id = crate::gcp::workflows::short(name).to_string();
+        p.step(format!("Deleting workflow {id}"));
+        let client = client.as_ref().expect("built when there are workflows");
+        let o = with_retry(&retry, p, "delete workflow", |_| async {
+            prov.check_lease()?;
+            Ok(
+                match crate::gcp::workflows::delete_owned(client, name, &first.app, &first.stage)
+                    .await?
+                {
+                    true => StepOutcome::Changed,
+                    false => StepOutcome::Unchanged,
+                },
+            )
+        })
+        .await?;
+        mark(&mut items, &format!("workflow {id}"), o);
+    }
+    for (email, roles) in &workflow_accounts {
+        for r in roles {
+            let res = format!("grant {} on {} to {}", r.role, r.target, email);
+            let o = with_retry(&retry, p, &res, |_| prov.revoke_grant(email, r)).await?;
+            mark(&mut items, &res, o);
+        }
+        p.step(format!("Deleting service account {email}"));
+        let o = with_retry(&retry, p, "delete service account", |_| async {
+            prov.check_lease()?;
+            prov.delete_service_account(email).await
+        })
+        .await?;
+        mark(&mut items, &format!("service account {email}"), o);
+    }
     // The scheduler's account (nothing calls the targets any more), before
-    // the workloads: the one holding the lease goes last.
+    // the workloads: the one holding the lease goes last. Its role on the
+    // project (to start workflows) goes first.
     if let Some(email) = delete_invoker {
+        if let Some(b) = scheduler_project_role(&resolved) {
+            let res = format!("grant {} on {} to {}", b.role, b.target, email);
+            let o = with_retry(&retry, p, &res, |_| prov.revoke_grant(&email, &b)).await?;
+            mark(&mut items, &res, o);
+        }
         p.step(format!("Deleting service account {email}"));
         let o = with_retry(&retry, p, "delete service account", |_| async {
             prov.check_lease()?;
@@ -887,6 +959,270 @@ pub async fn plan_schedules(
         }
     }
     Ok((names, invoker))
+}
+
+/// The live workflows that stay after this undeploy (`deleting`: full names
+/// of those it deletes), in any region and whoever created them; `None`
+/// when they cannot be listed. A workflow runway.yaml no longer names may
+/// still run as an account, so `None` keeps every account (see
+/// [`workflow_users`]), whatever runway.yaml lists.
+pub async fn remaining_workflows(
+    prov: &Provisioner<'_>,
+    deleting: &[String],
+) -> Result<Option<Vec<google_cloud_workflows_v1::model::Workflow>>> {
+    match prov.live_workflows().await {
+        Ok(l) => Ok(Some(
+            l.into_iter()
+                .filter(|w| !deleting.contains(&w.name))
+                .collect(),
+        )),
+        Err(e) if e.kind == ErrorKind::Prerequisite => {
+            tracing::debug!(error = %e.message, "workflows not listed");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The remaining workflows running as `email`, or why runway cannot tell.
+pub fn workflow_users(
+    remaining: Option<&[google_cloud_workflows_v1::model::Workflow]>,
+    email: &str,
+) -> Vec<String> {
+    match remaining {
+        None => vec!["workflows runway cannot list (workflows.workflows.list denied)".into()],
+        Some(l) => l
+            .iter()
+            .filter(|w| crate::gcp::workflows::runs_as(w, email))
+            .map(|w| format!("workflow {}", crate::gcp::workflows::short(&w.name)))
+            .collect(),
+    }
+}
+
+/// Keeps the accounts a remaining workflow runs as (`users` names them): a
+/// workflow kept by `--only` may run as the runtime account of a service
+/// being removed. Their plan entries say so, and their grants stay.
+pub fn keep_accounts_used_by_workflows(
+    plans: &mut [(&Deployment, bool, bool)],
+    workflow_accounts: &mut Vec<(String, Vec<crate::config::RoleBinding>)>,
+    items: &mut [Item],
+    users: &dyn Fn(&str) -> Vec<String>,
+) {
+    let mut kept: Vec<(String, Vec<String>)> = Vec::new();
+    let candidates = plans
+        .iter()
+        .filter(|(_, _, delete_sa)| *delete_sa)
+        .map(|(d, _, _)| d.service.service_account.clone())
+        .chain(workflow_accounts.iter().map(|(e, _)| e.clone()));
+    for email in candidates {
+        if kept.iter().any(|(e, _)| *e == email) {
+            continue;
+        }
+        let u = users(&email);
+        if !u.is_empty() {
+            kept.push((email, u));
+        }
+    }
+    for (email, users) in &kept {
+        for (d, _, delete_sa) in plans.iter_mut() {
+            if &d.service.service_account == email {
+                *delete_sa = false;
+            }
+        }
+        workflow_accounts.retain(|(e, _)| e != email);
+        let account = format!("service account {email}");
+        let grant_suffix = format!(" to {email}");
+        for i in items.iter_mut() {
+            if i.resource == account {
+                i.action = Action::Keep;
+                i.reason = format!("still used by {}", users.join(", "));
+            } else if i.resource.starts_with("grant ")
+                && i.resource.ends_with(&grant_suffix)
+                && i.action == Action::Revoke
+            {
+                i.action = Action::Keep;
+                i.reason =
+                    "the service account is kept; runway cannot tell whether the grant predates it"
+                        .into();
+            }
+        }
+    }
+}
+
+/// The scheduler account's role on the project, when a schedule starts a
+/// workflow.
+fn scheduler_project_role(resolved: &Resolved) -> Option<crate::config::RoleBinding> {
+    resolved
+        .schedules
+        .iter()
+        .any(|s| matches!(s.target, crate::config::ScheduleTarget::Workflow { .. }))
+        .then(|| crate::config::RoleBinding {
+            role: crate::provision::WORKFLOWS_INVOKER_ROLE.into(),
+            target: crate::config::RoleTarget::Project {
+                project: resolved.first().project.clone(),
+            },
+        })
+}
+
+/// Workflows to delete (full names), and the workflow accounts to delete
+/// with the project roles to revoke first: everything runway created for
+/// the stage when `whole`, those runway.yaml no longer lists with
+/// `orphans_only`. With `--only`, workflows calling what is removed stay.
+pub async fn plan_workflows(
+    resolved: &Resolved,
+    prov: &Provisioner<'_>,
+    targets: &[&Deployment],
+    whole: bool,
+    orphans_only: bool,
+    items: &mut Vec<Item>,
+) -> Result<(Vec<String>, Vec<(String, Vec<crate::config::RoleBinding>)>)> {
+    let d = resolved.first();
+    if !whole && !orphans_only {
+        for w in &resolved.workflows {
+            if targets.iter().any(|t| w.references(&t.service_id)) {
+                items.push(item(
+                    Action::Keep,
+                    format!("workflow {}", w.id),
+                    "it references what is removed; remove it from runway.yaml, then deploy the stage",
+                ));
+            }
+        }
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let names: Vec<String> = match prov.orphan_workflows().await {
+        // A stage that never had workflows (no permission to list them).
+        Err(e) if resolved.workflows.is_empty() && e.kind == ErrorKind::Prerequisite => Vec::new(),
+        Err(e) => return Err(e),
+        Ok(left) => {
+            let mut names: Vec<String> = left
+                .into_iter()
+                .filter_map(|s| match s {
+                    crate::provision::Step::Unworkflow { name } => Some(name),
+                    _ => None,
+                })
+                .collect();
+            if !orphans_only {
+                let client = prov.workflows_client()?;
+                for w in &resolved.workflows {
+                    let name = w.name(&d.project);
+                    match crate::gcp::workflows::get(&client, &name).await? {
+                        Some(live) if crate::gcp::workflows::owned(&live, &d.app, &d.stage) => {
+                            names.push(name)
+                        }
+                        Some(_) => items.push(item(
+                            Action::Keep,
+                            format!("workflow {}", w.id),
+                            "not created by runway for this app and stage (labels differ)",
+                        )),
+                        None => items.push(item(
+                            Action::Absent,
+                            format!("workflow {}", w.id),
+                            "does not exist",
+                        )),
+                    }
+                }
+            }
+            names
+        }
+    };
+    for n in &names {
+        items.push(item(
+            Action::Delete,
+            format!("workflow {}", crate::gcp::workflows::short(n)),
+            if orphans_only {
+                "created by runway (labels match); runway.yaml no longer lists it"
+            } else {
+                "created by runway (labels match); its executions go with it"
+            },
+        ));
+    }
+    let mut accounts: Vec<(String, Vec<crate::config::RoleBinding>)> = Vec::new();
+    if whole && !orphans_only {
+        let workload_accounts: Vec<&str> = resolved
+            .deployments
+            .iter()
+            .map(|w| w.service.service_account.as_str())
+            .collect();
+        for w in resolved.workflows.iter().filter(|w| w.identity.create) {
+            let email = &w.service_account;
+            if workload_accounts.contains(&email.as_str()) {
+                continue;
+            }
+            // Every role a workflow running as it was given (on the project
+            // and elsewhere; those on removed services and jobs go with them).
+            let mut roles: Vec<crate::config::RoleBinding> = Vec::new();
+            for other in resolved
+                .workflows
+                .iter()
+                .filter(|o| &o.service_account == email)
+            {
+                for b in &other.identity.roles {
+                    if !roles.contains(b) {
+                        roles.push(b.clone());
+                    }
+                }
+                let log = crate::config::RoleBinding {
+                    role: crate::provision::LOG_WRITER_ROLE.into(),
+                    target: crate::config::RoleTarget::Project {
+                        project: d.project.clone(),
+                    },
+                };
+                if other.call_log_level != crate::config::CallLogLevel::None
+                    && !roles.contains(&log)
+                {
+                    roles.push(log);
+                }
+            }
+            if accounts.iter().any(|(e, _)| e == email) {
+                continue;
+            }
+            match prov.service_account_description(email).await? {
+                Some(desc) if has_sa_marker(&desc, &d.app, Some(&d.stage), "workflows") => {
+                    items.push(item(
+                        Action::Delete,
+                        format!("service account {email}"),
+                        "the workflows' account, created by runway for this app and stage",
+                    ));
+                    for r in &roles {
+                        items.push(item(
+                            Action::Revoke,
+                            format!("grant {} on {} to {email}", r.role, r.target),
+                            "the service account is deleted",
+                        ));
+                    }
+                    accounts.push((email.clone(), roles));
+                }
+                Some(_) => items.push(item(
+                    Action::Keep,
+                    format!("service account {email}"),
+                    "not created by runway for this app and stage",
+                )),
+                None => {}
+            }
+        }
+        let invokers: Vec<&String> = resolved
+            .workflows
+            .iter()
+            .flat_map(|w| &w.invokers)
+            .collect();
+        if !invokers.is_empty() {
+            items.push(item(
+                Action::Keep,
+                format!(
+                    "{} on project {} for {}",
+                    crate::provision::WORKFLOWS_INVOKER_ROLE,
+                    d.project,
+                    invokers
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "a project-wide role other workflows of the project may rely on",
+            ));
+        }
+    }
+    Ok((names, accounts))
 }
 
 /// Whether an account is deleted is decided per account, not per workload:

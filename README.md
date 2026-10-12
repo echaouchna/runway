@@ -7,8 +7,8 @@
 
 **Cloud Run deployments from one file and one command.**
 
-Services, jobs, schedules, builds, identity, secrets, traffic and releases
-for Google Cloud Run, described in a `runway.yaml` next to your code.
+Services, jobs, schedules, workflows, builds, identity, secrets, traffic and
+releases for Google Cloud Run, described in a `runway.yaml` next to your code.
 
 [![CI](https://github.com/echaouchna/runway/actions/workflows/ci.yml/badge.svg)](https://github.com/echaouchna/runway/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -69,6 +69,11 @@ Cloud Run application** in one file and one tool:
 - **Services, jobs and schedules.** Several services, Cloud Run jobs and Cloud
   Scheduler jobs in one file; in a monorepo, deploy only what a change
   touched (`--only apps/web`). `runway run-job migrate --wait` runs a job.
+- **Workflows that know your stack.** Google Cloud Workflows deployed from
+  files in your repository, with the URLs of your services and the names of
+  your jobs put in (`${services.api.url}`, `${jobs.export.name}`), access to
+  exactly what each one calls, and schedules that start them.
+  `runway run-workflow nightly --wait` runs one.
 - **No state file, no cluster.** runway reads the live project, changes only
   what differs, and is safe to re-run. An interrupted deploy resumes.
 - **Learn as you go.** `runway explain` browses every key of `runway.yaml`

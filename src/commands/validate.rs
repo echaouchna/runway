@@ -49,6 +49,7 @@ pub fn run(ctx: &Context, args: ValidateArgs) -> Result<()> {
                             true => format!("job {}", d.service_id),
                             false => d.service_id.clone(),
                         })
+                        .chain(res.workflows.iter().map(|w| format!("workflow {}", w.id)))
                         .chain(res.schedules.iter().map(|s| format!("schedule {}", s.key)))
                         .collect::<Vec<_>>()
                         .join(", "),

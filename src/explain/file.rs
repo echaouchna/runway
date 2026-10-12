@@ -39,6 +39,8 @@ const STAGEABLE: &[&str] = &[
     "jobs",
     "schedules",
     "scheduler",
+    "workflows",
+    "workflow_defaults",
     "release",
     "domains",
 ];

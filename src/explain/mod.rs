@@ -261,6 +261,8 @@ mod tests {
         missing::<RawJob>("jobs.x", &mut m);
         missing::<RawSchedule>("schedules.x", &mut m);
         missing::<RawScheduler>("scheduler", &mut m);
+        missing::<RawWorkflow>("workflows.x", &mut m);
+        missing::<RawWorkflow>("workflow_defaults", &mut m);
         missing::<RawRelease>("release", &mut m);
         missing::<RawReleaseRepository>("release.repository", &mut m);
         missing::<RawDomains>("domains", &mut m);

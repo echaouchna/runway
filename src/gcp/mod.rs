@@ -14,6 +14,7 @@ pub mod logging;
 pub mod registry;
 pub mod run;
 pub mod scheduler;
+pub mod workflows;
 
 use crate::error::{Error, ErrorKind};
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder as CredBuilder, Credentials};

@@ -10,8 +10,8 @@ hide:
 # runway documentation
 
 <p class="rw-lead">runway deploys applications to <strong>Google Cloud Run</strong> from a
-<code>runway.yaml</code> next to your code. One file describes your services, jobs and
-schedules, how they are built, what they may access and how traffic reaches them.
+<code>runway.yaml</code> next to your code. One file describes your services, jobs,
+schedules and workflows, how they are built, what they may access and how traffic reaches them.
 runway creates what they need, rolls them out, waits until they are healthy and
 manages their traffic.</p>
 
@@ -45,12 +45,17 @@ $ runway traffic --stage prod --promote     # finish it
       Build; or deploys an existing image. Images are content-addressed: the
       same source and base images are never built twice.
     - Deploys Cloud Run **services**, Cloud Run **jobs** and **Cloud
-      Scheduler** jobs that run a job or call a service, from one file. A
-      monorepo can deploy only the app a change touched (`--only apps/web`).
+      Scheduler** jobs that run a job, call a service or start a workflow,
+      from one file. A monorepo can deploy only the app a change touched
+      (`--only apps/web`).
+    - **Workflows** from files in your repository, with the URLs of your
+      services and the names of your jobs put in, and access to exactly what
+      each one calls.
     - **Stages** (`dev`, `prod`, …) share one file; each overrides what
       differs (project, region, scaling, environment).
 
     [:material-arrow-right: Services, jobs and schedules](services-and-jobs.md) ·
+    [Workflows](workflows.md) ·
     [Stages](configuration.md#stage-override-precedence)
 
 -   :material-shield-check-outline:{ .lg .middle } __Safety__
@@ -143,6 +148,8 @@ $ runway traffic --stage prod --promote     # finish it
 | Add a second service or a job | `services:`, `jobs:` | [Services, jobs and schedules](services-and-jobs.md) |
 | Run a job on a schedule | `schedules:` | [Services, jobs and schedules](services-and-jobs.md#run-a-job-every-night) |
 | Run a job now | `runway run-job NAME --stage S --wait` | [Services, jobs and schedules](services-and-jobs.md#run-a-job-now) |
+| Chain jobs and services in a workflow | `workflows: {NAME: {source: …}}` | [Workflows](workflows.md) |
+| Run a workflow now, or on a schedule | `runway run-workflow NAME --stage S --wait`, `schedules.N.workflow` | [Workflows](workflows.md#run-a-workflow) |
 | Deploy only one app of a monorepo | `--only NAME` or `--only PATH` | [Services, jobs and schedules](services-and-jobs.md#deploy-only-what-changed) |
 | Give each branch its own URL | `deploy --preview "$BRANCH"` | [Traffic](traffic.md) |
 | Clean up previews of merged branches | `runway preview prune --stage S --yes` | [Traffic](traffic.md#managing-previews) |
@@ -176,6 +183,10 @@ $ runway traffic --stage prod --promote     # finish it
 
     Several apps per file, monorepos, Cloud Run jobs, Cloud Scheduler
 
+-   [:material-transit-connection-variant: __Workflows__](workflows.md)
+
+    Google Cloud Workflows that call your services and run your jobs
+
 -   [:material-call-split: __Previews, canaries and traffic__](traffic.md)
 
     A URL per branch, gradual rollouts, rollback
@@ -198,7 +209,7 @@ $ runway traffic --stage prod --promote     # finish it
 
 -   [:material-account-key-outline: __Permissions__](permissions.md)
 
-    Deployer, build, runtime and scheduler identities
+    Deployer, build, runtime, scheduler and workflow identities
 
 -   [:material-delete-sweep-outline: __Undeploying__](undeploy.md)
 
