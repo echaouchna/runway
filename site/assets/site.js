@@ -160,22 +160,76 @@
   // ---------------------------------------------------------- pipeline
   const steps = $$(".pipe-steps li");
   const yaml = $(".yaml");
+  // The file stays pinned while the steps scroll past the middle of the
+  // screen; a step is active once its dot crosses that line, in either
+  // direction. Space under the list keeps the file pinned until the last
+  // step has been read.
   if (steps.length && yaml) {
     const list = $(".pipe-steps");
+    const card = $(".pipe-code .sticky");
+    const lines = $$(".ln", yaml);
+    const DOT = 34; // centre of a step's dot, from the step's top (CSS)
+    const PIN_TOP = 96; // `top` of the pinned card (CSS)
+    let current = -1;
     const activate = (n) => {
+      if (n === current) return;
+      current = n;
       steps.forEach((s, i) => {
         s.classList.toggle("on", i + 1 === n);
         s.classList.toggle("done", i + 1 < n);
       });
       yaml.classList.toggle("has-active", n > 0);
-      $$(".ln", yaml).forEach((l) => l.classList.toggle("hl", Number(l.dataset.s) === n));
-      list.style.setProperty("--fill", steps.length > 1 ? (n - 1) / (steps.length - 1) : 1);
+      lines.forEach((l) => l.classList.toggle("hl", Number(l.dataset.s) === n));
     };
-    const io = new IntersectionObserver(
-      (es) => es.forEach((e) => e.isIntersecting && activate(Number(e.target.dataset.step))),
-      { rootMargin: "-45% 0px -45% 0px" },
-    );
-    steps.forEach((s) => io.observe(s));
+    const pivot = () => innerHeight * 0.5;
+    const layout = () => {
+      list.style.marginTop = "0px";
+      list.style.marginBottom = "0px";
+      card.classList.remove("no-pin");
+      const fits = card.offsetHeight + PIN_TOP + 24 <= innerHeight;
+      card.classList.toggle("no-pin", !fits);
+      if (!fits || getComputedStyle(card).position !== "sticky") return;
+      // The first step reaches the pivot just as the card pins.
+      list.style.marginTop = `${Math.max(0, Math.round(pivot() - PIN_TOP - DOT))}px`;
+      // When the last dot reaches the pivot, keep scrolling a fifth of the
+      // screen before the row ends and the card leaves.
+      const last = steps[steps.length - 1];
+      const belowLastDot = list.offsetHeight - (last.offsetTop + DOT);
+      const dwell = innerHeight * 0.2;
+      const margin = PIN_TOP + card.offsetHeight - pivot() - belowLastDot + dwell;
+      list.style.marginBottom = `${Math.max(0, Math.round(margin))}px`;
+    };
+    const update = () => {
+      const top = list.getBoundingClientRect().top;
+      const line = pivot() - top;
+      let n = 0;
+      steps.forEach((s, i) => {
+        if (s.offsetTop + DOT <= line) n = i + 1;
+      });
+      activate(n);
+      const lastDot = steps[steps.length - 1].offsetTop + DOT;
+      list.style.setProperty("--fill-px", `${Math.max(0, Math.min(line, lastDot) - 10)}px`);
+    };
+    let queued = false;
+    const onScroll = () => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => {
+        queued = false;
+        update();
+      });
+    };
+    addEventListener("scroll", onScroll, { passive: true });
+    addEventListener("resize", () => {
+      layout();
+      update();
+    });
+    addEventListener("load", () => {
+      layout();
+      update();
+    });
+    layout();
+    update();
   }
 
   // ---------------------------------------------------------- traffic playground
