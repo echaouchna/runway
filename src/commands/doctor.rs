@@ -123,9 +123,8 @@ pub fn required_project_permissions(d: &Deployment) -> Vec<&'static str> {
     if creates_build || !d.buckets.is_empty() {
         p.push("storage.buckets.create");
     }
-    if creates_build || matches!(&d.artifact, Artifact::Promote(x) if x.create_resources) {
-        p.push("artifactregistry.repositories.create");
-    }
+    // Repository creation is checked after observing the repository, in its
+    // own project. Existing repositories do not require this permission.
     if d.apis.enable {
         p.push("serviceusage.services.enable");
     }
@@ -723,12 +722,23 @@ fn repository_name(t: &crate::commands::release::Target) -> String {
 /// The repositories exist, or deploy creates them (as the deployer, who
 /// must then be able to read them).
 async fn check_repository(session: &Session, d: &Deployment) -> Result<Report> {
+    let ar = build_client!(ArtifactRegistry, session)?;
+    let projects = build_client!(Projects, session)?;
+    check_repositories(session, d, &ar, &projects).await
+}
+
+/// Check repository prerequisites using the supplied read-only SDK clients.
+pub async fn check_repositories(
+    session: &Session,
+    d: &Deployment,
+    ar: &ArtifactRegistry,
+    projects: &Projects,
+) -> Result<Report> {
     let mut r = Report::default();
     let repos = repositories(d);
     if repos.is_empty() {
         return Ok(r);
     }
-    let ar = build_client!(ArtifactRegistry, session)?;
     let who = Who::of(session);
     for (label, t, create) in repos {
         let repo = repository_name(&t);
@@ -740,14 +750,30 @@ async fn check_repository(session: &Session, d: &Deployment) -> Result<Report> {
                 "create a repository with --repository-format=docker",
             ),
             Ok(_) => r.pass(label, format!("{short} (Docker)")),
-            Err(e) if is_not_found(&e) && create => r.warn(
-                label,
-                format!("{short} does not exist yet; deploy creates it"),
-                format!(
-                    "{} needs artifactregistry.repositories.create on project {} (roles/artifactregistry.admin)",
-                    who.name, t.project
-                ),
-            ),
+            Err(e) if is_not_found(&e) && create => {
+                const CREATE: &str = "artifactregistry.repositories.create";
+                let hint = project_grants(&who, &t.project, &[CREATE]);
+                match projects.test_iam_permissions()
+                    .set_resource(format!("projects/{}", t.project))
+                    .set_permissions([CREATE.to_string()])
+                    .send().await {
+                    Ok(got) if got.permissions.iter().any(|p| p == CREATE) => r.warn(
+                        label,
+                        format!("{short} does not exist yet; deploy creates it"),
+                        format!("{} has permission to create it", who.name),
+                    ),
+                    Ok(_) => r.fail(
+                        label,
+                        format!("{short} does not exist; {} lacks {CREATE} on project {}", who.name, t.project),
+                        hint,
+                    ),
+                    Err(e) => r.warn(
+                        label,
+                        format!("{short} does not exist; cannot verify permission to create it: {}", short_err(&e)),
+                        hint,
+                    ),
+                }
+            },
             Err(e) if is_not_found(&e) => r.fail(
                 label,
                 format!("{short} does not exist"),
@@ -1279,47 +1305,107 @@ async fn check_foreign_grants(session: &Session, d: &Deployment) -> Result<Repor
     Ok(r)
 }
 
+/// Wrap prose at word boundaries, preserving account names and resource paths.
+fn prose(out: &mut String, text: &str, indent: usize, width: usize) {
+    let pad = " ".repeat(indent);
+    for line in text.lines() {
+        let mut current = pad.clone();
+        let mut len = indent;
+        for word in line.split_whitespace() {
+            let word_len = word.chars().count();
+            if len > indent && len + 1 + word_len > width {
+                out.push_str(&current);
+                out.push('\n');
+                current = pad.clone();
+                len = indent;
+            }
+            if len > indent {
+                current.push(' ');
+                len += 1;
+            }
+            current.push_str(word);
+            len += word_len;
+        }
+        out.push_str(&current);
+        out.push('\n');
+    }
+}
+
+fn advice(out: &mut String, hint: &str, width: usize) {
+    for line in hint.lines() {
+        let line = line.trim();
+        if line.starts_with("gcloud ") {
+            // Keep shell commands copyable: flags start on continuation lines,
+            // and long arguments (especially IAM members) remain intact.
+            out.push('\n');
+            let parts: Vec<_> = line.split(" --").collect();
+            for (i, part) in parts.iter().enumerate() {
+                out.push_str(if i == 0 { "    " } else { "      --" });
+                out.push_str(part);
+                if i + 1 < parts.len() {
+                    out.push_str(" \\");
+                }
+                out.push('\n');
+            }
+        } else {
+            prose(out, line, 2, width);
+        }
+    }
+}
+
+fn text_report(r: &Report, p: crate::style::Painter, width: usize) -> String {
+    let mut out = String::new();
+    let count = |status| r.checks.iter().filter(|c| c.status == status).count();
+    out.push_str(&format!(
+        "Doctor: {} failed, {} warnings, {} passed, {} skipped\n",
+        count(CheckStatus::Fail),
+        count(CheckStatus::Warn),
+        count(CheckStatus::Pass),
+        count(CheckStatus::Skip),
+    ));
+    for (status, title, mark) in [
+        (CheckStatus::Fail, "Needs attention", p.bold_red("✗")),
+        (CheckStatus::Warn, "Warnings", p.yellow("!")),
+        (CheckStatus::Pass, "Passed", p.green("✓")),
+        (CheckStatus::Skip, "Skipped", p.dim("-")),
+    ] {
+        if count(status) == 0 {
+            continue;
+        }
+        out.push_str(&format!("\n{}\n", p.bold(title)));
+        for c in r.checks.iter().filter(|c| c.status == status) {
+            out.push_str(&format!("{mark} {}\n", p.bold(&c.name)));
+            prose(&mut out, &c.detail, 2, width);
+            if matches!(status, CheckStatus::Fail | CheckStatus::Warn) {
+                if let Some(hint) = &c.hint {
+                    out.push('\n');
+                    advice(&mut out, hint, width);
+                }
+                out.push('\n');
+            }
+        }
+    }
+    out.push('\n');
+    out.push_str(&if count(CheckStatus::Fail) > 0 {
+        p.bold_red("Some checks failed; fix them before deploying.")
+    } else if count(CheckStatus::Warn) > 0 {
+        p.yellow("No failed checks; review the warnings before deploying.")
+    } else {
+        p.bold_green("All required checks passed.")
+    });
+    out.push('\n');
+    out
+}
+
 fn finish(ctx: &Context, mut r: Report) -> Result<()> {
     r.ok = !r.checks.iter().any(|c| c.status == CheckStatus::Fail);
     match ctx.output {
         OutputFormat::Json => print_json(&r),
         OutputFormat::Text => {
-            let p = crate::style::out();
-            for c in &r.checks {
-                let mark = match c.status {
-                    CheckStatus::Pass => p.green("✓"),
-                    CheckStatus::Warn => p.yellow("!"),
-                    CheckStatus::Fail => p.bold_red("✗"),
-                    CheckStatus::Skip => p.dim("-"),
-                };
-                let name = format!("{:<28}", c.name);
-                let name = if c.status == CheckStatus::Fail {
-                    p.bold(&name)
-                } else {
-                    name
-                };
-                println!("{mark} {name} {}", c.detail);
-                if let Some(h) = &c.hint
-                    && c.status != CheckStatus::Pass
-                {
-                    for (i, line) in h.lines().enumerate() {
-                        let line = match i {
-                            0 => format!("→ {line}"),
-                            _ => format!("  {line}"),
-                        };
-                        println!("  {:<28} {}", "", p.cyan(&line));
-                    }
-                }
-            }
-            println!();
-            println!(
-                "{}",
-                if r.ok {
-                    p.bold_green("All required checks passed.")
-                } else {
-                    p.bold_red("Some checks failed; fix them before deploying.")
-                }
-            );
+            let width = ratatui::crossterm::terminal::size()
+                .map(|(cols, _)| usize::from(cols))
+                .unwrap_or(100);
+            print!("{}", text_report(&r, crate::style::out(), width));
         }
     }
     if r.ok {
@@ -1636,6 +1722,65 @@ mod tests {
             job[0].contains("`jobs.migrate.identity.create: true`"),
             "{job:?}"
         );
+    }
+
+    #[test]
+    fn repository_creation_is_not_a_blanket_deployment_project_permission() {
+        let mut d = deployment(true, false, false);
+        let Artifact::Build(b) = &mut d.artifact else {
+            unreachable!()
+        };
+        b.create_resources = true;
+        b.artifact_project = "my-registry-project".into();
+        let permissions = required_project_permissions(&d);
+        assert!(!permissions.contains(&"artifactregistry.repositories.create"));
+        assert!(permissions.contains(&"cloudbuild.builds.create"));
+    }
+
+    #[test]
+    fn report_prioritizes_failures_and_keeps_commands_copyable() {
+        let mut r = Report::default();
+        r.pass("configuration", "valid");
+        r.warn(
+            "pull access",
+            "cannot verify access",
+            "ask the repository administrator",
+        );
+        r.fail("deployer permissions", "missing build permission", "grant the role:\n  gcloud projects add-iam-policy-binding my-gcp-project --member=serviceAccount:deployer@my-gcp-project.iam.gserviceaccount.com --role=roles/cloudbuild.builds.editor");
+        let text = text_report(&r, crate::style::Painter { enabled: false }, 60);
+        assert!(text.starts_with("Doctor: 1 failed, 1 warnings, 1 passed, 0 skipped\n"));
+        assert!(text.find("Needs attention").unwrap() < text.find("Warnings").unwrap());
+        assert!(text.find("Warnings").unwrap() < text.find("Passed").unwrap());
+        let command = text
+            .lines()
+            .filter(|l| l.starts_with("    "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            command.replace(" \\\n      ", " ").trim(),
+            "gcloud projects add-iam-policy-binding my-gcp-project --member=serviceAccount:deployer@my-gcp-project.iam.gserviceaccount.com --role=roles/cloudbuild.builds.editor"
+        );
+        let mut wrapped = String::new();
+        prose(
+            &mut wrapped,
+            "permission checks need a readable explanation",
+            2,
+            24,
+        );
+        assert!(wrapped.lines().all(|l| l.chars().count() <= 24));
+        assert_eq!(
+            wrapped.split_whitespace().collect::<Vec<_>>().join(" "),
+            "permission checks need a readable explanation"
+        );
+    }
+
+    #[test]
+    fn warnings_are_not_reported_as_fully_verified() {
+        let mut r = Report::default();
+        r.warn("pull access", "unknown", "verify the grant");
+        let text = text_report(&r, crate::style::Painter { enabled: false }, 100);
+        assert!(text.contains("No failed checks; review the warnings before deploying."));
+        assert!(!text.contains("All required checks passed."));
     }
 
     #[test]
