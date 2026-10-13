@@ -2578,3 +2578,48 @@ fn workflow_mistakes_are_reported_with_their_path() {
         "{e:#?}"
     );
 }
+
+#[test]
+fn repositories_may_be_in_a_multi_region() {
+    let yaml = FULL.replace(
+        "stages:\n",
+        "release:\n  repository:\n    project: my-release-project\n    location: europe\n    repository: docker-releases-eu\n    package: mr-terraform-agent/agent\nstages:\n",
+    );
+    let (_d, cfg) = load_str(&yaml);
+    let r = resolve_ok(&cfg, "prod");
+    let rel = r.first().release.repository.clone().unwrap();
+    assert_eq!(rel.location, "europe");
+    let t = crate::commands::release::Target {
+        project: rel.project,
+        location: rel.location,
+        repository: rel.repository,
+        package: rel.package.unwrap(),
+    };
+    assert_eq!(
+        t.image(),
+        "europe-docker.pkg.dev/my-release-project/docker-releases-eu/mr-terraform-agent/agent"
+    );
+    // The build repository too; the build still runs in provider.region.
+    let yaml = FULL.replace(
+        "  artifact_repository: applications\n",
+        "  artifact_repository: applications\n  artifact_location: us\n",
+    );
+    let (_d, cfg) = load_str(&yaml);
+    let d = resolve_ok(&cfg, "prod").first().clone();
+    assert!(
+        d.build_image()
+            .unwrap()
+            .starts_with("us-docker.pkg.dev/my-gcp-project/applications/")
+    );
+    // A misspelt one is still an error, with the valid choices.
+    let (_d, cfg) = load_str(&yaml.replace("artifact_location: us", "artifact_location: eu"));
+    let e = resolve_err(&cfg, "prod");
+    assert!(
+        has_error(
+            &e,
+            "provider.artifact_location",
+            "multi-region: `europe`, `us`, `asia`"
+        ),
+        "{e:#?}"
+    );
+}

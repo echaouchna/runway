@@ -301,6 +301,10 @@ migration notes.
 
 ### Fixed
 
+- **Artifact Registry multi-regions.** `provider.artifact_location` and
+  `release.repository.location` accept `europe`, `us` and `asia` (images go to
+  `europe-docker.pkg.dev/…`); they were rejected as invalid regions. Builds
+  still run in `provider.region`.
 - **Doctor checks repository creation where it is needed.** An existing
   repository no longer requires `artifactregistry.repositories.create` on the
   deployment project. Missing repositories are checked in their own project.

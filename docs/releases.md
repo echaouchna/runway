@@ -70,7 +70,7 @@ repository keeps releases apart, for example in the production project:
 release:
   repository:                 # global: every stage publishes here
     project: my-release-project   # default: provider.project
-    location: europe-west1        # default: the build repository's location
+    location: europe-west1        # default: the build repository's location; or europe, us, asia
     repository: releases
 
 stages:

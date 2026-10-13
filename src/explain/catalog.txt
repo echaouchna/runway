@@ -1564,7 +1564,9 @@ The repository's project.
 type: string
 default: the build repository's location
 docs: releases.md#publish-to-a-release-repository
-The repository's location.
+The repository's location: a region (`europe-west1`) or a multi-region (`europe`, `us`, `asia`).
+Example:
+  location: europe
 
 @ release.repository.repository
 type: string

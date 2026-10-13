@@ -20,7 +20,7 @@ provider:
   # create_build_resources is true: then they default to `runway`,
   # `${project}-runway-sources` and `runway-build@${project}.iam.gserviceaccount.com`.
   artifact_repository: applications             # source builds
-  artifact_location: europe-west1               # optional, defaults to region
+  artifact_location: europe-west1               # optional, defaults to region; or a multi-region: europe, us, asia
   artifact_project: my-registry-project         # optional, defaults to project (see "Where images go")
   artifact_package: team/hello                  # optional image path, defaults to <app>, <app>-<name>
   source_bucket: "${project}-runway-sources"   # source builds, name without gs://
@@ -548,7 +548,7 @@ releases the latest release candidate without rebuilding. See
 release:                      # global (optional)
   repository:                 # where released images are published (copied, same digest)
     project: my-release-project   # default: provider.project
-    location: europe-west1        # default: the build repository's location
+    location: europe-west1        # default: the build repository's location; or europe, us, asia
     repository: releases
     package: team/agent           # optional: the image path in it (default: <app>, <app>-<name>)
 
