@@ -582,6 +582,21 @@ pub fn api_name(s: &str) -> Result<(), String> {
     }
 }
 
+/// Artifact Registry multi-regions (their hosts are `europe-docker.pkg.dev`…).
+pub const REPOSITORY_MULTI_REGIONS: &[&str] = &["asia", "europe", "us"];
+
+/// An Artifact Registry repository location: a region (`europe-west1`) or a
+/// multi-region (`europe`, `us`, `asia`).
+pub fn repository_location(s: &str) -> Result<(), String> {
+    if REPOSITORY_MULTI_REGIONS.contains(&s) || region(s).is_ok() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{s}` is not an Artifact Registry location (a region such as `europe-west1`, or a multi-region: `europe`, `us`, `asia`)"
+        ))
+    }
+}
+
 /// A region (`europe-west1`), multi-region (`EU`) or dual-region (`EUR4`).
 pub fn bucket_location(s: &str) -> Result<(), String> {
     let multi = (2..=10).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric());
@@ -775,6 +790,13 @@ mod tests {
         assert!(region("europe-west1").is_ok());
         assert!(region("europe-west1-b").is_err());
         assert!(region("Europe").is_err());
+        assert!(region("europe").is_err(), "a multi-region is not a region");
+        for ok in ["europe-west1", "europe", "us", "asia"] {
+            assert!(repository_location(ok).is_ok(), "{ok}");
+        }
+        for bad in ["EU", "eu", "Europe", "europe-west1-b"] {
+            assert!(repository_location(bad).is_err(), "{bad}");
+        }
         assert!(
             bucket_name("gs://x")
                 .unwrap_err()

@@ -1289,7 +1289,7 @@ pub fn resolve(
         }
     };
     check_opt(&mut d, &artifact_repository, validate::repository_id);
-    check_opt(&mut d, &artifact_location, validate::region);
+    check_opt(&mut d, &artifact_location, validate::repository_location);
     check_opt(&mut d, &artifact_project, validate::project_id);
     check_opt(&mut d, &artifact_package, validate::image_package);
     check_opt(&mut d, &push_sa, validate::service_account_email);
@@ -3537,7 +3537,7 @@ fn resolve_release(
                 &project,
                 validate::project_id as fn(&str) -> std::result::Result<(), String>,
             ),
-            ("location", &location, validate::region),
+            ("location", &location, validate::repository_location),
             ("repository", &r.repository, validate::repository_id),
         ] {
             if let Err(e) = check(value) {
