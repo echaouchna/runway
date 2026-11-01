@@ -21,7 +21,7 @@ clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde-saphyr = "1.3"
+serde-saphyr = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ignore = "0.4"
