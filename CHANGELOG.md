@@ -301,6 +301,10 @@ migration notes.
 
 ### Fixed
 
+- **Publishing a release to another repository.** Copying an image sent no
+  `Content-Length` when it started a layer upload, and Artifact Registry
+  answered `411 Length Required`, so `deploy --tag` failed whenever a layer
+  had to be uploaded or the registry refused to mount it.
 - **Artifact Registry multi-regions.** `provider.artifact_location` and
   `release.repository.location` accept `europe`, `us` and `asia` (images go to
   `europe-docker.pkg.dev/…`); they were rejected as invalid regions. Builds

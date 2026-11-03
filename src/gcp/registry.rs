@@ -334,8 +334,14 @@ impl RegistryClient {
             ),
             false => format!("{base}/v2/{}/blobs/uploads/", dst.repository),
         };
+        // Without a body reqwest sends no Content-Length, and Artifact
+        // Registry answers 411 Length Required.
+        let post = self
+            .http
+            .post(&start)
+            .header(reqwest::header::CONTENT_LENGTH, 0);
         let resp = self
-            .authed(self.http.post(&start), dst, &start)
+            .authed(post, dst, &start)
             .send()
             .await
             .map_err(|e| ResolveError::Other(format!("cannot reach registry: {e}")))?;

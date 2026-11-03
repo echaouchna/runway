@@ -9,7 +9,7 @@ use runway::gcp::registry::RegistryClient;
 use runway::image_ref::ImageRef;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -78,6 +78,8 @@ async fn an_image_is_copied_by_mounting_its_layers_and_keeps_its_digest() {
         .and(path(format!("/v2/{dst_repo}/blobs/uploads/")))
         .and(query_param("mount", layer_d.as_str()))
         .and(query_param("from", src_repo))
+        // Artifact Registry answers 411 to a POST without Content-Length.
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&s)
@@ -144,6 +146,7 @@ async fn across_locations_layers_are_streamed_and_indexes_copy_every_platform() 
     }
     Mock::given(method("POST"))
         .and(path(format!("/v2/{dst_repo}/blobs/uploads/")))
+        .and(header("content-length", "0"))
         .respond_with(
             ResponseTemplate::new(202)
                 .insert_header("location", format!("/v2/{dst_repo}/blobs/uploads/u1")),
@@ -196,6 +199,72 @@ async fn across_locations_layers_are_streamed_and_indexes_copy_every_platform() 
             .unwrap()
     };
     assert!(pos(&child_d) < pos(&index_d));
+}
+
+#[tokio::test]
+async fn a_refused_mount_falls_back_to_streaming_the_layer() {
+    let s = MockServer::start().await;
+    let (src_repo, dst_repo) = (
+        "my-gcp-project/builds/shop",
+        "my-prod-project/releases/shop",
+    );
+    let (cfg_d, layer_d) = (sha(b"{}"), sha(b"layer"));
+    let (body, digest) = manifest(&cfg_d, &layer_d);
+    serve_manifest(&s, src_repo, &body, &digest, MANIFEST).await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/{dst_repo}/blobs/{cfg_d}")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&s)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/{dst_repo}/blobs/{layer_d}")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{src_repo}/blobs/{layer_d}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"layer".to_vec()))
+        .mount(&s)
+        .await;
+    // Same host, but the registry will not mount (e.g. another project):
+    // 202 with an upload location instead of 201.
+    Mock::given(method("POST"))
+        .and(path(format!("/v2/{dst_repo}/blobs/uploads/")))
+        .and(query_param("mount", layer_d.as_str()))
+        .and(query_param("from", src_repo))
+        .and(header("content-length", "0"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", format!("/v2/{dst_repo}/blobs/uploads/u1")),
+        )
+        .expect(1)
+        .mount(&s)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{dst_repo}/blobs/uploads/u1")))
+        .and(query_param("digest", layer_d.as_str()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&s)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/{dst_repo}/manifests/{digest}")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&s)
+        .await;
+    let src = ImageRef::parse(&format!("europe-west1-docker.pkg.dev/{src_repo}@{digest}")).unwrap();
+    let dst = ImageRef::parse(&format!("europe-west1-docker.pkg.dev/{dst_repo}")).unwrap();
+    client(&s).copy(&src, &dst).await.unwrap();
+
+    let upload = s
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path().ends_with("/uploads/u1"))
+        .unwrap();
+    assert_eq!(upload.body, b"layer");
 }
 
 fn release_config(stages: &str) -> (tempfile::TempDir, config::LoadedConfig) {
