@@ -1607,6 +1607,11 @@ impl<'a> Provisioner<'a> {
         self.lease.lock().expect("not poisoned").check()
     }
 
+    /// The lease handle held by this provisioner.
+    pub fn held(&self) -> crate::lease::Held {
+        self.lease.lock().expect("not poisoned").clone()
+    }
+
     /// The same provisioner (clients, what it granted) for the tags and IAP
     /// of one service.
     pub fn for_service(&self, d: &'a Deployment) -> Provisioner<'a> {

@@ -1,0 +1,4 @@
+# False positives in lockfiles that are not compiled into runway.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono is only an un-enabled optional dependency of serde_with in Cargo.lock; runway uses jiff and does not compile chrono (verified by cargo tree and cargo deny)."

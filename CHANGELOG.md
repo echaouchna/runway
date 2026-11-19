@@ -92,8 +92,8 @@ migration notes.
   and deploy that copy. Default: the build's name, as before. A stage that
   builds several images with a `package` set is a validation error.
 - **Several runs at once.** Runs on the same stage coordinate through a lease
-  on the stage's own Cloud Run service (annotation `runway.dev/lease`,
-  written with the etag; no lock file): deploys, canaries, traffic changes
+  on the stage's own Cloud Run service (annotation `runway.dev/lease`;
+  no lock file): deploys, canaries, traffic changes
   and teardowns are exclusive, previews share the stage. A busy stage makes
   a run wait and say for whom (`--wait-timeout`, default 30m; `--no-wait`).
   Leases are renewed every 30 seconds and expire after 2 minutes;
@@ -301,6 +301,13 @@ migration notes.
 
 ### Fixed
 
+- **Lease lost after a long build.** A deploy kept the pre-build snapshot of
+  an existing service or job and wrote its old `runway.dev/lease` annotation
+  back during rollout; after a build longer than the 2-minute lease TTL, that
+  overwrote the renewed lease with an expired one and made the next renewal
+  report the lease as lost. Rollouts now re-read an existing service or job
+  right before updating it and serialize writes to the lease holder with the
+  background lease renewal.
 - **Publishing a release to another repository.** Copying an image sent no
   `Content-Length` when it started a layer upload, and Artifact Registry
   answered `411 Length Required`, so `deploy --tag` failed whenever a layer

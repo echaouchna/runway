@@ -18,6 +18,7 @@ pub mod config;
 pub mod deploy;
 pub mod describe;
 pub mod domains;
+pub mod duration;
 pub mod error;
 pub mod explain;
 pub mod gcp;

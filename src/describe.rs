@@ -764,8 +764,8 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
         items: vec![format!(
             "Each step is retried up to {} time(s) (initial delay {}, doubling, max {}); configuration errors, ownership conflicts and failed Docker builds are not retried.",
             d.retry.attempts,
-            humantime::format_duration(d.retry.delay),
-            humantime::format_duration(d.retry.max_delay)
+            crate::duration::format_duration(d.retry.delay),
+            crate::duration::format_duration(d.retry.max_delay)
         )],
     });
     out

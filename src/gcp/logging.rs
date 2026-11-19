@@ -2,9 +2,9 @@
 
 use crate::error::{Error, Result};
 use crate::gcp::api_error;
-use chrono::{DateTime, SecondsFormat, Utc};
 use google_cloud_logging_v2::client::LoggingServiceV2;
 use google_cloud_logging_v2::model::{LogEntry, log_entry};
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -21,10 +21,20 @@ pub struct LogQuery {
     pub min_severity: Option<String>,
 }
 
+/// Formats a timestamp as UTC RFC 3339 with microsecond precision.
+pub fn format_rfc3339_micros(ts: Timestamp) -> String {
+    format!(
+        "{}.{:06}Z",
+        ts.strftime("%Y-%m-%dT%H:%M:%S"),
+        ts.subsec_nanosecond() / 1_000
+    )
+}
+
 /// Cloud Logging filter selecting a service's application logs.
-pub fn service_filter(q: &LogQuery, now: DateTime<Utc>) -> String {
-    let start = now - chrono::Duration::from_std(q.since).unwrap_or(chrono::Duration::hours(1));
-    service_filter_after(q, &start.to_rfc3339_opts(SecondsFormat::Micros, true))
+pub fn service_filter(q: &LogQuery, now: Timestamp) -> String {
+    let since = SignedDuration::try_from(q.since).unwrap_or(SignedDuration::from_hours(1));
+    let start = now.checked_sub(since).unwrap_or(now);
+    service_filter_after(q, &format_rfc3339_micros(start))
 }
 
 fn service_filter_after(q: &LogQuery, ts: &str) -> String {
@@ -220,7 +230,7 @@ pub async fn follow(
 }
 
 pub fn parse_since(s: &str) -> Result<Duration> {
-    let d = humantime::parse_duration(s).map_err(|e| {
+    let d = crate::duration::parse_duration(s).map_err(|e| {
         Error::config(format!(
             "invalid --since `{s}`: {e} (examples: 10m, 1h, 2h30m, 1d)"
         ))
@@ -251,9 +261,7 @@ mod tests {
 
     #[test]
     fn filter_targets_service_and_excludes_request_logs() {
-        let now = DateTime::parse_from_rfc3339("2025-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now: Timestamp = "2025-01-01T12:00:00Z".parse().unwrap();
         let f = service_filter(&q(), now);
         assert!(f.contains(r#"resource.type="cloud_run_revision""#));
         assert!(f.contains(r#"resource.labels.service_name="hello-dev""#));

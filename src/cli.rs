@@ -313,7 +313,7 @@ pub struct PreviewDeleteArgs {
     #[arg(long)]
     pub delete_revisions: bool,
     /// Maximum time to wait for Cloud Run.
-    #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "5m", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
     #[command(flatten)]
     pub lock: LockArgs,
@@ -344,7 +344,7 @@ pub struct PreviewPruneArgs {
     #[arg(long)]
     pub delete_revisions: bool,
     /// Maximum time to wait for Cloud Run.
-    #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "5m", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
     #[command(flatten)]
     pub lock: LockArgs,
@@ -367,7 +367,7 @@ pub struct TrafficArgs {
     #[command(flatten)]
     pub lock: LockArgs,
     /// Maximum time to wait for the change to be applied.
-    #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "5m", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
 }
 
@@ -395,7 +395,7 @@ pub struct UndeployArgs {
     #[command(flatten)]
     pub lock: LockArgs,
     /// Maximum time to wait for the service deletion.
-    #[arg(long, default_value = "5m", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "5m", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
     /// Retries per failed step (overrides `retry.attempts`; 0 disables retries).
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
@@ -471,7 +471,7 @@ pub struct RunJobArgs {
     #[arg(long)]
     pub wait: bool,
     /// How long to wait with `--wait`.
-    #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "1h", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
 }
 
@@ -488,7 +488,7 @@ pub struct RunWorkflowArgs {
     #[arg(long)]
     pub wait: bool,
     /// How long to wait with `--wait`.
-    #[arg(long, default_value = "1h", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "1h", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
 }
 
@@ -531,7 +531,7 @@ pub struct PlanArgs {
 pub struct LockArgs {
     /// Longest wait for another runway run on the same stage (a deploy,
     /// canary, traffic change or teardown) to finish.
-    #[arg(long, default_value = "30m", value_parser = humantime::parse_duration, env = "RUNWAY_WAIT_TIMEOUT")]
+    #[arg(long, default_value = "30m", value_parser = crate::duration::parse_duration, env = "RUNWAY_WAIT_TIMEOUT")]
     pub wait_timeout: std::time::Duration,
     /// Fail at once when another runway run holds the stage.
     #[arg(long)]
@@ -555,10 +555,10 @@ pub struct DeployArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// Maximum time to wait for the service to become ready.
-    #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "10m", value_parser = crate::duration::parse_duration)]
     pub timeout: std::time::Duration,
     /// Maximum Cloud Build duration.
-    #[arg(long, default_value = "20m", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "20m", value_parser = crate::duration::parse_duration)]
     pub build_timeout: std::time::Duration,
     /// Rebuild even if an image for identical source already exists.
     #[arg(long)]
@@ -585,7 +585,7 @@ pub struct DeployArgs {
     #[arg(long)]
     pub tag_rc: bool,
     /// Initial delay between retries, doubling each time (overrides `retry.delay`).
-    #[arg(long, value_parser = humantime::parse_duration)]
+    #[arg(long, value_parser = crate::duration::parse_duration)]
     pub retry_delay: Option<std::time::Duration>,
     /// Deploy even if the stage runs a newer commit than this checkout (a
     /// rollback on purpose).

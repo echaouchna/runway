@@ -202,10 +202,14 @@ pub async fn apply_domains(
     else {
         return Err(Error::internal("not a domains step"));
     };
+    let held = provisioner.held();
+    let holder_name = holder.d.service_name();
     let target = Recorded::of(want);
     let touched = previous.union(&target);
-    with_retry(retry, p, "record custom domains", |_| {
-        save_domains_record(reconciler, holder, Some(&touched), p)
+    with_retry(retry, p, "record custom domains", |_| async {
+        let _writing = held.writing(&holder_name).await;
+        held.check()?;
+        save_domains_record(reconciler, holder, Some(&touched), p).await
     })
     .await?;
     let done = provisioner
@@ -220,8 +224,10 @@ pub async fn apply_domains(
         (true, false) => Some(target),
         (false, _) => Some(touched),
     };
-    with_retry(retry, p, "record custom domains", |_| {
-        save_domains_record(reconciler, holder, last.as_ref(), p)
+    with_retry(retry, p, "record custom domains", |_| async {
+        let _writing = held.writing(&holder_name).await;
+        held.check()?;
+        save_domains_record(reconciler, holder, last.as_ref(), p).await
     })
     .await?;
     Ok(done)
@@ -554,6 +560,7 @@ pub async fn run(
     {
         Ok(done) => steps.extend(done),
         Err(e) => {
+            let _writing = held.writing(&holder.d.service_name()).await;
             let _ = save_holder(
                 &reconciler,
                 &jrec,
@@ -666,27 +673,20 @@ pub async fn run(
         }
     }));
     let joined = tokio::try_join!(builds, provision);
-    let saved = save_holder(
-        &reconciler,
-        &jrec,
-        &holder,
-        &record_now(),
-        !recorded.is_empty(),
-        p,
-    )
-    .await;
+    let saved = {
+        let _writing = held.writing(&holder.d.service_name()).await;
+        save_holder(
+            &reconciler,
+            &jrec,
+            &holder,
+            &record_now(),
+            !recorded.is_empty(),
+            p,
+        )
+        .await
+    };
     let (built, (done, pinned)) = joined?;
-    // A record written changed the holder's etag: its rollout starts from it.
-    if saved? {
-        for (d, live) in ws.iter().zip(lives.iter_mut()) {
-            if is_holder(d, holder.d) {
-                *live = match d.is_job() {
-                    true => Live::Job(jrec.get(&job_for_mode(d, &mode)?.service_name()).await?),
-                    false => Live::Service(reconciler.get(&d.service_name()).await?),
-                };
-            }
-        }
-    }
+    saved?;
     steps.extend(done);
     let images: Vec<String> = (0..decisions.len())
         .map(|i| match (&built[i], &existing_images[i]) {
@@ -790,27 +790,36 @@ pub async fn run(
                 let job_changes = crate::gcp::jobs::changes(known.as_ref(), &spec, settings);
                 p.details(&crate::commands::deploy::change_lines(&job_changes));
                 let name = target.service_name();
+                let is_new = known.is_none();
                 let change = with_retry(&retry, p, "deploy job", |attempt| {
-                    let (jrec, spec, target, known, name) = (&jrec, &spec, &target, &known, &name);
+                    let (jrec, spec, target, name) = (&jrec, &spec, &target, &name);
                     let held = &held;
                     async move {
-                        held.check()?;
-                        // A retry re-reads the job: its etag changed if the
-                        // failed attempt applied.
-                        let existing = match attempt {
-                            1 => known.clone(),
-                            _ => jrec.get(name).await?,
+                        let (change, op) = {
+                            let _writing = held.writing(name).await;
+                            held.check()?;
+                            // Re-read an existing job right before updating:
+                            // the background lease renewal (or an earlier
+                            // rollout) updates its annotations during builds.
+                            let existing = match (attempt, is_new) {
+                                (1, true) => None,
+                                _ => jrec.get(name).await?,
+                            };
+                            jrec.start_apply(
+                                &target.parent(),
+                                &target.service_id,
+                                spec,
+                                settings,
+                                existing,
+                                &d.app,
+                                &d.stage,
+                            )
+                            .await?
                         };
-                        jrec.apply(
-                            &target.parent(),
-                            &target.service_id,
-                            spec,
-                            settings,
-                            existing,
-                            &d.app,
-                            &d.stage,
-                        )
-                        .await
+                        if let Some(op) = op {
+                            jrec.wait(&op, &target.service_id).await?;
+                        }
+                        Ok(change)
                     }
                 })
                 .await?;
@@ -914,6 +923,7 @@ pub async fn run(
         match provisioner.apply_all(&post, &retry, p, &report).await {
             Ok(done) => steps.extend(done),
             Err(e) => {
+                let _writing = held.writing(&holder.d.service_name()).await;
                 let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
                 let _ = save_holder(&reconciler, &jrec, &holder, &record, true, p).await;
                 return Err(after_rollout(e, first, any_url.as_deref()));
@@ -928,8 +938,11 @@ pub async fn run(
         !revoke_now,
     );
     if final_record != record {
-        with_retry(&retry, p, "record grants", |_| {
-            save_holder(&reconciler, &jrec, &holder, &final_record, true, p)
+        let holder_name = holder.d.service_name();
+        with_retry(&retry, p, "record grants", |_| async {
+            let _writing = held.writing(&holder_name).await;
+            held.check()?;
+            save_holder(&reconciler, &jrec, &holder, &final_record, true, p).await
         })
         .await
         .map_err(|e| after_rollout(e, first, any_url.as_deref()))?;
@@ -961,6 +974,7 @@ pub async fn run(
     {
         let name = holder.d.service_name();
         with_retry(&retry, p, "record the deployed commit", |_| async {
+            let _writing = held.writing(&name).await;
             held.check()?;
             match holder.d.is_job() {
                 true => {
@@ -1039,10 +1053,10 @@ async fn deploy_service(
             "First deploy: creating {} with ingress {} until its tags are effective",
             d.service_id, bs.ingress
         ));
+        let held = view.held();
         with_retry(retry, p, "create the service", |attempt| {
-            let (name, placeholder) = (&name, &placeholder);
+            let (name, placeholder, held) = (&name, &placeholder, &held);
             async move {
-                view.check_lease()?;
                 roll_out(
                     reconciler,
                     d,
@@ -1050,6 +1064,7 @@ async fn deploy_service(
                     placeholder,
                     if attempt == 1 { Some(None) } else { None },
                     false,
+                    held,
                     p,
                 )
                 .await
@@ -1086,12 +1101,19 @@ async fn deploy_service(
         (Some(_), _) => format!("Updating Cloud Run service {}", d.service_id),
     });
     let tag_just_bound = steps.iter().any(|x| x.outcome == StepOutcome::Changed);
+    let held = view.held();
+    let is_new = existing.is_none();
     let (applied, svc, changes) = with_retry(retry, p, "deploy service", |attempt| {
-        let known = if attempt == 1 { Some(existing.clone()) } else { None };
-        let (name, base_spec) = (&name, &base_spec);
+        // Re-read an existing service right before updating so the live lease
+        // (renewed during builds / earlier rollouts) and etag are current.
+        let known = if attempt == 1 && is_new {
+            Some(None)
+        } else {
+            None
+        };
+        let (name, base_spec, held) = (&name, &base_spec, &held);
         async move {
-            view.check_lease()?;
-            roll_out(reconciler, d, name, base_spec, known, adopt, p)
+            roll_out(reconciler, d, name, base_spec, known, adopt, held, p)
                 .await
                 .map_err(|mut e| {
                     if tag_just_bound && e.permanent && e.message.contains("constraints/") {

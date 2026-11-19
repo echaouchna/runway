@@ -200,8 +200,9 @@ Two pipelines, or a pipeline and a person, may run runway on the same stage
 at the same time. runway coordinates them without a lock file or any extra
 resource: the stage's own Cloud Run service (the main one, else the first
 service, else the first job) carries a **lease** (annotation
-`runway.dev/lease`), written with the service's etag so that two runs can
-never both take it.
+`runway.dev/lease`). runway sends the service's etag on each update and
+verifies the returned annotation carries its entry (see
+[Limitations](limitations.md)).
 
 | Run | Lease | Waits for |
 |---|---|---|

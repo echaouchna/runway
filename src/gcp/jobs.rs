@@ -195,10 +195,10 @@ impl JobReconciler<'_> {
         }
     }
 
-    /// Creates or updates the job when its configuration differs, then waits
-    /// for the operation. Ownership is checked first.
+    /// Creates or updates the job when its configuration differs, returning the
+    /// change and the operation to wait on (none when unchanged).
     #[allow(clippy::too_many_arguments)]
-    pub async fn apply(
+    pub async fn start_apply(
         &self,
         parent: &str,
         job_id: &str,
@@ -207,7 +207,7 @@ impl JobReconciler<'_> {
         existing: Option<Job>,
         app: &str,
         stage: &str,
-    ) -> Result<JobChange> {
+    ) -> Result<(JobChange, Option<String>)> {
         if let Some(job) = &existing {
             check_job_ownership(job, app, stage)?;
             // The holder's update carries this run's lease: never overwrite
@@ -224,7 +224,7 @@ impl JobReconciler<'_> {
                 return Err(e);
             }
             if changes(Some(job), spec, j).is_empty() {
-                return Ok(JobChange::Unchanged);
+                return Ok((JobChange::Unchanged, None));
             }
         }
         let req = desired_job(spec, j, existing.as_ref());
@@ -250,11 +250,10 @@ impl JobReconciler<'_> {
                 JobChange::Updated,
             ),
         };
-        self.wait(&op.name, job_id).await?;
-        Ok(change)
+        Ok((change, Some(op.name)))
     }
 
-    async fn wait(&self, operation: &str, job_id: &str) -> Result<()> {
+    pub async fn wait(&self, operation: &str, job_id: &str) -> Result<()> {
         let mut poller = Poller::new(self.poll, self.timeout);
         loop {
             let op = self

@@ -1,9 +1,11 @@
 //! A lease on the stage's holder workload (the one that records grants: the
 //! main service, else the first service, else the first job), so that runs
 //! that would interfere wait for each other. No lock file and no other
-//! resource: the lease is the annotation [`ANNOTATION_LEASE`], written with
-//! the resource's etag, so two runs can never both take it. A write counts
-//! only once its operation completed and the resource carries it.
+//! resource: the lease is the annotation [`ANNOTATION_LEASE`]. Each update
+//! sends the resource's etag and counts only once its operation completes
+//! with the new lease on the resource (note that Cloud Run v2 does not
+//! always reject stale etags on masked updates, so concurrent acquisitions
+//! are also caught when the returned annotation differs or on renewal).
 //!
 //! Deploys, canaries, traffic changes and teardowns take it exclusively;
 //! previews share it (they only add their own tag). A lease expires
@@ -14,9 +16,9 @@
 use crate::error::{Error, ErrorKind, Result};
 use crate::gcp::{api_error, is_ambiguous, is_concurrency_conflict, is_not_found};
 use crate::output::Progress;
-use chrono::{DateTime, Utc};
 use google_cloud_lro::Poller;
 use google_cloud_run_v2::client::{Jobs, Services};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,19 +58,19 @@ pub struct Holder {
     pub mode: Mode,
     /// Who: CI job, user and host, command.
     pub by: String,
-    pub since: DateTime<Utc>,
-    pub until: DateTime<Utc>,
+    pub since: Timestamp,
+    pub until: Timestamp,
 }
 
 impl Holder {
-    fn live(&self, now: DateTime<Utc>) -> bool {
+    fn live(&self, now: Timestamp) -> bool {
         self.until > now
     }
 
     /// `exclusive lease held by gitlab job 4711 … for 3m12s (expires in 1m40s …)`.
-    pub fn describe(&self, now: DateTime<Utc>) -> String {
-        let ago = (now - self.since).to_std().unwrap_or_default();
-        let left = (self.until - now).to_std().unwrap_or_default();
+    pub fn describe(&self, now: Timestamp) -> String {
+        let ago = Duration::try_from(now.duration_since(self.since)).unwrap_or_default();
+        let left = Duration::try_from(self.until.duration_since(now)).unwrap_or_default();
         format!(
             "{} lease held by {} for {} (expires in {} unless renewed)",
             self.mode,
@@ -97,17 +99,17 @@ impl Lease {
     }
 
     /// Holders whose lease has not expired.
-    pub fn live(&self, now: DateTime<Utc>) -> Vec<&Holder> {
+    pub fn live(&self, now: Timestamp) -> Vec<&Holder> {
         self.holders.iter().filter(|h| h.live(now)).collect()
     }
 
     /// Whether `mode` can be taken now by `id` (its own entry aside).
-    pub fn admits(&self, id: &str, mode: Mode, now: DateTime<Utc>) -> bool {
+    pub fn admits(&self, id: &str, mode: Mode, now: Timestamp) -> bool {
         self.blockers(id, mode, now).is_empty()
     }
 
     /// The live holders that keep `mode` out.
-    pub fn blockers(&self, id: &str, mode: Mode, now: DateTime<Utc>) -> Vec<&Holder> {
+    pub fn blockers(&self, id: &str, mode: Mode, now: Timestamp) -> Vec<&Holder> {
         self.live(now)
             .into_iter()
             .filter(|h| h.id != id && (mode == Mode::Exclusive || h.mode == Mode::Exclusive))
@@ -115,7 +117,7 @@ impl Lease {
     }
 
     /// This lease with `h` added (or renewed) and expired holders dropped.
-    pub fn with(&self, h: Holder, now: DateTime<Utc>) -> Lease {
+    pub fn with(&self, h: Holder, now: Timestamp) -> Lease {
         let mut holders: Vec<Holder> = self
             .holders
             .iter()
@@ -127,7 +129,7 @@ impl Lease {
     }
 
     /// This lease without `id` (and without expired holders).
-    pub fn without(&self, id: &str, now: DateTime<Utc>) -> Lease {
+    pub fn without(&self, id: &str, now: Timestamp) -> Lease {
         Lease {
             holders: self
                 .holders
@@ -139,7 +141,7 @@ impl Lease {
     }
 
     /// `id`'s holder, if it still holds the lease.
-    pub fn holder(&self, id: &str, now: DateTime<Utc>) -> Option<&Holder> {
+    pub fn holder(&self, id: &str, now: Timestamp) -> Option<&Holder> {
         self.live(now).into_iter().find(|h| h.id == id)
     }
 }
@@ -197,7 +199,7 @@ fn new_id() -> String {
     let seed = format!(
         "{}-{}-{:?}",
         std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        Timestamp::now().as_nanosecond(),
         std::thread::current().id()
     );
     Sha256::digest(seed.as_bytes())
@@ -337,7 +339,7 @@ impl Target {
 
     /// The live holders, for `plan` and `unlock`.
     pub async fn holders(&self) -> Result<Vec<Holder>> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         Ok(self
             .update(|seen| {
                 Ok((
@@ -356,7 +358,7 @@ impl Target {
     /// Removes the whole lease (`runway unlock`) from a holder runway owns
     /// for `app`/`stage`; returns who held it.
     pub async fn clear(&self, app: &str, stage: &str) -> Result<Vec<Holder>> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let short = self.short().to_string();
         Ok(self
             .update(|seen| {
@@ -403,13 +405,19 @@ impl Default for Wait {
 #[derive(Debug)]
 struct State {
     target: String,
+    /// Full resource name of the workload holding the lease.
+    target_name: String,
     /// Not locked (no holder runway owns): nothing to lose.
     active: bool,
     /// The holder did not exist: the lease goes into its creation.
     pending: AtomicBool,
     lost: AtomicBool,
     /// Expiry of the last lease this run wrote (or put into a creation).
-    until: Mutex<DateTime<Utc>>,
+    until: Mutex<Timestamp>,
+    /// Serializes this run's writes to the holder (rollout, annotation
+    /// updates, background renewal) so a renewal never reads before a rollout
+    /// or annotation write and overwrites its annotations afterwards.
+    write: tokio::sync::Mutex<()>,
 }
 
 /// A handle to check, before a change, that this run still holds its lease.
@@ -421,11 +429,24 @@ impl Held {
     pub fn none() -> Held {
         Held(Arc::new(State {
             target: String::new(),
+            target_name: String::new(),
             active: false,
             pending: AtomicBool::new(false),
             lost: AtomicBool::new(false),
-            until: Mutex::new(Utc::now()),
+            until: Mutex::new(Timestamp::now()),
+            write: tokio::sync::Mutex::new(()),
         }))
+    }
+
+    /// Serializes a read-modify-write of `name` with the background lease
+    /// renewal when `name` is the workload holding the lease; returns `None`
+    /// for other workloads or when no lease is active. Hold across the read
+    /// and write only, never across a long wait such as readiness polling.
+    pub async fn writing(&self, name: &str) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if !self.0.active || self.0.target_name != name {
+            return None;
+        }
+        Some(self.0.write.lock().await)
     }
 
     /// Fails when the lease was lost (taken over, removed, or about to
@@ -454,8 +475,8 @@ impl Held {
             return Ok(());
         }
         let until = *s.until.lock().expect("not poisoned");
-        let margin = chrono::Duration::from_std(MARGIN).expect("small");
-        if Utc::now() + margin >= until {
+        let margin = SignedDuration::try_from(MARGIN).expect("small");
+        if Timestamp::now() + margin >= until {
             return Err(lost("it could not be renewed in time"));
         }
         Ok(())
@@ -469,7 +490,7 @@ pub struct Guard {
     id: String,
     mode: Mode,
     by: String,
-    since: DateTime<Utc>,
+    since: Timestamp,
     state: Arc<State>,
     renew: Option<tokio::task::JoinHandle<()>>,
     renew_every: Duration,
@@ -483,7 +504,7 @@ impl Guard {
             id: new_id(),
             mode: Mode::Shared,
             by: String::new(),
-            since: Utc::now(),
+            since: Timestamp::now(),
             state: Held::none().0,
             renew: None,
             renew_every: RENEW_EVERY,
@@ -501,7 +522,7 @@ impl Guard {
     /// (see [`created_by_other`]). `None` without a lease.
     pub fn annotation(&self) -> Option<(String, String)> {
         self.target.as_ref()?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let lease = Lease::default().with(self.holder(now), now);
         if self.state.pending.load(Ordering::SeqCst) {
             *self.state.until.lock().expect("not poisoned") = now + ttl();
@@ -509,7 +530,7 @@ impl Guard {
         Some((ANNOTATION_LEASE.to_string(), lease.encode()?))
     }
 
-    fn holder(&self, now: DateTime<Utc>) -> Holder {
+    fn holder(&self, now: Timestamp) -> Holder {
         Holder {
             id: self.id.clone(),
             mode: self.mode,
@@ -555,7 +576,7 @@ impl Guard {
         let mut poll = wait.poll;
         let mut last_told: Option<(std::time::Instant, String)> = None;
         loop {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let me = self.holder(now);
             let id = self.id.clone();
             let outcome = target
@@ -672,10 +693,12 @@ impl Guard {
             let until = *self.state.until.lock().expect("not poisoned");
             self.state = Arc::new(State {
                 target: target.short().to_string(),
+                target_name: target.name().to_string(),
                 active: true,
                 pending: AtomicBool::new(pending),
                 lost: AtomicBool::new(false),
                 until: Mutex::new(until),
+                write: tokio::sync::Mutex::new(()),
             });
         }
         // A renewal that stopped (it saw another run's holder while this one
@@ -687,6 +710,10 @@ impl Guard {
 
     /// Gives the lease back (best effort: otherwise it expires).
     pub async fn release(mut self, p: &Progress) {
+        // Wait briefly for any in-flight renewal write to finish so release
+        // does not race it on the wire; if renewal is stuck on a slow network
+        // call, give up after 5s, abort it and release anyway (best effort).
+        let _writing = tokio::time::timeout(Duration::from_secs(5), self.state.write.lock()).await;
         if let Some(h) = self.renew.take() {
             h.abort();
         }
@@ -701,7 +728,7 @@ impl Guard {
             return;
         }
         let id = self.id.clone();
-        let now = Utc::now();
+        let now = Timestamp::now();
         if let Err(e) = target
             .update(|seen| Ok((Some(seen.lease.without(&id, now)), ())))
             .await
@@ -724,8 +751,8 @@ impl Drop for Guard {
     }
 }
 
-fn ttl() -> chrono::Duration {
-    chrono::Duration::from_std(TTL).expect("small")
+fn ttl() -> SignedDuration {
+    SignedDuration::try_from(TTL).expect("small")
 }
 
 /// Takes the lease on `target` in `mode`, waiting while runs that exclude
@@ -748,7 +775,7 @@ pub async fn acquire(
         id: new_id(),
         mode,
         by: whoami(command),
-        since: Utc::now(),
+        since: Timestamp::now(),
         state: Held::none().0,
         renew: None,
         renew_every: wait.renew,
@@ -772,7 +799,10 @@ fn spawn_renewal(target: Target, guard: &Guard) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(every).await;
-            let now = Utc::now();
+            // Held across the whole read-modify-write so a rollout or
+            // annotation update cannot interleave and lose its annotations.
+            let _writing = state.write.lock().await;
+            let now = Timestamp::now();
             let me = Holder {
                 id: id.clone(),
                 mode,
@@ -792,8 +822,6 @@ fn spawn_renewal(target: Target, guard: &Guard) -> tokio::task::JoinHandle<()> {
                     *state.until.lock().expect("not poisoned") = me.until;
                     state.pending.store(false, Ordering::SeqCst);
                 }
-                // The holder exists without this run's entry: lost (unless
-                // still waiting for this run to create it).
                 // The holder exists without this run's entry: lost. (A
                 // holder this run creates carries its lease, so a pending run
                 // seeing it without its entry means another run created it.)
@@ -817,7 +845,7 @@ fn spawn_renewal(target: Target, guard: &Guard) -> tokio::task::JoinHandle<()> {
 pub fn created_by_other(ours: Option<&str>, live: Option<&str>, name: &str) -> Option<Error> {
     let ours = Lease::decode(ours);
     let mine = ours.holders.first()?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let theirs = Lease::decode(live);
     let other = theirs
         .blockers(&mine.id, mine.mode, now)
@@ -838,7 +866,7 @@ pub fn created_by_other(ours: Option<&str>, live: Option<&str>, name: &str) -> O
 
 /// Best effort, for `plan`: who holds the lease on `annotations`.
 pub fn status(annotations: &HashMap<String, String>) -> Vec<String> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     Lease::decode(annotations.get(ANNOTATION_LEASE).map(String::as_str))
         .live(now)
         .iter()
@@ -851,19 +879,19 @@ mod tests {
     use super::*;
 
     fn h(id: &str, mode: Mode, until_s: i64) -> Holder {
-        let now = Utc::now();
+        let now = Timestamp::now();
         Holder {
             id: id.into(),
             mode,
             by: format!("run {id}"),
-            since: now - chrono::Duration::seconds(30),
-            until: now + chrono::Duration::seconds(until_s),
+            since: now - SignedDuration::from_secs(30),
+            until: now + SignedDuration::from_secs(until_s),
         }
     }
 
     #[test]
     fn exclusive_excludes_everyone_and_shared_shares() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let free = Lease::default();
         assert!(free.admits("a", Mode::Exclusive, now));
         let shared = Lease {
@@ -891,7 +919,7 @@ mod tests {
 
     #[test]
     fn expired_holders_do_not_count_and_are_dropped() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let stale = Lease {
             holders: vec![h("old", Mode::Exclusive, -1)],
         };
@@ -917,7 +945,7 @@ mod tests {
 
     #[test]
     fn a_write_over_another_run_s_lease_is_refused() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mine = Lease::default()
             .with(h("me", Mode::Exclusive, 60), now)
             .encode();
@@ -950,13 +978,15 @@ mod tests {
     fn a_lost_or_unrenewed_lease_stops_the_run() {
         let held = Held(Arc::new(State {
             target: "shop-prod".into(),
+            target_name: "projects/p/locations/r/services/shop-prod".into(),
             active: true,
             pending: AtomicBool::new(false),
             lost: AtomicBool::new(false),
-            until: Mutex::new(Utc::now() + chrono::Duration::seconds(100)),
+            until: Mutex::new(Timestamp::now() + SignedDuration::from_secs(100)),
+            write: tokio::sync::Mutex::new(()),
         }));
         assert!(held.check().is_ok());
-        *held.0.until.lock().unwrap() = Utc::now() + chrono::Duration::seconds(5);
+        *held.0.until.lock().unwrap() = Timestamp::now() + SignedDuration::from_secs(5);
         let e = held.check().unwrap_err();
         assert!(
             e.message.contains("could not be renewed in time"),
