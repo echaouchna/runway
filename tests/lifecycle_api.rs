@@ -525,13 +525,13 @@ async fn an_update_never_overwrites_another_run_s_lease() {
     let s = MockServer::start().await;
     let (_dir, r) = resolved("service: {}");
     let d = r.first();
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let entry = |id: &str| runway::lease::Holder {
         id: id.into(),
         mode: runway::lease::Mode::Exclusive,
         by: format!("run {id}"),
         since: now,
-        until: now + chrono::Duration::minutes(2),
+        until: now + jiff::SignedDuration::from_mins(2),
     };
     let lease = |id: &str| {
         runway::lease::Lease::default()

@@ -43,6 +43,10 @@ changes are listed in the [changelog](https://github.com/echaouchna/runway/blob/
 
 **Several runs at once**
 
+- Cloud Run v2 does not enforce `etag` on masked service updates, so two runs
+  that try to take a free lease at the exact same instant can race; runway
+  verifies the returned annotation after writing and stops a run if a later
+  renewal sees its entry was overwritten.
 - The lease's expiry relies on the runners' clocks (CI runners keep them
   synchronized; the 2-minute expiry absorbs small differences).
 - Each renewal (every 30 seconds) is an update of the holder service's

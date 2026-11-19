@@ -70,7 +70,7 @@ pub async fn run(ctx: &Context, args: LogsArgs) -> Result<()> {
     };
     let session = crate::commands::connect(ctx, d).await?;
     let client = build_client!(LoggingServiceV2, session)?;
-    let filter = logging::service_filter(&q, chrono::Utc::now());
+    let filter = logging::service_filter(&q, jiff::Timestamp::now());
     tracing::debug!(%filter, "log filter");
     let lines = logging::fetch(&client, &d.project, &filter, q.limit).await?;
 
@@ -93,9 +93,7 @@ pub async fn run(ctx: &Context, args: LogsArgs) -> Result<()> {
         let last = lines
             .last()
             .map(|l| l.timestamp.clone())
-            .unwrap_or_else(|| {
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-            });
+            .unwrap_or_else(|| logging::format_rfc3339_micros(jiff::Timestamp::now()));
         let mut seen = logging::SeenIds::default();
         for l in &lines {
             seen.insert(&l.insert_id);

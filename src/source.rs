@@ -4,7 +4,7 @@
 //! branch deployed by mistake). `--allow-older` rolls back on purpose.
 
 use crate::error::{Error, ErrorKind, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -15,7 +15,7 @@ pub const ANNOTATION_SOURCE: &str = "runway.dev/source";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Source {
     pub commit: String,
-    pub time: DateTime<Utc>,
+    pub time: Timestamp,
     /// The checkout had uncommitted changes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dirty: bool,
@@ -41,7 +41,7 @@ impl std::fmt::Display for Source {
             f,
             "commit {} of {}{}",
             self.short(),
-            self.time.format("%Y-%m-%d %H:%M:%S UTC"),
+            self.time.strftime("%Y-%m-%d %H:%M:%S UTC"),
             if self.dirty {
                 ", with uncommitted changes"
             } else {
@@ -69,15 +69,12 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 pub fn current(dir: &Path) -> Option<Source> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     if let (Some(commit), Some(time)) = (env("RUNWAY_SOURCE_COMMIT"), env("RUNWAY_SOURCE_TIME")) {
-        let time = DateTime::parse_from_rfc3339(time.trim())
-            .map(|t| t.with_timezone(&Utc))
-            .ok()
-            .or_else(|| {
-                time.trim()
-                    .parse::<i64>()
-                    .ok()
-                    .and_then(|s| DateTime::from_timestamp(s, 0))
-            })?;
+        let time = time.trim().parse::<Timestamp>().ok().or_else(|| {
+            time.trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|s| Timestamp::from_second(s).ok())
+        })?;
         return Some(Source {
             commit: commit.trim().to_string(),
             time,
@@ -88,7 +85,7 @@ pub fn current(dir: &Path) -> Option<Source> {
     let (commit, secs) = line.split_once(' ')?;
     Some(Source {
         commit: commit.to_string(),
-        time: DateTime::from_timestamp(secs.parse().ok()?, 0)?,
+        time: Timestamp::from_second(secs.parse().ok()?).ok()?,
         dirty: git(dir, &["status", "--porcelain", "--untracked-files=no"])
             .is_some_and(|s| !s.is_empty()),
     })
@@ -270,7 +267,7 @@ mod tests {
     fn s(commit: &str, secs: i64) -> Source {
         Source {
             commit: commit.into(),
-            time: DateTime::from_timestamp(secs, 0).unwrap(),
+            time: Timestamp::from_second(secs).unwrap(),
             dirty: false,
         }
     }

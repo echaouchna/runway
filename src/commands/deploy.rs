@@ -421,6 +421,7 @@ async fn run_single(
     {
         Ok(done) => steps.extend(done),
         Err(e) => {
+            let _writing = held.writing(&name).await;
             let _ = save_grants(&reconciler, &name, existing.as_ref(), &record_now(), p).await;
             return Err(e);
         }
@@ -517,13 +518,12 @@ async fn run_single(
     // What runway granted so far is recorded now, whatever comes next: a grant
     // made before a failure (an empty secret, a failed build, a rollout
     // refused) would otherwise look pre-existing and never be revoked.
-    let saved = save_grants(&reconciler, &name, existing.as_ref(), &record_now(), p).await;
-    let (built, (done, pinned_secrets, secret_notes)): (Option<BuiltImage>, _) = joined?;
-    // A record written changed the service's etag: the rollout starts from it.
-    let existing = match saved? {
-        true => reconciler.get(&name).await?,
-        false => existing,
+    let saved = {
+        let _writing = held.writing(&name).await;
+        save_grants(&reconciler, &name, existing.as_ref(), &record_now(), p).await
     };
+    let (built, (done, pinned_secrets, secret_notes)): (Option<BuiltImage>, _) = joined?;
+    saved?;
     steps.extend(done);
     for n in secret_notes {
         p.warn(n);
@@ -598,7 +598,6 @@ async fn run_single(
     // First deploy with `bootstrap`: a placeholder service that organization
     // policies accept, so the service's tags exist (and are effective) before
     // the real configuration (for example `ingress: all`) is applied.
-    let mut existing = existing;
     let mut done_tags: Vec<String> = Vec::new();
     let bootstrapped = if existing.is_none()
         && let Some(bs) = &d.service.bootstrap
@@ -622,7 +621,6 @@ async fn run_single(
         with_retry(&retry, p, what, |attempt| {
             let (held, reconciler, name, placeholder) = (&held, &reconciler, &name, &placeholder);
             async move {
-                held.check()?;
                 roll_out(
                     reconciler,
                     d,
@@ -630,6 +628,7 @@ async fn run_single(
                     placeholder,
                     if attempt == 1 { Some(None) } else { None },
                     false,
+                    held,
                     p,
                 )
                 .await
@@ -684,22 +683,38 @@ async fn run_single(
     let (reconciler_ref, name_ref, spec_ref) = (&reconciler, &name, &base_spec);
     let adopt = args.adopt;
     let held_ref = &held;
+    let is_new = existing.is_none();
     let (applied, svc, changes) = with_retry(&retry, p, "deploy service", |attempt| {
-        let known = if attempt == 1 { Some(existing.clone()) } else { None };
+        // An existing service is re-read right before updating: the background
+        // lease renewal (or another shared preview) updates its annotations
+        // during the build, so a pre-build snapshot would carry a stale lease.
+        let known = if attempt == 1 && is_new {
+            Some(None)
+        } else {
+            None
+        };
         async move {
-            held_ref.check()?;
-            roll_out(reconciler_ref, d, name_ref, spec_ref, known, adopt, p)
-                .await
-                .map_err(|mut e| {
-                    if tag_just_bound && e.permanent && e.message.contains("constraints/") {
-                        e.permanent = false;
-                        e.hints.insert(
-                            0,
-                            "a tag was bound moments ago; organization policies can take a few minutes to see it".into(),
-                        );
-                    }
-                    e
-                })
+            roll_out(
+                reconciler_ref,
+                d,
+                name_ref,
+                spec_ref,
+                known,
+                adopt,
+                held_ref,
+                p,
+            )
+            .await
+            .map_err(|mut e| {
+                if tag_just_bound && e.permanent && e.message.contains("constraints/") {
+                    e.permanent = false;
+                    e.hints.insert(
+                        0,
+                        "a tag was bound moments ago; organization policies can take a few minutes to see it".into(),
+                    );
+                }
+                e
+            })
         }
     })
     .await?;
@@ -760,6 +775,7 @@ async fn run_single(
     match provisioner.apply_all(&remaining, &retry, p, &report).await {
         Ok(done) => steps.extend(done),
         Err(e) => {
+            let _writing = held.writing(&name).await;
             let live = reconciler.get(&name).await.ok().flatten();
             let record = grant_record(&recorded, &desired_grants, &provisioner.granted(), true);
             let _ = save_grants(&reconciler, &name, live.as_ref(), &record, p).await;
@@ -775,8 +791,12 @@ async fn run_single(
     );
     if final_record != record {
         let value = encode_grants(&final_record);
-        with_retry(&retry, p, "record grants", |_| {
-            reconciler.set_annotation(&name, ANNOTATION_GRANTS, &value)
+        with_retry(&retry, p, "record grants", |_| async {
+            let _writing = held.writing(&name).await;
+            held.check()?;
+            reconciler
+                .set_annotation(&name, ANNOTATION_GRANTS, &value)
+                .await
         })
         .await
         .map_err(|e| after_rollout(e, d, url.as_deref()))?;
@@ -824,6 +844,7 @@ async fn run_single(
     };
     if records_source && let Some(value) = record {
         with_retry(&retry, p, "record the deployed commit", |_| async {
+            let _writing = held.writing(&name).await;
             held.check()?;
             reconciler
                 .put_annotation(&name, crate::source::ANNOTATION_SOURCE, value.as_deref())
@@ -913,8 +934,9 @@ pub(crate) async fn save_grants(
         })
 }
 
-/// One idempotent roll-out attempt: re-reads the service (except on the first
-/// attempt), checks ownership, applies changes and waits for readiness.
+/// One idempotent roll-out attempt: re-reads the service (unless `known` is
+/// supplied), checks ownership, applies changes and waits for readiness.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn roll_out(
     reconciler: &Reconciler<'_>,
     d: &Deployment,
@@ -922,84 +944,92 @@ pub(crate) async fn roll_out(
     base_spec: &ServiceSpec,
     known: Option<Option<Service>>,
     adopt: bool,
+    held: &crate::lease::Held,
     p: &Progress,
 ) -> Result<(Applied, Service, Vec<crate::plan::FieldChange>)> {
-    let existing = match known {
-        Some(e) => e,
-        None => reconciler.get(name).await?,
-    };
-    if let Some(svc) = &existing {
-        check_ownership(svc, &d.app, &d.stage, adopt)?;
-    }
-    let mut spec = run::spec_for_live(base_spec, existing.as_ref());
-    // A preview or canary always runs in a revision of its own (marked by a
-    // template annotation), even when its code and configuration equal what
-    // already serves: otherwise its URL would point at the production revision.
-    if let Some((key, value)) = run::revision_marker(&spec.traffic.mode) {
-        spec.revision_annotations.insert(key.to_string(), value);
-    }
-    let mut force = existing
-        .as_ref()
-        .is_some_and(|s| run::needs_own_revision(s, &spec.traffic.mode));
-    // The revision behind the URL this deploy changes (the main URL, the
-    // preview's tag or the canary) may already run this configuration: it
-    // then keeps serving, and no revision is created nor traffic moved.
-    if let Some(svc) = &existing {
-        let new_revision = force
-            || diff(&run::observed_flat(svc), &spec.flatten())
-                .iter()
-                .any(|c| !run::is_service_level(&c.field));
-        if new_revision
-            && let Some((target, revision)) = reconciler.matching_revision(svc, &spec).await
-        {
-            p.info(format!(
-                "{revision} already runs this configuration: no new revision"
-            ));
-            spec.traffic.serve = Some(target);
-            spec = spec.with_current_traffic(Some(&run::current_traffic(svc)));
-            force = false;
+    let (existing, applied, changes) = {
+        let _writing = held.writing(name).await;
+        held.check()?;
+        let existing = match known {
+            Some(e) => e,
+            None => reconciler.get(name).await?,
+        };
+        if let Some(svc) = &existing {
+            check_ownership(svc, &d.app, &d.stage, adopt)?;
         }
-    }
-    // An owned service whose spec already matches but whose latest revision
-    // failed gets a fresh revision (for example after a grant propagated).
-    if !force
-        && spec.traffic.serve.is_none()
-        && let Some(svc) = &existing
-        && diff(&run::observed_flat(svc), &spec.flatten()).is_empty()
-        && matches!(run::readiness(svc), Readiness::Failed { .. })
-    {
-        p.info("configuration unchanged but the latest revision is failing; rolling out a new revision");
-        spec.revision_annotations.insert(
-            "runway.dev/redeployed-at".into(),
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        );
-        force = true;
-    }
-    // Every field this rollout changes (all of them for a new service).
-    let changes: Vec<crate::plan::FieldChange> = match &existing {
-        Some(svc) => run::pending_changes(svc, &spec),
-        None => spec
-            .flatten()
-            .into_iter()
-            .map(|(field, v)| crate::plan::FieldChange {
-                field,
-                before: None,
-                after: Some(v),
-            })
-            .collect(),
+        let mut spec = run::spec_for_live(base_spec, existing.as_ref());
+        // A preview or canary always runs in a revision of its own (marked by a
+        // template annotation), even when its code and configuration equal what
+        // already serves: otherwise its URL would point at the production revision.
+        if let Some((key, value)) = run::revision_marker(&spec.traffic.mode) {
+            spec.revision_annotations.insert(key.to_string(), value);
+        }
+        let mut force = existing
+            .as_ref()
+            .is_some_and(|s| run::needs_own_revision(s, &spec.traffic.mode));
+        // The revision behind the URL this deploy changes (the main URL, the
+        // preview's tag or the canary) may already run this configuration: it
+        // then keeps serving, and no revision is created nor traffic moved.
+        if let Some(svc) = &existing {
+            let new_revision = force
+                || diff(&run::observed_flat(svc), &spec.flatten())
+                    .iter()
+                    .any(|c| !run::is_service_level(&c.field));
+            if new_revision
+                && let Some((target, revision)) = reconciler.matching_revision(svc, &spec).await
+            {
+                p.info(format!(
+                    "{revision} already runs this configuration: no new revision"
+                ));
+                spec.traffic.serve = Some(target);
+                spec = spec.with_current_traffic(Some(&run::current_traffic(svc)));
+                force = false;
+            }
+        }
+        // An owned service whose spec already matches but whose latest revision
+        // failed gets a fresh revision (for example after a grant propagated).
+        if !force
+            && spec.traffic.serve.is_none()
+            && let Some(svc) = &existing
+            && diff(&run::observed_flat(svc), &spec.flatten()).is_empty()
+            && matches!(run::readiness(svc), Readiness::Failed { .. })
+        {
+            p.info("configuration unchanged but the latest revision is failing; rolling out a new revision");
+            spec.revision_annotations.insert(
+                "runway.dev/redeployed-at".into(),
+                jiff::Timestamp::now()
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string(),
+            );
+            force = true;
+        }
+        // Every field this rollout changes (all of them for a new service).
+        let changes: Vec<crate::plan::FieldChange> = match &existing {
+            Some(svc) => run::pending_changes(svc, &spec),
+            None => spec
+                .flatten()
+                .into_iter()
+                .map(|(field, v)| crate::plan::FieldChange {
+                    field,
+                    before: None,
+                    after: Some(v),
+                })
+                .collect(),
+        };
+        p.details(&change_lines(&changes));
+        let parent = d.parent();
+        let target = Target {
+            parent: &parent,
+            service_id: &d.service_id,
+            name,
+            app: &d.app,
+            stage: &d.stage,
+            adopt,
+            force,
+        };
+        let applied = reconciler.apply(&target, &spec, existing.clone()).await?;
+        (existing, applied, changes)
     };
-    p.details(&change_lines(&changes));
-    let parent = d.parent();
-    let target = Target {
-        parent: &parent,
-        service_id: &d.service_id,
-        name,
-        app: &d.app,
-        stage: &d.stage,
-        adopt,
-        force,
-    };
-    let applied = reconciler.apply(&target, &spec, existing.clone()).await?;
     let svc = match existing {
         Some(s)
             if applied.change == ServiceChange::Unchanged
@@ -1307,5 +1337,206 @@ mod tests {
         assert_eq!(r.attempts, 8);
         assert_eq!(r.delay, std::time::Duration::from_secs(60));
         assert!(r.max_delay >= r.delay);
+    }
+
+    #[tokio::test]
+    async fn roll_out_re_reads_live_lease_even_when_server_ignores_etag() {
+        use crate::lease::{self, Mode, Target as LeaseTarget, Wait};
+        use google_cloud_auth::credentials::anonymous;
+        use serde_json::{Value, json};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::Notify;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runway.yaml");
+        std::fs::write(
+            &p,
+            "version: 1\napp: shop\nprovider: {project: my-gcp-project, region: europe-west1}\nservice: {image: nginx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, service_account: rt@my-gcp-project.iam.gserviceaccount.com}\nstages: {prod: {}}\n",
+        )
+        .unwrap();
+        let d = crate::config::load_and_resolve(&p, "prod", &Default::default())
+            .unwrap()
+            .1
+            .deployments[0]
+            .clone();
+        let name = d.service_name();
+
+        #[derive(Clone)]
+        struct FakeRun {
+            svc: Arc<Mutex<Value>>,
+            writes: Arc<AtomicUsize>,
+            wrote: Arc<Notify>,
+        }
+        impl Respond for FakeRun {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let mut svc = self.svc.lock().unwrap();
+                match req.method.as_str() {
+                    "GET" => ResponseTemplate::new(200).set_body_json(svc.clone()),
+                    "PATCH" => {
+                        let body: Value = serde_json::from_slice(&req.body).unwrap();
+                        // Intentionally ignore etag to match Cloud Run v2 with updateMask.
+                        svc["annotations"] = body["annotations"].clone();
+                        if let Some(t) = body.get("template") {
+                            svc["template"] = t.clone();
+                        }
+                        let g = svc["generation"].as_i64().unwrap_or(1) + 1;
+                        svc["generation"] = json!(g);
+                        svc["observedGeneration"] = json!(g);
+                        svc["etag"] = json!(format!("e{g}"));
+                        self.writes.fetch_add(1, Ordering::SeqCst);
+                        self.wrote.notify_waiters();
+                        let mut done = svc.clone();
+                        done["@type"] = json!("type.googleapis.com/google.cloud.run.v2.Service");
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "name": "projects/my-gcp-project/locations/europe-west1/operations/op-1",
+                            "done": true,
+                            "response": done
+                        }))
+                    }
+                    _ => ResponseTemplate::new(405),
+                }
+            }
+        }
+
+        let initial = json!({
+            "name": name,
+            "uri": "https://shop-prod.example.run.app",
+            "etag": "e1",
+            "generation": 1,
+            "observedGeneration": 1,
+            "reconciling": false,
+            "latestReadyRevision": format!("{name}/revisions/shop-prod-00001-aaa"),
+            "latestCreatedRevision": format!("{name}/revisions/shop-prod-00001-aaa"),
+            "terminalCondition": {"type": "Ready", "state": "CONDITION_SUCCEEDED"},
+            "labels": {
+                "managed-by": "runway",
+                "runway-app": "shop",
+                "runway-stage": "prod"
+            },
+            "annotations": {},
+            "template": {
+                "containers": [{
+                    "image": "nginx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }]
+            }
+        });
+        let fake = FakeRun {
+            svc: Arc::new(Mutex::new(initial)),
+            writes: Default::default(),
+            wrote: Arc::new(Notify::new()),
+        };
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/v2/{name}")))
+            .respond_with(fake.clone())
+            .mount(&server)
+            .await;
+        Mock::given(path(
+            "/v2/projects/my-gcp-project/locations/europe-west1/operations/op-1",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "projects/my-gcp-project/locations/europe-west1/operations/op-1",
+            "done": true
+        })))
+        .mount(&server)
+        .await;
+
+        let run = Services::builder()
+            .with_endpoint(server.uri())
+            .with_credentials(anonymous::Builder::new().build())
+            .build()
+            .await
+            .unwrap();
+        let target = LeaseTarget::Service {
+            run: run.clone(),
+            name: name.clone(),
+        };
+        let guard = lease::acquire(
+            target,
+            Mode::Shared,
+            "shop",
+            "prod",
+            "runway deploy --stage prod --preview feat",
+            Wait {
+                timeout: None,
+                poll: std::time::Duration::from_millis(20),
+                renew: std::time::Duration::from_millis(20),
+            },
+            &Progress::silent(),
+        )
+        .await
+        .unwrap();
+        let held = guard.held();
+
+        // Wait deterministically for at least one background renewal after acquire
+        // (analogous to a long build renewing the lease after initial inspection).
+        let before_renew = fake.writes.load(Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fake.writes.load(Ordering::SeqCst) <= before_renew {
+                fake.wrote.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        let renewed_lease = fake.svc.lock().unwrap()["annotations"][lease::ANNOTATION_LEASE]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Roll out with `known = None` (as `deploy` now does for existing services).
+        let reconciler = Reconciler {
+            run: &run,
+            revisions: None,
+            progress: &Progress::silent(),
+            poll: PollConfig::fast(),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let mut annotations = std::collections::BTreeMap::new();
+        if let Some((k, v)) = guard.annotation() {
+            annotations.insert(k, v);
+        }
+        let spec = ServiceSpec::from_deployment(
+            &d,
+            "nginx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            annotations,
+        );
+        let (applied, _svc, _changes) = roll_out(
+            &reconciler,
+            &d,
+            &name,
+            &spec,
+            None,
+            false,
+            &held,
+            &Progress::silent(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.change, ServiceChange::Updated);
+
+        // Wait for one more renewal after rollout and confirm the lease was not lost.
+        let after_rollout = fake.writes.load(Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fake.writes.load(Ordering::SeqCst) <= after_rollout {
+                fake.wrote.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            held.check().is_ok(),
+            "lease must remain held after roll_out"
+        );
+        let latest_lease = fake.svc.lock().unwrap()["annotations"][lease::ANNOTATION_LEASE]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = lease::Lease::decode(Some(&renewed_lease));
+        let after = lease::Lease::decode(Some(&latest_lease));
+        assert!(after.holders[0].until >= before.holders[0].until);
+
+        guard.release(&Progress::silent()).await;
     }
 }

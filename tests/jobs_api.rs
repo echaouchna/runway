@@ -91,10 +91,13 @@ async fn a_job_is_created_with_its_task_settings_and_awaited() {
         poll: PollConfig::fast(),
         timeout: Duration::from_secs(5),
     };
-    let change = rec
-        .apply(PARENT, &d.service_id, &spec, settings, None, "shop", "prod")
+    let (change, op) = rec
+        .start_apply(PARENT, &d.service_id, &spec, settings, None, "shop", "prod")
         .await
         .unwrap();
+    if let Some(op) = op {
+        rec.wait(&op, &d.service_id).await.unwrap();
+    }
     assert_eq!(change, JobChange::Created);
 
     let reqs = server.received_requests().await.unwrap();

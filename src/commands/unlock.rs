@@ -36,7 +36,7 @@ pub async fn run(ctx: &Context, args: UnlockArgs) -> Result<()> {
         holders,
         removed: args.yes,
     };
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     match ctx.output {
         OutputFormat::Json => print_json(&report),
         OutputFormat::Text => {

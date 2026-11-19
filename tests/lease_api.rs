@@ -7,9 +7,10 @@ use runway::error::ErrorKind;
 use runway::lease::{self, Guard, Lease, Mode, Target, Wait};
 use runway::output::Progress;
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 use wiremock::matchers::path;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -23,6 +24,11 @@ struct Fake {
     conflicts: Arc<AtomicUsize>,
     /// Writes whose operation completes with an error (nothing applied).
     failures: Arc<AtomicUsize>,
+    /// When true, PATCH does not reject stale etags (to test writes that
+    /// rely on a fresh read rather than etag rejection).
+    ignore_etag: Arc<AtomicBool>,
+    /// Signaled after each committed write so tests wait deterministically.
+    wrote: Arc<Notify>,
 }
 
 impl Fake {
@@ -32,7 +38,21 @@ impl Fake {
             writes: Default::default(),
             conflicts: Default::default(),
             failures: Default::default(),
+            ignore_etag: Default::default(),
+            wrote: Arc::new(Notify::new()),
         }
+    }
+
+    /// Waits until `writes` exceeds `since`.
+    async fn wait_write(&self, since: usize) {
+        let deadline = Duration::from_secs(5);
+        tokio::time::timeout(deadline, async {
+            while self.writes.load(Ordering::SeqCst) <= since {
+                self.wrote.notified().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for a write");
     }
 
     fn lease(&self) -> Lease {
@@ -56,7 +76,7 @@ impl Respond for Fake {
             "GET" => ResponseTemplate::new(200).set_body_json(svc.clone()),
             "PATCH" => {
                 let body: Value = serde_json::from_slice(&req.body).unwrap();
-                let stale = body["etag"] != svc["etag"];
+                let stale = !self.ignore_etag.load(Ordering::SeqCst) && body["etag"] != svc["etag"];
                 if stale || self.conflicts.load(Ordering::SeqCst) > 0 {
                     if !stale {
                         self.conflicts.fetch_sub(1, Ordering::SeqCst);
@@ -85,6 +105,7 @@ impl Respond for Fake {
                 svc["etag"] = json!(format!("e{}", n + 1));
                 let mut done = svc.clone();
                 done["@type"] = json!("type.googleapis.com/google.cloud.run.v2.Service");
+                self.wrote.notify_waiters();
                 ResponseTemplate::new(200).set_body_json(json!({
                     "name": "projects/p/locations/l/operations/op", "done": true, "response": done
                 }))
@@ -261,11 +282,11 @@ async fn a_concurrent_write_makes_it_read_again() {
 
 #[tokio::test]
 async fn an_expired_lease_is_taken_over() {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let stale = json!({"holders": [{
         "id": "gone", "mode": "exclusive", "by": "a killed runner",
-        "since": (now - chrono::Duration::minutes(10)).to_rfc3339(),
-        "until": (now - chrono::Duration::seconds(5)).to_rfc3339()
+        "since": (now - jiff::SignedDuration::from_mins(10)).to_string(),
+        "until": (now - jiff::SignedDuration::from_secs(5)).to_string()
     }]});
     let fake = Fake::new(Some(service(
         owned(),
@@ -304,21 +325,22 @@ async fn a_first_deploy_creates_the_holder_with_its_lease() {
     let mine = Lease::decode(Some(&value));
     assert_eq!(mine.holders.len(), 1);
     assert!(
-        mine.holders[0].until > chrono::Utc::now(),
+        mine.holders[0].until > jiff::Timestamp::now(),
         "valid from creation"
     );
 
     // Another run created the service first, with its own lease: this one stops.
+    let now = jiff::Timestamp::now();
     let theirs = Lease::default()
         .with(
             lease::Holder {
                 id: "other".into(),
                 mode: Mode::Exclusive,
                 by: "another runner".into(),
-                since: chrono::Utc::now(),
-                until: chrono::Utc::now() + chrono::Duration::minutes(2),
+                since: now,
+                until: now + jiff::SignedDuration::from_mins(2),
             },
-            chrono::Utc::now(),
+            now,
         )
         .encode();
     let e = lease::created_by_other(Some(&value), theirs.as_deref(), "shop-prod").expect("stops");
@@ -347,7 +369,7 @@ async fn unlock_shows_and_removes_the_lease() {
 }
 
 fn other_lease(by: &str) -> String {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     Lease::default()
         .with(
             lease::Holder {
@@ -355,7 +377,7 @@ fn other_lease(by: &str) -> String {
                 mode: Mode::Exclusive,
                 by: by.into(),
                 since: now,
-                until: now + chrono::Duration::minutes(2),
+                until: now + jiff::SignedDuration::from_mins(2),
             },
             now,
         )
@@ -505,5 +527,143 @@ async fn a_confirmed_lease_keeps_being_renewed() {
         "renewed after confirmation: {first} then {later}"
     );
     assert!(g.held().check().is_ok());
+    g.release(&Progress::silent()).await;
+}
+
+#[tokio::test]
+async fn holder_writes_serialize_with_renewal_and_keep_renewed_lease() {
+    use runway::deploy::{Reconciler, Target as DeployTarget};
+    use runway::plan::ServiceSpec;
+    use runway::poll::PollConfig;
+
+    let fake = Fake::new(Some(service(
+        owned(),
+        json!({"runway.dev/image-ref": "old-ref"}),
+    )));
+    // Match real Cloud Run v2 where PATCH with updateMask does not reject stale etags.
+    fake.ignore_etag.store(true, Ordering::SeqCst);
+    let (s, t) = target(&fake).await;
+    let fast = Wait {
+        renew: Duration::from_millis(20),
+        ..no_wait()
+    };
+    let g = take(&t, Mode::Shared, fast).await.unwrap();
+    let held = g.held();
+    // Non-holder workloads do not acquire the holder's write lock.
+    assert!(
+        held.writing("projects/my-gcp-project/locations/europe-west1/services/other")
+            .await
+            .is_none()
+    );
+    // A second preview shares the lease while the first is building.
+    let peer = take(&t, Mode::Shared, no_wait()).await.unwrap();
+    assert_eq!(fake.lease().holders.len(), 2);
+
+    // Deterministically wait for a background renewal to advance the lease.
+    let initial_until = fake.lease().holders[0].until;
+    let writes_before = fake.writes.load(Ordering::SeqCst);
+    fake.wait_write(writes_before).await;
+    assert!(fake.lease().holders[0].until > initial_until);
+
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(s.uri())
+        .with_credentials(anonymous::Builder::new().build())
+        .build()
+        .await
+        .unwrap();
+    let rec = Reconciler {
+        run: &run,
+        revisions: None,
+        progress: &Progress::silent(),
+        poll: PollConfig::fast(),
+        timeout: Duration::from_secs(5),
+    };
+    {
+        let _writing = held
+            .writing(NAME)
+            .await
+            .expect("holder acquires the write lock");
+        let writes_while_locked = fake.writes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            fake.writes.load(Ordering::SeqCst),
+            writes_while_locked,
+            "background renewal waits while a holder write is in progress"
+        );
+        // Fresh read right before apply preserves both shared holders and the
+        // renewed expiry, and records the new rollout annotations.
+        let fresh = rec.get(NAME).await.unwrap();
+        let mut annotations = std::collections::BTreeMap::new();
+        annotations.insert("runway.dev/image-ref".into(), "new-ref".into());
+        if let Some((k, v)) = g.annotation() {
+            annotations.insert(k, v);
+        }
+        let spec = ServiceSpec {
+            image: "europe-west1-docker.pkg.dev/my-gcp-project/runway/shop@sha256:1111".into(),
+            port: 8080,
+            cpu: "1".into(),
+            memory: "512Mi".into(),
+            timeout_seconds: 300,
+            concurrency: 80,
+            min_instances: 0,
+            max_instances: 1,
+            service_account: "shop-run@my-gcp-project.iam.gserviceaccount.com".into(),
+            ingress: "all".into(),
+            health_check: None,
+            otel_collector: None,
+            sidecars: Default::default(),
+            env: Default::default(),
+            secrets: Default::default(),
+            labels: [
+                ("managed-by".into(), "runway".into()),
+                ("runway-app".into(), "shop".into()),
+                ("runway-stage".into(), "prod".into()),
+            ]
+            .into_iter()
+            .collect(),
+            volumes: Default::default(),
+            iap_enabled: false,
+            billing: "request-based".into(),
+            startup_cpu_boost: false,
+            execution_environment: None,
+            sandbox: false,
+            command: Vec::new(),
+            args: Vec::new(),
+            vpc: None,
+            cloud_sql: Vec::new(),
+            custom_audiences: Vec::new(),
+            annotations,
+            revision_annotations: Default::default(),
+            provenance: Default::default(),
+            traffic: Default::default(),
+        };
+        let dt = DeployTarget {
+            parent: "projects/my-gcp-project/locations/europe-west1",
+            service_id: "shop-prod",
+            name: NAME,
+            app: "shop",
+            stage: "prod",
+            adopt: false,
+            force: true,
+        };
+        rec.apply(&dt, &spec, fresh).await.unwrap();
+    }
+
+    // Deterministically wait for the next renewal after `_writing` drops.
+    let after_rollout = fake.writes.load(Ordering::SeqCst);
+    fake.wait_write(after_rollout).await;
+    assert!(held.check().is_ok(), "lease stays held after rollout");
+    assert_eq!(
+        fake.lease().holders.len(),
+        2,
+        "peer shared lease survived rollout"
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().as_ref().unwrap()["annotations"]["runway.dev/image-ref"],
+        "new-ref",
+        "renewals kept the rollout's annotations"
+    );
+
+    peer.release(&Progress::silent()).await;
     g.release(&Progress::silent()).await;
 }

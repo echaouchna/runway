@@ -43,7 +43,7 @@ mod humantime_serde_compat {
         d: &std::time::Duration,
         s: S,
     ) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&humantime::format_duration(*d).to_string())
+        s.serialize_str(&crate::duration::format_duration(*d))
     }
 }
 
@@ -86,7 +86,7 @@ where
                     "{step}: attempt {attempt}/{} failed: {}; retrying in {}",
                     cfg.attempts,
                     e.message,
-                    humantime::format_duration(wait)
+                    crate::duration::format_duration(wait)
                 ));
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {

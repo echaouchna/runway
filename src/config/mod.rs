@@ -2923,7 +2923,7 @@ fn resolve_retry(d: &mut Diagnostics, raw: Option<&schema::RawRetry>) -> crate::
     let dur =
         |d: &mut Diagnostics, v: &Option<String>, path: &str| -> Option<std::time::Duration> {
             let s = v.as_ref()?;
-            match humantime::parse_duration(s) {
+            match crate::duration::parse_duration(s) {
                 Ok(x) if x <= std::time::Duration::from_secs(3600) => Some(x),
                 Ok(_) => {
                     d.error(path, "must be at most 1h");
