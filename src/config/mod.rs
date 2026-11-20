@@ -607,6 +607,9 @@ pub struct ServiceConfig {
     pub min_instances: u32,
     pub max_instances: u32,
     pub public: bool,
+    /// Granted `roles/run.invoker` on the service (recorded, revoked once
+    /// removed).
+    pub invokers: Vec<String>,
     /// `all`, `internal` or `internal-and-cloud-load-balancing`.
     pub ingress: String,
     pub health_check: Option<HealthCheck>,
@@ -2403,6 +2406,33 @@ fn resolve_workload(
         }
     };
 
+    // ---- invokers ----
+    let mut invokers: Vec<String> = Vec::new();
+    if let Some((raw, path)) = s!(invokers) {
+        for (i, m) in raw.iter().enumerate() {
+            let mpath = format!("{path}[{i}]");
+            let m = ixs(&mut d, m, &mpath);
+            if m == "allUsers" || m == "allAuthenticatedUsers" {
+                d.error(
+                    mpath,
+                    format!("`{m}` cannot be an invoker; use `public: true` to open the service"),
+                );
+            } else if let Err(e) = validate::iam_member(&m) {
+                d.error(mpath, e);
+            } else if invokers.iter().any(|x| crate::gcp::iam::same_member(x, &m)) {
+                d.warn(mpath, format!("`{m}` is listed twice"));
+            } else {
+                invokers.push(m);
+            }
+        }
+        if public && !invokers.is_empty() {
+            d.warn(
+                path,
+                "`public: true` already lets everyone invoke the service; `invokers` adds nothing",
+            );
+        }
+    }
+
     // ---- identity ----
     let identity = match s!(identity) {
         None => IdentityConfig::default(),
@@ -2487,6 +2517,7 @@ fn resolve_workload(
                 min_instances,
                 max_instances,
                 public,
+                invokers,
                 ingress,
                 health_check,
                 bootstrap,

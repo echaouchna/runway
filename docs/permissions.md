@@ -4,7 +4,7 @@ runway keeps three identities separate:
 
 | Identity | What it does | Minimum roles |
 |----------|--------------|---------------|
-| **Deployer** (you / CI) | runs `runway`; uploads sources, submits builds, creates/updates the service, reads logs | `roles/run.developer` (+ `run.services.setIamPolicy`, e.g. `roles/run.admin`, to switch public access), `roles/cloudbuild.builds.editor`, `roles/logging.viewer`, `roles/storage.objectUser` on the bucket, `roles/artifactregistry.reader` on the repository, `roles/iam.serviceAccountUser` on the runtime and build service accounts |
+| **Deployer** (you / CI) | runs `runway`; uploads sources, submits builds, creates/updates the service, reads logs | `roles/run.developer` (+ `run.services.setIamPolicy`, e.g. `roles/run.admin`, to switch public access or grant `invokers`), `roles/cloudbuild.builds.editor`, `roles/logging.viewer`, `roles/storage.objectUser` on the bucket, `roles/artifactregistry.reader` on the repository, `roles/iam.serviceAccountUser` on the runtime and build service accounts |
 | **Build service account** | runs Cloud Build: reads the archive, pushes the image, writes build logs | `roles/storage.objectViewer` on the bucket, `roles/artifactregistry.writer` on the repository, `roles/logging.logWriter` on the project |
 | **Runtime service account** | identity of the running container | `roles/secretmanager.secretAccessor` on each referenced secret, plus whatever the app needs |
 
@@ -36,6 +36,7 @@ work the same in `services.<name>.…`, `jobs.<name>.…` and `defaults.…`):
 | `release.repository` | the deployer: `roles/artifactregistry.reader` on the repository images are copied from and `roles/artifactregistry.writer` on the release repository; in another project, the Cloud Run service agent (`service-PROJECT_NUMBER@serverless-robot-prod.iam.gserviceaccount.com`) needs `roles/artifactregistry.reader` on it to pull (runway does not grant it) |
 | Several runs at once (lease, deployed commit) | nothing extra: the lease and the commit record are annotations on the stage's service, written with `run.services.update` (in `roles/run.developer`); on a stage of jobs only, `run.jobs.update` |
 | `undeploy` | also `run.jobs.list` (in `roles/run.developer`), to keep an account a job still runs as; without it the account is kept |
+| `service.invokers` | `run.services.setIamPolicy` on the service (`roles/run.admin`) |
 | `jobs` | `run.jobs.*` (in `roles/run.developer`) and `iam.serviceAccounts.actAs` on the job's runtime account |
 | `schedules` | `roles/cloudscheduler.admin`, `iam.serviceAccounts.actAs` (`roles/iam.serviceAccountUser`) on the scheduler account, `run.services.setIamPolicy`/`run.jobs.setIamPolicy` on the targets (`roles/run.admin`), and with the default account `roles/iam.serviceAccountAdmin` to create it |
 | `workflows` | `roles/workflows.editor`, `iam.serviceAccounts.actAs` on each workflow's account, and the grants below; see [Workflows](#workflows) |

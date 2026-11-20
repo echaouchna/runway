@@ -26,8 +26,13 @@ fn access_label(d: &Deployment) -> String {
         format!("Identity-Aware Proxy: {who}")
     } else if s.public {
         "public: allUsers".into()
-    } else {
+    } else if s.invokers.is_empty() {
         "private: callers with roles/run.invoker".into()
+    } else {
+        format!(
+            "private: {} and other callers with roles/run.invoker",
+            s.invokers.join(", ")
+        )
     }
 }
 
@@ -569,6 +574,12 @@ pub fn explain(d: &Deployment) -> Vec<Section> {
         access.push(
             "Only principals with roles/run.invoker can call it, with an identity token.".into(),
         );
+    }
+    if !s.invokers.is_empty() {
+        access.push(format!(
+            "runway grants roles/run.invoker on the service to {}, and revokes what it granted once removed from runway.yaml.",
+            s.invokers.join(", ")
+        ));
     }
     if !d.project_tags.is_empty() {
         access.push(format!(

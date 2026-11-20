@@ -12,6 +12,12 @@ migration notes.
 
 ### Added
 
+- **Service invokers.** `invokers` on a service grants `roles/run.invoker` on
+  that service to the principals listed (service accounts, groups, users…),
+  once the service exists. A stage list replaces the inherited one. runway
+  records what it granted and revokes it once removed from runway.yaml;
+  members it did not grant are never removed. `allUsers` and
+  `allAuthenticatedUsers` are refused: use `public: true`.
 - **Google Cloud Workflows.** `workflows.<name>.source` deploys a workflow
   file from the repository as `<app>-<name>-<stage>`, after the services and
   jobs it calls exist. `env` sets user-defined environment variables (read

@@ -195,6 +195,7 @@ buckets (`buckets:`), and the runtime service account with its grants
 | Tag bindings on the service (`tags`)                                 | added if missing; tags bound directly to the service that are not listed are removed |
 | Adders of secrets runway created (`adders`)                          | added if missing; unlisted ones removed |
 | IAP: `iap_enabled`, IAP agent invoker binding, `httpsResourceAccessor` members | enabled/added; members not in `iap.members` removed |
+| `invokers` members of `roles/run.invoker` on the service             | added if missing; only those runway granted are removed |
 | Source archives `gs://<bucket>/runway/<app>/source-<sha256>.tar.gz` | content-addressed |
 | Images `<location>-docker.pkg.dev/<project>/<repo>/<app>:src-<hash>`| content-addressed tag |
 | Cloud Build runs                                                    | tags `runway`, `runway-app-<app>`, `runway-stage-<stage>`, `runway-src-<hash>` |

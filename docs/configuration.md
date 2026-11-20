@@ -62,6 +62,9 @@ service:
   min_instances: 0            # default 0
   max_instances: 10           # default 10
   public: false               # default false (private)
+  invokers:                   # get roles/run.invoker on the service (see "Invokers" below)
+    - serviceAccount:frontend@my-gcp-project.iam.gserviceaccount.com
+    - group:ops@example.com
   ingress: all                # all (default) | internal | internal-and-cloud-load-balancing
   billing: request-based      # request-based (default) | instance-based (CPU always allocated)
   startup_cpu_boost: false    # default false: more CPU while instances start
@@ -173,6 +176,37 @@ stages:                       # at least one; --stage must name one of these
       env:
         LOG_LEVEL: warning
 ```
+
+## Invokers
+
+A private service (`public: false`) only accepts callers with
+`roles/run.invoker` on it. `invokers` grants that role on the service to the
+principals listed (`user:`, `group:`, `serviceAccount:`, `domain:`,
+`principal:` or `principalSet:`), once the service exists:
+
+```yaml
+services:
+  api:
+    invokers:
+      - serviceAccount:frontend@my-gcp-project.iam.gserviceaccount.com
+      - group:ops@example.com
+stages:
+  dev:
+    services:
+      api:
+        invokers: [group:devs@example.com]   # replaces the inherited list
+```
+
+It is separate from IAP: `iap.members` get `roles/iap.httpsResourceAccessor`
+on the IAP resource, while `invokers` call the service URL directly with an
+identity token. `allUsers` and `allAuthenticatedUsers` are refused (use
+`public: true`), and `invokers` with `public: true` gets a warning (everyone
+can already invoke the service). Jobs have no `invokers`.
+
+runway only removes the invokers it granted itself (see
+[Removing access](#removing-access)): other members of `roles/run.invoker`
+on the service (the IAP service agent, schedules, workflows, people added by
+hand) stay.
 
 ## Sidecars
 
@@ -615,7 +649,8 @@ only the grants it added itself. It records them on the service (annotation
 - the runtime account's roles, both `identity.roles` and those implied by
   secrets and volumes;
 - secret `adders`;
-- `iap.members`.
+- `iap.members`;
+- service `invokers` (`roles/run.invoker` on the service).
 
 A configured grant that was already in place when runway checked it is never
 recorded: someone else granted it.
@@ -669,7 +704,7 @@ From highest to lowest:
 
 Scalars are replaced. `env`, `secrets`, `tags`, `volumes` and `vars` are
 merged key by key; a stage can remove an inherited key by setting it to `null`. The
-`identity` and `iap` blocks are replaced as a whole by a stage that sets them. The deployment mode is chosen
+`identity` and `iap` blocks, and the `invokers` list, are replaced as a whole by a stage that sets them. The deployment mode is chosen
 by the highest layer that sets `image` or `source`/`dockerfile`: a stage that
 sets `image` replaces a top-level source build (and vice versa). Setting both
 in the same block is an error.
@@ -679,7 +714,7 @@ in the same block is an error.
 `${...}` is replaced in `provider.source_bucket`,
 `provider.build_service_account`, bucket names, `service.service_account`,
 `env` values, secret names, `identity` (targets and display name), volume
-buckets and IAP members. Available: `${project}`, `${region}`, `${app}`,
+buckets, IAP members and invokers. Available: `${project}`, `${region}`, `${app}`,
 `${stage}`, `${vars.NAME}` (top-level `vars`, overridden by
 `stages.<stage>.vars`; variables may use the built-ins) and `${buckets.KEY}`
 (the resolved name of a declared bucket). `$$` is a literal `$`. Unknown

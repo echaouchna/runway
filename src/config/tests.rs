@@ -2623,3 +2623,56 @@ fn repositories_may_be_in_a_multi_region() {
         "{e:#?}"
     );
 }
+
+#[test]
+fn invokers_resolve_and_a_stage_list_replaces_them() {
+    let yaml = FULL
+        .replace(
+            "  public: false\n",
+            "  public: false\n  invokers: [group:ops@example.com, serviceAccount:caller@my-gcp-project.iam.gserviceaccount.com]\n",
+        )
+        .replace(
+            "      max_instances: 2\n",
+            "      max_instances: 2\n      invokers: [user:dev@example.com]\n",
+        );
+    let (_d, cfg) = load_str(&yaml);
+    let dev = resolve_ok(&cfg, "dev").deployments[0].clone();
+    assert_eq!(dev.service.invokers, ["user:dev@example.com"]);
+    let prod = resolve_ok(&cfg, "prod").deployments[0].clone();
+    assert_eq!(
+        prod.service.invokers,
+        [
+            "group:ops@example.com",
+            "serviceAccount:caller@my-gcp-project.iam.gserviceaccount.com"
+        ]
+    );
+}
+
+#[test]
+fn invokers_reject_all_users_and_bad_members() {
+    let yaml = FULL.replace(
+        "  public: false\n",
+        "  public: false\n  invokers: [allUsers, ops@example.com]\n",
+    );
+    let (_d, cfg) = load_str(&yaml);
+    let errors = resolve_err(&cfg, "dev");
+    assert!(has_error(&errors, "service.invokers[0]", "public: true"));
+    assert!(has_error(&errors, "service.invokers[1]", "IAM principal"));
+}
+
+#[test]
+fn invokers_warn_when_public_or_listed_twice() {
+    let yaml = FULL.replace(
+        "  public: false\n",
+        "  public: true\n  invokers: [group:ops@example.com, group:OPS@example.com]\n",
+    );
+    let (_d, cfg) = load_str(&yaml);
+    let r = resolve_ok(&cfg, "dev");
+    assert_eq!(r.deployments[0].service.invokers, ["group:ops@example.com"]);
+    assert!(r.warnings.iter().any(|w| w.path == "service.invokers[1]"));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.path == "service.invokers" && w.message.contains("public"))
+    );
+}

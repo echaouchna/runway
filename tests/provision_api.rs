@@ -1757,3 +1757,108 @@ async fn iap_never_used_is_not_a_warning_but_an_unreadable_policy_is() {
     assert_eq!(denied.unchecked.len(), 1, "{:?}", denied.unchecked);
     assert!(denied.unchecked[0].starts_with("IAP access: "));
 }
+
+/// The service's policy: `roles/run.invoker` held by the IAP agent, a
+/// caller added by hand and a member runway granted earlier.
+async fn invoker_project() -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(path(format!("/v2/{SVC}:getIamPolicy")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "version": 1, "etag": "BwX1",
+            "bindings": [{"role": "roles/run.invoker",
+                          "members": [AGENT, "group:manual@example.com", "group:old@example.com"]}]
+        })))
+        .mount(&s)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v2/{SVC}:setIamPolicy")))
+        .respond_with(|r: &Request| {
+            let b: Value = serde_json::from_slice(&r.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(b["policy"].clone())
+        })
+        .mount(&s)
+        .await;
+    s
+}
+
+#[tokio::test]
+async fn invokers_are_granted_on_the_service_and_only_runways_are_revoked() {
+    use runway::config::RoleTarget;
+    use runway::provision::{ManagedGrant, Step, grant_record, managed_grants, revoke_steps};
+    let mut d = deployment();
+    d.service.iap = Default::default();
+    d.service.invokers = vec![
+        "group:ops@example.com".into(),
+        "group:manual@example.com".into(),
+    ];
+    let server = invoker_project().await;
+    let session = Session::from_static_token("test-token").unwrap();
+    let run = google_cloud_run_v2::client::Services::builder()
+        .with_endpoint(server.uri())
+        .with_credentials(session.credentials.clone())
+        .build()
+        .await
+        .unwrap();
+    let prov = provisioner_for(&server, &d, &session, &run).await;
+    let step = post_steps(&d)
+        .into_iter()
+        .find(|s| matches!(s, Step::GrantMembers { .. }))
+        .expect("an invokers step");
+
+    // Plan: only the missing member, and nothing before the service exists.
+    let check = prov.check(&step, true).await;
+    assert_eq!(check.state, StepState::Pending, "{check:?}");
+    assert!(check.detail.contains("group:ops@example.com"), "{check:?}");
+    assert!(!check.detail.contains("manual"), "{check:?}");
+    assert_eq!(
+        prov.check(&step, false).await.detail,
+        "after the service is created"
+    );
+
+    let r = prov.apply(&step).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed);
+    let reqs = server.received_requests().await.unwrap();
+    let bodies = set_policy_bodies(&reqs, &format!("/v2/{SVC}"));
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["policy"]["etag"], "BwX1");
+    let members = &bodies[0]["policy"]["bindings"][0]["members"];
+    for m in [
+        AGENT,
+        "group:manual@example.com",
+        "group:old@example.com",
+        "group:ops@example.com",
+    ] {
+        assert!(
+            members.as_array().unwrap().contains(&json!(m)),
+            "{m}: {members}"
+        );
+    }
+
+    // Only the member runway added is recorded: `manual` stays if removed.
+    let record = grant_record(&[], &managed_grants(&d), &prov.granted(), true);
+    let recorded: Vec<&str> = record.iter().map(|g| g.member.as_str()).collect();
+    assert_eq!(recorded, ["group:ops@example.com"]);
+
+    // `old` was recorded by an earlier deploy and left runway.yaml.
+    let old = ManagedGrant {
+        member: "group:old@example.com".into(),
+        role: "roles/run.invoker".into(),
+        target: Some(RoleTarget::RunService { name: SVC.into() }),
+        runtime: false,
+        service: None,
+    };
+    let mut recorded = record.clone();
+    recorded.push(old.clone());
+    let revokes = revoke_steps(&recorded, &d);
+    assert_eq!(revokes, [Step::Revoke(old)]);
+    let r = prov.apply(&revokes[0]).await.unwrap();
+    assert_eq!(r.outcome, StepOutcome::Changed);
+    let reqs = server.received_requests().await.unwrap();
+    let bodies = set_policy_bodies(&reqs, &format!("/v2/{SVC}"));
+    let members = &bodies[1]["policy"]["bindings"][0]["members"];
+    assert_eq!(
+        members,
+        &json!([AGENT, "group:manual@example.com"]),
+        "only the recorded member is removed"
+    );
+}

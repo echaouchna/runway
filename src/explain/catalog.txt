@@ -531,6 +531,19 @@ Example:
 Rules:
 - Organizations with Domain Restricted Sharing refuse `allUsers`: keep the service private or use `iap`.
 
+@ service.invokers
+also: run.invoker, who can call, callers, service to service, allowed callers
+type: list of principals
+group: Access and networking
+docs: configuration.md#invokers
+Principals granted `roles/run.invoker` on the service: they call its URL with an identity token. Not IAP access (that is `iap.members`).
+Example:
+  invokers: [serviceAccount:frontend@my-gcp-project.iam.gserviceaccount.com, group:ops@example.com]
+Rules:
+- `allUsers` and `allAuthenticatedUsers` are refused: use `public: true`.
+- runway removes only the invokers it granted; other members of the role stay.
+- A stage list replaces the inherited one. Jobs have no `invokers`.
+
 @ service.ingress
 also: internal only, internal traffic, load balancer only, restrict traffic, private service
 type: all | internal | internal-and-cloud-load-balancing

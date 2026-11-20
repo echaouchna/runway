@@ -78,8 +78,9 @@ $ runway traffic --stage prod --promote     # finish it
 
     - A runtime service account per app (or per service or job), created if
       you want, with roles on exactly one bucket, dataset, secret or project.
-    - Private by default; `public: true`, restricted ingress, Identity-Aware
-      Proxy for sign-in with Google, custom audiences.
+    - Private by default; `public: true`, `invokers` allowed to call a
+      service, restricted ingress, Identity-Aware Proxy for sign-in with
+      Google, custom audiences.
     - Secret Manager references as environment variables or files; secrets
       runway creates empty, with the people allowed to fill them, and a deploy
       that waits (with the exact command) until they have a value.

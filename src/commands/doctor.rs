@@ -1584,6 +1584,7 @@ mod tests {
                 min_instances: 0,
                 max_instances: 1,
                 public,
+                invokers: vec![],
                 service_account: "rt@p.iam.gserviceaccount.com".into(),
                 ingress: "all".into(),
                 health_check: None,

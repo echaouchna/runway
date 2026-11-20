@@ -419,6 +419,9 @@ pub struct RawService {
     pub min_instances: Option<i64>,
     pub max_instances: Option<i64>,
     pub public: Option<bool>,
+    /// Principals granted `roles/run.invoker` on the service. A stage list
+    /// replaces the inherited one.
+    pub invokers: Option<Vec<String>>,
     /// `all` (default), `internal` or `internal-and-cloud-load-balancing`.
     pub ingress: Option<String>,
     /// HTTP startup (and liveness) probes. A stage block replaces the inherited one.
