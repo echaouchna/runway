@@ -199,6 +199,15 @@ pub fn managed_grants(d: &Deployment) -> Vec<ManagedGrant> {
             _ => {}
         }
     }
+    if let Some(Step::GrantMembers { members, binding }) = invokers_step(d) {
+        out.extend(members.into_iter().map(|member| ManagedGrant {
+            member,
+            role: binding.role.clone(),
+            target: Some(binding.target.clone()),
+            runtime: false,
+            service: None,
+        }));
+    }
     if d.service.iap.enabled && !d.is_job() {
         out.extend(d.service.iap.members.iter().map(|m| ManagedGrant {
             member: m.clone(),
@@ -289,10 +298,23 @@ pub fn revoke_steps(recorded: &[ManagedGrant], d: &Deployment) -> Vec<Step> {
     let desired = managed_grants(d);
     recorded
         .iter()
-        .filter(|g| !desired.contains(g))
+        .filter(|g| !still_wanted(&desired, g))
         .cloned()
         .map(Step::Revoke)
         .collect()
+}
+
+/// Whether `desired` still holds the binding of `g` (same member, role and
+/// resource), maybe for another reason: an `invokers` entry removed while a
+/// workflow's account still calls the service keeps its access.
+fn still_wanted(desired: &[ManagedGrant], g: &ManagedGrant) -> bool {
+    desired.iter().any(|x| {
+        x == g
+            || (iam::same_member(&x.member, &g.member)
+                && x.role == g.role
+                && x.target.is_some()
+                && x.target == g.target)
+    })
 }
 
 impl Step {
@@ -379,6 +401,14 @@ impl Step {
             self,
             Step::Tag { .. } | Step::IapInvoker | Step::IapAccess | Step::Untag { .. }
         ) || matches!(self, Step::Revoke(g) if g.target.is_none())
+            || self.is_invokers_grant()
+    }
+
+    /// The `invokers` grant: on the service itself, so after it exists.
+    fn is_invokers_grant(&self) -> bool {
+        matches!(self, Step::GrantMembers { binding, .. }
+            if binding.role == INVOKER_ROLE
+                && matches!(binding.target, RoleTarget::RunService { .. }))
     }
 
     /// Steps of a wave depend only on earlier waves: project tags (which
@@ -853,7 +883,21 @@ pub fn post_steps(d: &Deployment) -> Vec<Step> {
             steps.push(Step::IapAccess);
         }
     }
+    steps.extend(invokers_step(d));
     steps
+}
+
+/// `roles/run.invoker` on the service for the configured `invokers`.
+fn invokers_step(d: &Deployment) -> Option<Step> {
+    (!d.is_job() && !d.service.invokers.is_empty()).then(|| Step::GrantMembers {
+        members: d.service.invokers.clone(),
+        binding: RoleBinding {
+            role: INVOKER_ROLE.into(),
+            target: RoleTarget::RunService {
+                name: d.service_name(),
+            },
+        },
+    })
 }
 
 /// `~ field: a -> b; + field: c` for a step's details.
@@ -1231,7 +1275,7 @@ pub fn stack_revoke_steps(recorded: &[ManagedGrant], r: &Resolved) -> Vec<Step> 
     let desired = stack_managed_grants(r);
     recorded
         .iter()
-        .filter(|g| !desired.contains(g))
+        .filter(|g| !still_wanted(&desired, g))
         .cloned()
         .map(Step::Revoke)
         .collect()
@@ -4551,6 +4595,59 @@ stages: { prod: {} }
         all.extend(revokes);
         let w = wave_names(&all, &d);
         assert!(w.last().unwrap()[0][0].starts_with("revoke "), "{w:#?}");
+    }
+
+    #[test]
+    fn invokers_are_granted_after_the_service_exists_and_revoked_once_removed() {
+        let yaml = FULL.replace(
+            "  iap: { members: [group:finops@example.com] }\n",
+            "  invokers: [group:ops@example.com]\n",
+        );
+        let (_dir, d) = deployment(&yaml);
+        let service = RoleTarget::RunService {
+            name: d.service_name(),
+        };
+        let step = Step::GrantMembers {
+            members: vec!["group:ops@example.com".into()],
+            binding: RoleBinding {
+                role: INVOKER_ROLE.into(),
+                target: service.clone(),
+            },
+        };
+        assert_eq!(post_steps(&d), std::slice::from_ref(&step));
+        assert!(
+            !pre_steps(&d).contains(&step),
+            "the service must exist first"
+        );
+        assert!(step.needs_service());
+        let ops = ManagedGrant {
+            member: "group:ops@example.com".into(),
+            role: INVOKER_ROLE.into(),
+            target: Some(service.clone()),
+            runtime: false,
+            service: None,
+        };
+        assert!(managed_grants(&d).contains(&ops), "recorded, so revocable");
+
+        let old = ManagedGrant {
+            member: "group:old@example.com".into(),
+            ..ops.clone()
+        };
+        let mut recorded = managed_grants(&d);
+        recorded.push(old.clone());
+        let revokes = revoke_steps(&recorded, &d);
+        assert_eq!(revokes, [Step::Revoke(old)]);
+        assert!(
+            revokes[0]
+                .describe(&d)
+                .starts_with("revoke roles/run.invoker on service ")
+        );
+        // The same binding still wanted for another reason is kept.
+        let as_runtime = ManagedGrant {
+            runtime: true,
+            ..ops.clone()
+        };
+        assert!(revoke_steps(&[as_runtime], &d).is_empty());
     }
 
     #[test]

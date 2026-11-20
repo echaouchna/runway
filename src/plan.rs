@@ -1251,6 +1251,7 @@ mod tests {
                 min_instances: 0,
                 max_instances: 2,
                 public: false,
+                invokers: vec![],
                 service_account: "rt@my-gcp-project.iam.gserviceaccount.com".into(),
                 ingress: "all".into(),
                 health_check: None,

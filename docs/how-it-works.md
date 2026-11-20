@@ -123,6 +123,7 @@ what is missing, and is retried per the `retry` policy):
    requires for `allUsers` is in place first).
 11. IAP: make sure the IAP service agent exists and can invoke the service;
     grant `roles/iap.httpsResourceAccessor` to `service.iap.members`.
+    Grant `roles/run.invoker` on the service to `service.invokers`.
 12. Main deploys only, once one revision serves all traffic: remove what
     `runway.yaml` does not list on what runway owns (IAP members, tags bound
     to the service, adders of its secrets, roles of its runtime account),
